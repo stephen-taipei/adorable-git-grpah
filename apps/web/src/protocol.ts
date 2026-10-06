@@ -5,6 +5,8 @@ export interface GitSnapshot {
   graph: GraphData | null;
   /** graph 為 null 時的原因（例如不是 git repo）。 */
   error?: string;
+  /** 暫時性的 git 錯誤（例如 gc / fetch 進行中）。已經有好的圖時，dev plugin 會保留舊圖；第一次讀取就失敗時才會帶著這個旗標送出。 */
+  transient?: boolean;
   generatedAt: number;
 }
 

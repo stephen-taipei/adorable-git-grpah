@@ -116,6 +116,17 @@ describe('selectRefs', () => {
     }
   });
 
+  it('keeps names unique when the remote default and a local branch of the same name point at different commits', () => {
+    const refs = parseForEachRef(
+      [`refs/remotes/origin/main\t${sha(2)}\t`, `refs/heads/main\t${sha(1)}\t`].join('\n'),
+    );
+    const s = selectRefs(refs, { defaultBranch: 'origin/main' });
+    const names = s.refs.map((r) => r.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(s.refs.find((r) => r.isDefault)).toMatchObject({ name: 'origin/main', sha: sha(2) });
+    expect(names).toContain('main');
+  });
+
   it('honours an explicit default and the branch cap', () => {
     const s = selectRefs(all, { defaultBranch: 'diverged', maxBranches: 2 });
     expect(s.refs.map((r) => r.name)).toEqual(['diverged', 'feat/x']);

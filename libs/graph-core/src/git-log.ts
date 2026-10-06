@@ -146,10 +146,16 @@ export function selectRefs(all: readonly ParsedRef[], opts: SelectRefsOptions = 
   for (const b of candidates) add(b);
   const limited = picked.slice(0, Math.max(1, opts.maxBranches ?? 8));
 
+  const defRef = twinOf(def);
   const refs: RefInput[] = limited.map((b) => {
-    const isDefault = b === twinOf(def);
+    const isDefault = b === defRef;
+    // 只靠 remote 才有的 default 以去掉前綴的名稱顯示；但若有另一個（指向不同 commit 的）同名 branch 也被選中，保留前綴以免兩個都叫 main
+    const stripped =
+      isDefault &&
+      b.remote &&
+      !limited.some((o) => o !== b && o.kind === 'branch' && bare(o) === bare(b) && !o.remote);
     return {
-      name: isDefault && b.remote ? b.name.slice(b.remote.length + 1) : b.name,
+      name: stripped ? bare(b) : b.name,
       sha: b.sha,
       kind: 'branch' as const,
       isDefault,
@@ -206,7 +212,15 @@ export interface BuildGitGraphInput {
 export function buildGitGraphData(input: BuildGitGraphInput): GraphData {
   const remote = parseGitHubRemote(input.remoteUrl);
   const base = remote ? `https://github.com/${remote.owner}/${remote.repo}` : undefined;
-  const commits = parseGitLog(input.logText, base ? (sha) => `${base}/commit/${sha}` : undefined);
+  // 呼叫端可能把多段 `git log` 輸出串在一起（重疊的部分以 sha 去重）
+  const commits = [
+    ...new Map(
+      parseGitLog(input.logText, base ? (sha) => `${base}/commit/${sha}` : undefined).map((c) => [
+        c.sha,
+        c,
+      ]),
+    ).values(),
+  ];
   const known = new Set(commits.map((c) => c.sha));
 
   const refs: RefInput[] = input.selected.refs.filter((r) => known.has(r.sha));

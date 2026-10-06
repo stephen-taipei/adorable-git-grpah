@@ -279,20 +279,49 @@ esac
     }
   });
 
-  it('returns an error snapshot (and warns) instead of throwing when git fails', async () => {
+  it('returns a transient error snapshot (and warns) instead of throwing when git itself fails', async () => {
     const dir = tmp('agg-broken-');
     git(dir, 'init', '-q', '-b', 'main');
     commit(dir, 'ok');
-    writeFileSync(join(dir, '.git/refs/heads/bad'), `${'0'.repeat(40)}\n`);
+    // ref 指到不存在的 object：`git for-each-ref` 以 128 結束（fatal: missing object）
+    writeFileSync(join(dir, '.git/refs/heads/bad'), `${'1'.repeat(40)}\n`);
     const warnings: string[] = [];
     const snap = await readGitSnapshot(dir, { onWarn: (m) => warnings.push(m) });
-    // 壞掉的 ref 可能被 git 忽略或讓它失敗；兩種結果都不可以 throw，且錯誤訊息不含本機路徑
-    if (snap.graph === null) {
-      expect(snap.error).not.toContain(tmpdir());
-      expect(warnings.length).toBeGreaterThan(0);
-    } else {
-      expect(snap.graph.commits.length).toBeGreaterThan(0);
+    expect(snap.graph).toBeNull();
+    expect(snap.transient).toBe(true);
+    expect(snap.error).toMatch(/git reported an error/);
+    expect(snap.error).not.toContain(tmpdir());
+    expect(warnings.join('\n')).toMatch(/missing object/); // 細節只走 onWarn（終端機），不進快照
+  });
+
+  it('is not fooled by a non-UTF-8 i18n.logOutputEncoding in the user config', async () => {
+    const dir = tmp('agg-enc-');
+    const cfg = join(dir, 'gitconfig');
+    writeFileSync(cfg, '[i18n]\n\tlogOutputEncoding = latin1\n');
+    const repo = join(dir, 'repo');
+    mkdirSync(repo);
+    const prev = process.env['GIT_CONFIG_GLOBAL'];
+    process.env['GIT_CONFIG_GLOBAL'] = cfg;
+    try {
+      git(repo, 'init', '-q', '-b', 'main');
+      commit(repo, 'feat: café 日本語 ✓');
+      const g = (await readGitSnapshot(repo)).graph!;
+      expect(g.commits[0]!.message).toBe('feat: café 日本語 ✓');
+    } finally {
+      process.env['GIT_CONFIG_GLOBAL'] = prev;
     }
+  });
+
+  it('always loads the default branch tip, even when other branches have newer commits than the cap', async () => {
+    const dir = tmp('agg-default-tip-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'main: old tip');
+    git(dir, 'checkout', '-q', '-b', 'busy');
+    for (let i = 0; i < 6; i++) commit(dir, `busy ${i}`);
+    const g = (await readGitSnapshot(dir, { maxCommits: 3 })).graph!;
+    expect(g.refs.find((r) => r.isDefault)?.name).toBe('main');
+    expect(g.commits.some((c) => c.message === 'main: old tip')).toBe(true);
+    expect(buildLayout(g).nodes.find((n) => n.isHead)?.subject).toBe('main: old tip');
   });
 });
 
@@ -321,10 +350,54 @@ describe('watchGitRefs (regression: live updates must keep working after the fir
       await expectEvent('checkout other again', () => git(dir, 'checkout', '-q', 'other'));
       await expectEvent('tag', () => git(dir, 'tag', 'v1'));
       await expectEvent('new nested branch dir', () => git(dir, 'branch', 'feat/deep/er'));
-      await expectEvent('commit inside the new nested branch dir', () => {
-        git(dir, 'checkout', '-q', 'feat/deep/er');
-        commit(dir, 'nested');
+      await expectEvent('checkout into it', () => git(dir, 'checkout', '-q', 'feat/deep/er'));
+      // 這一步只改動「新建出來的巢狀目錄」裡的 ref 檔：目錄若沒被補上監看，就收不到事件
+      await expectEvent('commit inside the nested ref directory', () => commit(dir, 'nested'));
+    } finally {
+      stop();
+    }
+  });
+
+  it('keeps watching a ref directory that is deleted and re-created (branch delete, git gc, pack-refs)', async () => {
+    const dir = tmp('agg-watch-recreate-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    git(dir, 'branch', 'feat/a');
+    const gitDir = join(dir, '.git');
+
+    let calls = 0;
+    const stop = watchGitRefs([gitDir], () => calls++);
+    try {
+      const expectEvent = async (label: string, action: () => void) => {
+        const before = calls;
+        action();
+        await waitFor(() => calls > before, 4000).catch(() => {
+          throw new Error(`no event after: ${label}`);
+        });
+        await sleep(200);
+      };
+      // refs/heads/feat 被刪掉（最後一個 feat/* 刪除）再重建，之後只改動裡面的 ref 檔
+      await expectEvent('delete the only nested branch (removes refs/heads/feat)', () =>
+        git(dir, 'branch', '-q', '-D', 'feat/a'),
+      );
+      await expectEvent('re-create a nested branch (re-creates refs/heads/feat)', () =>
+        git(dir, 'branch', 'feat/b'),
+      );
+      await expectEvent('move ONLY the ref file inside the re-created directory', () =>
+        git(dir, 'update-ref', 'refs/heads/feat/b', git(dir, 'rev-parse', 'HEAD')),
+      );
+      await expectEvent('second change inside it', () => {
+        commit(dir, 'two');
+        git(dir, 'update-ref', 'refs/heads/feat/b', git(dir, 'rev-parse', 'HEAD'));
       });
+      // pack-refs --prune 會刪掉所有鬆散 ref 與空目錄，之後的更新又會重建它們
+      await expectEvent('git pack-refs --all --prune', () =>
+        git(dir, 'pack-refs', '--all', '--prune'),
+      );
+      await expectEvent('ref update after pack-refs', () => git(dir, 'branch', 'feat/c'));
+      await expectEvent('only the ref inside after pack-refs', () =>
+        git(dir, 'update-ref', 'refs/heads/feat/c', git(dir, 'rev-parse', 'HEAD~1')),
+      );
     } finally {
       stop();
     }
@@ -350,8 +423,8 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     data: { graph: { commits: unknown[] } | null };
   }
 
-  async function startPlugin(repoDir: string) {
-    const plugin = gitSnapshot({ repoDir, pollMs: 300 }) as unknown as {
+  async function startPlugin(repoDir: string, pollMs = 300) {
+    const plugin = gitSnapshot({ repoDir, pollMs }) as unknown as {
       configResolved(c: unknown): void;
       configureServer(s: unknown): Promise<void>;
       load(id: string): Promise<string | undefined>;
@@ -366,7 +439,8 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       httpServer: null,
       close: async () => {},
     };
-    plugin.configResolved({ root: repoDir, logger: { warn: () => {} } });
+    const warnings: string[] = [];
+    plugin.configResolved({ root: repoDir, logger: { warn: (m: string) => warnings.push(m) } });
     // gitSnapshot 在 vitest 下會刻意略過 configureServer；這裡要真的跑，所以暫時拿掉旗標
     const flag = process.env['VITEST'];
     delete process.env['VITEST'];
@@ -386,14 +460,22 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
         };
         handler!({ method, headers }, res);
       });
-    return { plugin, sent, request, invalidated: () => invalidated, close: () => server.close() };
+    return {
+      plugin,
+      sent,
+      warnings,
+      request,
+      invalidated: () => invalidated,
+      close: () => server.close(),
+    };
   }
 
-  it('pushes an HMR update for each consecutive commit (watcher + polling safety net)', async () => {
+  it('pushes an HMR update for each consecutive commit — through the WATCHER alone (poll disabled)', async () => {
     const dir = tmp('agg-plugin-');
     git(dir, 'init', '-q', '-b', 'main');
     commit(dir, 'one');
-    const p = await startPlugin(dir);
+    // pollMs: 0 → 安全網關掉。若監看失靈，這個測試必須失敗（否則輪詢會把問題蓋住）
+    const p = await startPlugin(dir, 0);
     try {
       for (let i = 2; i <= 5; i++) {
         commit(dir, `c${i}`);
@@ -401,6 +483,20 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
         expect(p.sent.at(-1)!.data.graph!.commits).toHaveLength(i);
       }
       expect(p.invalidated()).toBeGreaterThanOrEqual(4); // 重新整理頁面時要拿到新的 module，而不是舊快取
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('the 2s-style poll catches changes the watcher could miss (watchers cannot be the only path)', async () => {
+    const dir = tmp('agg-poll-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const p = await startPlugin(dir, 200);
+    try {
+      commit(dir, 'two');
+      await waitFor(() => p.sent.length >= 1, 8000);
+      expect(p.sent.at(-1)!.data.graph!.commits).toHaveLength(2);
     } finally {
       await p.close();
     }
@@ -425,18 +521,40 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     }
   });
 
-  it('keeps the last good snapshot when a refresh fails transiently', async () => {
+  it('keeps the last good snapshot (and warns once) when git fails transiently', async () => {
     const dir = tmp('agg-keep-');
     git(dir, 'init', '-q', '-b', 'main');
     commit(dir, 'one');
-    const p = await startPlugin(dir);
+    const p = await startPlugin(dir, 0);
     try {
-      const first = JSON.parse((await p.request({})).body);
-      expect(first.graph.commits).toHaveLength(1);
-      rmSync(join(dir, '.git/HEAD')); // git 會認為這不是 repo：模擬 gc / fetch 進行中的瞬間錯誤
+      expect(JSON.parse((await p.request({})).body).graph.commits).toHaveLength(1);
+      writeFileSync(join(dir, '.git/refs/heads/bad'), `${'1'.repeat(40)}\n`); // git 以 128 結束
       const during = JSON.parse((await p.request({})).body);
-      expect(during.graph).not.toBeNull();
       expect(during.graph.commits).toHaveLength(1);
+      expect(during.error).toBeUndefined();
+      expect(p.warnings.filter((w) => /keeping the last good snapshot/.test(w))).toHaveLength(1);
+      await p.request({});
+      expect(p.warnings.filter((w) => /keeping the last good snapshot/.test(w))).toHaveLength(1);
+      rmSync(join(dir, '.git/refs/heads/bad')); // 恢復後立刻回到正常
+      expect(JSON.parse((await p.request({})).body).graph.commits).toHaveLength(1);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('does NOT mask a permanent failure (repository gone) behind the stale snapshot', async () => {
+    const dir = tmp('agg-gone-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const p = await startPlugin(dir, 0);
+    try {
+      expect(JSON.parse((await p.request({})).body).graph.commits).toHaveLength(1);
+      rmSync(join(dir, '.git'), { recursive: true, force: true });
+      const body = JSON.parse((await p.request({})).body);
+      expect(body.graph).toBeNull();
+      expect(body.error).toMatch(/not inside a git repository/);
+      expect(body.error).not.toContain(tmpdir());
+      await waitFor(() => p.sent.some((m) => m.data.graph === null), 4000); // 也會推送給畫面
     } finally {
       await p.close();
     }

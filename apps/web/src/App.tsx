@@ -73,6 +73,7 @@ export function App() {
         state={state}
         theme={theme === 'auto' ? 'auto' : theme}
         locale={locale}
+        sourceKey={source.kind === 'github' ? `github:${source.owner}/${source.repo}` : 'local'}
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
         onSelectNode={select}

@@ -26,6 +26,8 @@ export interface GitGraphViewerProps {
   onSelectNode?: (node: GraphNode) => void;
   /** 顯示在標題列正下方的額外控制項（例如資料來源切換）。 */
   headerExtra?: ReactNode;
+  /** 資料來源的識別（例如 `local` / `github`）。同名 repo 換來源時不會被當成「剛 commit 了一筆」的增量更新。 */
+  sourceKey?: string;
 }
 
 function usePrefersDark(): boolean {
@@ -97,6 +99,7 @@ export function GitGraphViewer({
   onOpenSettings,
   onSelectNode,
   headerExtra,
+  sourceKey,
 }: GitGraphViewerProps) {
   const loc = locale ?? detectLocale();
   const t = getMessages(loc);
@@ -137,6 +140,7 @@ export function GitGraphViewer({
           layout={layout}
           theme={sceneTheme}
           handleRef={canvasRef}
+          sourceKey={sourceKey}
           onHover={setHover}
           onSelect={select}
           onError={() => setWebglFailed(true)}

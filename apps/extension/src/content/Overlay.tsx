@@ -51,7 +51,7 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
         aria-modal="true"
         aria-label={`Git graph · ${repo.owner}/${repo.repo}`}
       >
-        <ErrorBoundary>
+        <ErrorBoundary onClose={onClose}>
           <GitGraphViewer
             title={`${repo.owner}/${repo.repo}`}
             state={state}

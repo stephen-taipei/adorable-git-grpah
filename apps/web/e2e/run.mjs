@@ -309,6 +309,27 @@ try {
     assert.equal(await commitCount(), expected);
   });
 
+  await step(
+    'token dialog keeps keyboard focus while the app re-renders underneath (live update)',
+    async () => {
+      await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
+      await page.locator('.web-dialog').waitFor();
+      const cancel = page.getByRole('button', { name: /^(取消|Cancel)$/ });
+      await cancel.focus();
+      // 背景來一筆新 commit → App 重新 render。若 effect 依賴 onClose 的身分，焦點會被搶回密碼欄
+      commit(repoDir, 'live: while the dialog is open');
+      expected++;
+      await waitForCommits(expected);
+      await page.waitForTimeout(300);
+      assert.equal(
+        await page.evaluate(() => document.activeElement?.textContent?.trim()),
+        (await cancel.innerText()).trim(),
+      );
+      await page.keyboard.press('Escape');
+      await page.locator('.web-dialog').waitFor({ state: 'detached' });
+    },
+  );
+
   await step('SECURITY: other origins cannot read the dev snapshot endpoint', async () => {
     const other = await ctx.newPage();
     await other.goto(`${apiBase}/avatar/x.svg`); // 不同 origin（127.0.0.1:<另一個埠>）
@@ -406,13 +427,6 @@ try {
       seen.auth.length = 0;
       await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
       await page.locator('.web-dialog').waitFor();
-      // 對話框開著時，背景的 render（例如 refetch）不可以把焦點搶回輸入框
-      await page.getByRole('button', { name: /^(取消|Cancel)$/ }).focus();
-      await page.waitForTimeout(300);
-      assert.equal(
-        await page.evaluate(() => document.activeElement?.textContent?.trim()),
-        await page.getByRole('button', { name: /^(取消|Cancel)$/ }).innerText(),
-      );
       await page.screenshot({ path: resolve(artifacts, '6-token-dialog.png') });
       await page.locator('.web-dialog input[type="password"]').fill('github_pat_web_secret');
       await page.getByRole('button', { name: /^(儲存|Save)$/ }).click();
@@ -435,8 +449,24 @@ try {
             .map((k) => JSON.parse(sessionStorage.getItem(k)).authed),
         );
       await waitUntil(async () => (await cacheEntries()).includes(true));
+      // 另一個 repo 的「帶 token」快取（mock 只提供一個 repo，所以直接塞進去）：移除 token 後必須一併消失
+      await page.evaluate(() =>
+        sessionStorage.setItem(
+          'agg:gh:private/secret-repo',
+          JSON.stringify({
+            savedAt: Date.now(),
+            graph: { repo: {}, commits: [], refs: [] },
+            authed: true,
+          }),
+        ),
+      );
       await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
       await page.getByRole('button', { name: /^(清除|Clear)$/ }).click();
+      assert.equal(
+        await page.evaluate(() => sessionStorage.getItem('agg:gh:private/secret-repo')),
+        null,
+        'clearing the token must purge every cached GitHub graph',
+      );
       assert.equal(await page.evaluate(() => localStorage.getItem('agg.github-token')), null);
       await page.locator('.agg-canvas canvas').waitFor();
       await page.waitForTimeout(500);
@@ -448,16 +478,30 @@ try {
   );
 
   await step(
-    'browser back/forward follow the source; Local button returns to the git snapshot',
+    'browser back/forward drive the viewer (not just the URL); Local button returns to the git snapshot',
     async () => {
-      await page.goBack();
-      await waitUntil(
-        async () =>
-          new URL(page.url()).search.includes('demo') || new URL(page.url()).search === '',
-      );
-      const afterBack = new URL(page.url()).search;
-      await page.goForward();
-      await waitUntil(async () => new URL(page.url()).search !== afterBack);
+      const pressed = () =>
+        page.locator('.web-seg button[aria-pressed="true"]').first().innerText();
+      await page.getByRole('button', { name: /Local$|本機$/ }).click(); // push "/"
+      await page.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
+      await waitForCommits(expected);
+      await page.getByRole('button', { name: /GitHub$/ }).click();
+      const input = page.locator('.web-input');
+      await input.fill('demo/adorable-git-graph');
+      await input.press('Enter'); // push "?repo=demo/adorable-git-graph"
+      await page.locator('.agg-title-text', { hasText: 'demo/adorable-git-graph' }).waitFor();
+
+      await page.goBack(); // → Local：畫面本身也必須跟著回去
+      await page.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
+      assert.equal(new URL(page.url()).search, '');
+      assert.match(await pressed(), /Local|本機/);
+      await waitForCommits(expected);
+
+      await page.goForward(); // → GitHub
+      await page.locator('.agg-title-text', { hasText: 'demo/adorable-git-graph' }).waitFor();
+      assert.equal(new URL(page.url()).search, '?repo=demo/adorable-git-graph');
+      assert.match(await pressed(), /GitHub/);
+
       await page.getByRole('button', { name: /Local$|本機$/ }).click();
       await page.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
       await page.locator('.agg-canvas canvas').waitFor();

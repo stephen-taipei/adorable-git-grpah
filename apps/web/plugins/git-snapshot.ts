@@ -80,7 +80,13 @@ export async function readGitSnapshot(
 ): Promise<GitSnapshot> {
   const generatedAt = Date.now();
   // 錯誤訊息會被烤進 bundle / 經由 endpoint 送出，所以一律不含本機路徑；細節給 onWarn（終端機）。
-  const fail = (error: string): GitSnapshot => ({ graph: null, error, generatedAt });
+  // transient：git 自己出錯（gc / fetch 進行中等），保留上一張好的圖；其餘是確定的失敗，要如實顯示。
+  const fail = (error: string, transient = false): GitSnapshot => ({
+    graph: null,
+    error,
+    generatedAt,
+    ...(transient ? { transient: true } : {}),
+  });
   if (!existsSync(repoDir)) return fail('The configured repository directory does not exist.');
 
   try {
@@ -118,22 +124,37 @@ export async function readGitSnapshot(
         ? ['HEAD']
         : [];
 
-    const logText = logRefs.length
-      ? await git(dir, [
-          // 使用者的 git 設定不能影響輸出格式（例如 log.showSignature 會在每筆前面塞 gpg 輸出）
-          '-c',
-          'log.showSignature=false',
-          'log',
-          '-z',
-          '--no-show-signature',
-          '--date-order',
-          `--format=${GIT_LOG_FORMAT}`,
-          '-n',
-          String(maxCommits),
-          ...logRefs,
-          '--',
-        ])
-      : '';
+    // 先把選好的 ref 解析成 sha，再交給 git log：避免讀取途中 ref 移動造成「branch 標籤落後最新 commit」的不一致快照
+    const tips = selected.refs.length ? [...new Set(selected.refs.map((r) => r.sha))] : logRefs;
+    const logArgs = (n: number, starts: string[]) => [
+      // 使用者的 git 設定不能影響輸出：log.showSignature 會在每筆前塞 gpg 輸出，
+      // i18n.logOutputEncoding 非 UTF-8 時作者名與標題會變成亂碼
+      '-c',
+      'log.showSignature=false',
+      '-c',
+      'i18n.logOutputEncoding=UTF-8',
+      'log',
+      '-z',
+      '--no-show-signature',
+      '--date-order',
+      `--format=${GIT_LOG_FORMAT}`,
+      '-n',
+      String(n),
+      ...starts,
+      '--',
+    ];
+    let logText = tips.length ? await git(dir, logArgs(maxCommits, tips)) : '';
+    // 其他 branch 很活躍時，default / 目前 branch 的 tip 可能比「最新 N 筆」還舊而整個被擠掉
+    // （圖上就沒有 default 的小球與皇冠）：另外保證它們各自最近的一段一定讀得到。
+    const guaranteed = selected.refs
+      .filter((r) => r.isDefault || r.name === currentBranch)
+      .map((r) => r.sha);
+    if (logText) {
+      // `git log -n` は複数の起点をまとめて数えるので、起点ごとに別々に取らないと保証にならない
+      for (const sha of new Set(guaranteed)) {
+        logText += await git(dir, logArgs(Math.min(maxCommits, 60), [sha]));
+      }
+    }
 
     const graph = buildGitGraphData({ logText, selected, allRefs, remoteUrl, fallbackName: name });
     // shallow clone 的邊界 commit 看起來像 root：至少要讓畫面標示「更早的歷史已省略」
@@ -144,7 +165,7 @@ export async function readGitSnapshot(
     opts.onWarn?.(
       `could not read git history: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return fail('Could not read the git history (git reported an error).');
+    return fail('Could not read the git history (git reported an error).', true);
   }
 }
 
@@ -169,37 +190,52 @@ export function watchGitRefs(gitDirs: string[], onChange: () => void): () => voi
   const watchers = new Map<string, FSWatcher>();
   let closed = false;
 
-  const add = (dir: string, handler: (filename: string | null) => void) => {
-    if (closed || watchers.has(dir)) return;
+  const drop = (dir: string) => {
+    watchers.get(dir)?.close();
+    watchers.delete(dir);
+  };
+
+  /** `replace`：同名目錄可能被刪掉又重建（git gc / pack-refs / branch 刪除重建）。核心會悄悄丟掉舊 inode 的監看，所以要換新的。 */
+  const add = (
+    dir: string,
+    handler: (event: string, filename: string | null) => void,
+    replace = false,
+  ) => {
+    if (closed) return;
+    if (watchers.has(dir)) {
+      if (!replace) return;
+      drop(dir);
+    }
     try {
-      const w = watch(dir, { persistent: false }, (_event, filename) =>
-        handler(filename ? String(filename) : null),
+      const w = watch(dir, { persistent: false }, (event, filename) =>
+        handler(event, filename ? String(filename) : null),
       );
-      w.on('error', () => {
-        w.close();
-        watchers.delete(dir);
-      });
+      w.on('error', () => drop(dir));
       watchers.set(dir, w);
     } catch {
       /* 目錄消失 / 達到 inotify 上限：交給輪詢安全網 */
     }
   };
 
-  const watchTree = (dir: string) => {
-    add(dir, (filename) => {
-      if (filename) {
-        const child = join(dir, filename);
-        try {
-          if (statSync(child).isDirectory()) watchTree(child);
-        } catch {
-          /* 已被刪除 */
+  const watchTree = (dir: string, replace = false) => {
+    add(
+      dir,
+      (event, filename) => {
+        if (filename) {
+          const child = join(dir, filename);
+          try {
+            if (statSync(child).isDirectory()) watchTree(child, event === 'rename');
+          } catch {
+            drop(child); // 已被刪除：放掉舊的監看，之後重建時才會重新加上
+          }
         }
-      }
-      onChange();
-    });
+        onChange();
+      },
+      replace,
+    );
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.isDirectory()) watchTree(join(dir, entry.name));
+        if (entry.isDirectory()) watchTree(join(dir, entry.name), replace);
       }
     } catch {
       /* ignore */
@@ -207,9 +243,9 @@ export function watchGitRefs(gitDirs: string[], onChange: () => void): () => voi
   };
 
   for (const gitDir of gitDirs) {
-    add(gitDir, (filename) => {
+    add(gitDir, (_event, filename) => {
       if (filename === null || filename === 'HEAD' || filename === 'packed-refs') onChange();
-      if (filename === 'refs') watchTree(join(gitDir, 'refs'));
+      if (filename === 'refs') watchTree(join(gitDir, 'refs'), true);
     });
     watchTree(join(gitDir, 'refs'));
   }
@@ -233,10 +269,17 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
   let last: GitSnapshot | undefined;
   let warn: (m: string) => void = options.onWarn ?? ((m) => console.warn(`[git-snapshot] ${m}`));
 
+  let staleWarned = false;
   const read = async (): Promise<GitSnapshot> => {
     const snap = await readGitSnapshot(repoDir, { ...options, onWarn: warn });
-    // 暫時性的 git 錯誤（例如 gc / fetch 進行中）不要把好好的畫面換成錯誤頁
-    if (!snap.graph && last?.graph) return last;
+    if (snap.graph) staleWarned = false;
+    // 暫時性的 git 錯誤（例如 gc / fetch 進行中）不要把好好的畫面換成錯誤頁；
+    // 目錄不見、不是 repo 這類確定的失敗則如實顯示（否則畫面會永遠停在舊圖，使用者還看不出來）。
+    if (!snap.graph && snap.transient && last?.graph) {
+      if (!staleWarned) warn('keeping the last good snapshot until git can be read again');
+      staleWarned = true;
+      return last;
+    }
     last = snap;
     return snap;
   };
