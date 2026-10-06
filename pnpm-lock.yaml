@@ -44,22 +44,59 @@ importers:
         version: 19.3.0(@types/react@19.3.0)
       '@vitejs/plugin-react':
         specifier: ^6.1.1
-        version: 6.1.1(vite@8.3.2(yaml@2.9.0))
+        version: 6.1.1(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
       playwright-core:
         specifier: ^1.63.0
         version: 1.63.0
       vite:
         specifier: ^8.3.2
-        version: 8.3.2(yaml@2.9.0)
+        version: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
       vitest:
         specifier: ^5.0.3
-        version: 5.0.3(vite@8.3.2(yaml@2.9.0))
+        version: 5.0.3(@types/node@22.20.5)(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
+
+  apps/web:
+    dependencies:
+      '@adorable/graph-core':
+        specifier: workspace:*
+        version: link:../../libs/graph-core
+      '@adorable/graph-ui':
+        specifier: workspace:*
+        version: link:../../libs/graph-ui
+      react:
+        specifier: ^19.3.0
+        version: 19.3.0
+      react-dom:
+        specifier: ^19.3.0
+        version: 19.3.0(react@19.3.0)
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.5
+      '@types/react':
+        specifier: ^19.2.0
+        version: 19.3.0
+      '@types/react-dom':
+        specifier: ^19.2.0
+        version: 19.3.0(@types/react@19.3.0)
+      '@vitejs/plugin-react':
+        specifier: ^6.1.1
+        version: 6.1.1(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
+      playwright-core:
+        specifier: ^1.63.0
+        version: 1.63.0
+      vite:
+        specifier: ^8.3.2
+        version: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
+      vitest:
+        specifier: ^5.0.3
+        version: 5.0.3(@types/node@22.20.5)(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
 
   libs/graph-core:
     devDependencies:
       vitest:
         specifier: ^5.0.3
-        version: 5.0.3(vite@8.3.2(yaml@2.9.0))
+        version: 5.0.3(@types/node@22.20.5)(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
 
   libs/graph-ui:
     dependencies:
@@ -87,7 +124,7 @@ importers:
         version: 19.3.0(react@19.3.0)
       vite:
         specifier: ^8.3.2
-        version: 8.3.2(yaml@2.9.0)
+        version: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
 
 packages:
 
@@ -310,6 +347,9 @@ packages:
 
   '@types/har-format@1.2.16':
     resolution: {integrity: sha512-fluxdy7ryD3MV6h8pTfTYpy/xQzCFC7m89nOH9y94cNqJ1mDIDPut7MnRHI3F6qRmh/cT2fUjG1MLdCNb4hE9A==}
+
+  '@types/node@22.20.5':
+    resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
 
   '@types/react-dom@19.3.0':
     resolution: {integrity: sha512-ZI7bU42mZXXKHn/qNLEw2IrbiINU7X5+vfgdixBHkCNpYWXjKgfQ/P+uyGb5CjOLB9UcnTeg3rylQtV2hym44Q==}
@@ -1097,6 +1137,9 @@ packages:
     engines: {node: '>=16.20.0'}
     hasBin: true
 
+  undici-types@6.21.0:
+    resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
 
@@ -1374,6 +1417,10 @@ snapshots:
 
   '@types/har-format@1.2.16': {}
 
+  '@types/node@22.20.5':
+    dependencies:
+      undici-types: 6.21.0
+
   '@types/react-dom@19.3.0(@types/react@19.3.0)':
     dependencies:
       '@types/react': 19.3.0
@@ -1455,19 +1502,19 @@ snapshots:
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
 
-  '@vitejs/plugin-react@6.1.1(vite@8.3.2(yaml@2.9.0))':
+  '@vitejs/plugin-react@6.1.1(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))':
     dependencies:
       '@rolldown/pluginutils': 1.0.1
-      vite: 8.3.2(yaml@2.9.0)
+      vite: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
 
-  '@vitest/mocker@5.0.3(vite@8.3.2(yaml@2.9.0))':
+  '@vitest/mocker@5.0.3(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.31
       '@vitest/spy': 5.0.3
       estree-walker: 3.0.3
       magic-string: 1.4.3
     optionalDependencies:
-      vite: 8.3.2(yaml@2.9.0)
+      vite: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
 
   '@vitest/spy@5.0.3': {}
 
@@ -2150,9 +2197,11 @@ snapshots:
       '@typescript/typescript-win32-arm64': 7.0.2
       '@typescript/typescript-win32-x64': 7.0.2
 
+  undici-types@6.21.0: {}
+
   util-deprecate@1.0.2: {}
 
-  vite@8.3.2(yaml@2.9.0):
+  vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.7
@@ -2160,13 +2209,14 @@ snapshots:
       rolldown: 1.2.12
       tinyglobby: 0.2.17
     optionalDependencies:
+      '@types/node': 22.20.5
       fsevents: 2.3.3
       yaml: 2.9.0
 
-  vitest@5.0.3(vite@8.3.2(yaml@2.9.0)):
+  vitest@5.0.3(@types/node@22.20.5)(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0)):
     dependencies:
       '@types/chai': 5.2.3
-      '@vitest/mocker': 5.0.3(vite@8.3.2(yaml@2.9.0))
+      '@vitest/mocker': 5.0.3(vite@8.3.2(@types/node@22.20.5)(yaml@2.9.0))
       chai: 6.3.0
       es-module-lexer: 2.3.2
       expect-type: 1.4.0
@@ -2177,8 +2227,10 @@ snapshots:
       tinybench: 6.2.0
       tinyexec: 1.3.1
       tinyglobby: 0.2.17
-      vite: 8.3.2(yaml@2.9.0)
+      vite: 8.3.2(@types/node@22.20.5)(yaml@2.9.0)
       why-is-node-running: 3.2.1
+    optionalDependencies:
+      '@types/node': 22.20.5
     transitivePeerDependencies:
       - msw
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GitHubError, fetchGitHubGraph, resolveBranchHint } from './github';
+import { GitHubError, fetchGitHubGraph, resolveBranchHint } from './github.ts';
 
 const sha = (n: number) => n.toString(16).padStart(40, '0');
 const apiCommit = (n: number, parent?: number) => ({

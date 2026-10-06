@@ -1,4 +1,4 @@
-import { colorAt } from './palette';
+import { colorAt } from './palette.ts';
 import type {
   CommitInput,
   CommitKind,
@@ -10,7 +10,7 @@ import type {
   GraphNode,
   LayoutOptions,
   RefInput,
-} from './types';
+} from './types.ts';
 
 const DEFAULT_MAX_COMMITS = 400;
 /** 換 lane 時，S 型曲線佔用的 x 長度（grid unit）。 */

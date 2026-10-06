@@ -24,6 +24,8 @@ export interface GitGraphViewerProps {
   onOpenSettings?: () => void;
   /** 預設：開新分頁前往 commit 的 GitHub 頁面。 */
   onSelectNode?: (node: GraphNode) => void;
+  /** 顯示在標題列正下方的額外控制項（例如資料來源切換）。 */
+  headerExtra?: ReactNode;
 }
 
 function usePrefersDark(): boolean {
@@ -94,6 +96,7 @@ export function GitGraphViewer({
   onClose,
   onOpenSettings,
   onSelectNode,
+  headerExtra,
 }: GitGraphViewerProps) {
   const loc = locale ?? detectLocale();
   const t = getMessages(loc);
@@ -173,6 +176,8 @@ export function GitGraphViewer({
           )}
         </div>
       </header>
+
+      {headerExtra && <div className="agg-subbar">{headerExtra}</div>}
 
       {state.kind === 'loading' && (
         <div className="agg-center" role="status">

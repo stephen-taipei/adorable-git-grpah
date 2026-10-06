@@ -24,6 +24,16 @@
     "e2e": {
       "dependsOn": ["^build"],
       "cache": false
+    },
+    "start": {
+      "continuous": true
+    },
+    "dev": {
+      "continuous": true
+    },
+    "preview": {
+      "continuous": true,
+      "dependsOn": ["build"]
     }
   }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { buildLayout, classifyCommit, laneY, routeEdge } from './layout';
-import { createDemoData } from './demo';
-import type { CommitInput, GraphData } from './types';
+import { buildLayout, classifyCommit, laneY, routeEdge } from './layout.ts';
+import { createDemoData } from './demo.ts';
+import type { CommitInput, GraphData } from './types.ts';
 
 const commit = (sha: string, parents: string[], hour: number, message = sha): CommitInput => ({
   sha,
