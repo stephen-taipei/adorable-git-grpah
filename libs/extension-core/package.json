@@ -1,0 +1,31 @@
+{
+  "name": "@adorable/extension-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-extension code shared by the Chrome and Firefox builds: background, content script, options page, and the build + manifest tooling.",
+  "exports": {
+    "./build": "./scripts/build.mjs",
+    "./manifest": "./scripts/manifest.mjs",
+    "./icons": "./assets/icons"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@adorable/graph-core": "workspace:*",
+    "@adorable/graph-ui": "workspace:*",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.4",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  }
+}

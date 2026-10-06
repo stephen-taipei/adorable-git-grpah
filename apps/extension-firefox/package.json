@@ -1,0 +1,22 @@
+{
+  "name": "@adorable/extension-firefox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Firefox (MV3) build of the Adorable Git Graph extension. Source is shared with the Chrome build via @adorable/extension-core.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "lint": "web-ext lint --source-dir dist",
+    "package": "web-ext build --source-dir dist --artifacts-dir web-ext-artifacts --overwrite-dest",
+    "package:source": "mkdir -p web-ext-artifacts && git -C ../.. archive --format=zip --prefix=adorable-git-graph/ -o apps/extension-firefox/web-ext-artifacts/adorable-git-graph-source.zip HEAD",
+    "run": "web-ext run --source-dir dist --start-url https://github.com/stephen-taipei/adorable-git-grpah",
+    "e2e": "node e2e/run.mjs"
+  },
+  "dependencies": {
+    "@adorable/extension-core": "workspace:*"
+  },
+  "devDependencies": {
+    "web-ext": "^10.7.0"
+  }
+}
