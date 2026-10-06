@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
-import { findChrome } from './chrome-path.mjs';
+import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
 
 const out = resolve(dirname(fileURLToPath(import.meta.url)), '../public/icons');
 await mkdir(out, { recursive: true });

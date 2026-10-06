@@ -1,0 +1,251 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: #bfe7ff;
+}
+
+.web-root {
+  position: fixed;
+  inset: 0;
+}
+
+/* ── source bar（放在 viewer 的 .agg-subbar 內，沿用 --agg-* 色票） ── */
+
+.web-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.web-seg {
+  display: flex;
+  overflow: hidden;
+  background: var(--agg-paper);
+  border: 3px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+}
+
+.web-seg button {
+  appearance: none;
+  margin: 0;
+  padding: 4px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 900;
+  color: var(--agg-ink);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.web-seg button + button {
+  border-left: 3px solid var(--agg-ink);
+}
+
+.web-seg button[aria-pressed='true'] {
+  background: var(--agg-pop);
+}
+
+.web-seg button:hover:not([aria-pressed='true']) {
+  background: #fff;
+}
+
+.web-form {
+  display: flex;
+  gap: 6px;
+}
+
+.web-input {
+  width: 260px;
+  max-width: 62vw;
+  padding: 4px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--agg-ink);
+  background: #fff;
+  border: 3px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+  user-select: text;
+}
+
+.web-input[aria-invalid='true'] {
+  background: #ffe1e5;
+  border-color: #c2253f;
+}
+
+.web-input--wide {
+  width: 100%;
+  max-width: none;
+  padding: 8px 14px;
+  font-size: 15px;
+}
+
+.web-go,
+.web-cta {
+  appearance: none;
+  margin: 0;
+  padding: 4px 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 900;
+  color: var(--agg-ink);
+  background: var(--agg-pop);
+  border: 3px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+  cursor: pointer;
+  transition: transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.web-go:hover,
+.web-cta:hover {
+  transform: translateY(-2px) rotate(-1deg);
+}
+
+.web-go:active,
+.web-cta:active {
+  transform: translateY(3px);
+  box-shadow: none;
+}
+
+.web-icon {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  margin: 0;
+  font-size: 16px;
+  line-height: 1;
+  background: var(--agg-paper);
+  border: 3px solid var(--agg-ink);
+  border-radius: 50%;
+  box-shadow: 0 3px 0 var(--agg-ink);
+  cursor: pointer;
+  transition: transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.web-icon:hover {
+  transform: translateY(-2px) rotate(-8deg);
+}
+
+.web-seg button:focus-visible,
+.web-input:focus-visible,
+.web-go:focus-visible,
+.web-icon:focus-visible,
+.web-cta:focus-visible {
+  outline: 3px solid #5b8cff;
+  outline-offset: 2px;
+}
+
+/* ── token dialog / toast ── */
+
+.web-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(43, 33, 64, 0.55);
+  backdrop-filter: blur(6px);
+}
+
+.web-dialog {
+  width: min(520px, 100%);
+  padding: 22px;
+  color: #2b2140;
+  background: #fffaf0;
+  border: 4px solid #2b2140;
+  border-radius: 24px;
+  box-shadow: 0 8px 0 #2b2140;
+  font:
+    700 14px/1.5 ui-rounded,
+    'SF Pro Rounded',
+    'Hiragino Maru Gothic ProN',
+    'Nunito',
+    'PingFang TC',
+    'Noto Sans TC',
+    system-ui,
+    sans-serif;
+  --agg-ink: #2b2140;
+  --agg-pop: #ffd23f;
+}
+
+.web-dialog h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  font-size: 20px;
+  font-weight: 900;
+}
+
+.web-dialog p {
+  margin: 12px 0 0;
+  font-size: 13px;
+}
+
+.web-warn {
+  padding: 10px 12px;
+  background: #fff0c2;
+  border: 3px solid #2b2140;
+  border-radius: 14px;
+}
+
+.web-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.web-cta--ghost {
+  background: #fff;
+}
+
+.web-toast {
+  position: fixed;
+  z-index: 11;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  padding: 8px 18px;
+  color: #2b2140;
+  background: #fffaf0;
+  border: 3px solid #2b2140;
+  border-radius: 999px;
+  box-shadow: 0 4px 0 #2b2140;
+  font:
+    900 14px/1.2 ui-rounded,
+    'SF Pro Rounded',
+    'Nunito',
+    'PingFang TC',
+    system-ui,
+    sans-serif;
+  animation: web-pop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes web-pop {
+  from {
+    transform: translateX(-50%) scale(0.8);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .web-toast {
+    animation: none;
+  }
+}

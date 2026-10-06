@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { buildLayout, classifyCommit, laneY, routeEdge } from './layout';
-import { createDemoData } from './demo';
-import type { CommitInput, GraphData } from './types';
+import { buildLayout, classifyCommit, laneY, routeEdge } from './layout.ts';
+import { createDemoData } from './demo.ts';
+import type { CommitInput, GraphData } from './types.ts';
 
 const commit = (sha: string, parents: string[], hour: number, message = sha): CommitInput => ({
   sha,
@@ -115,6 +115,27 @@ describe('buildLayout', () => {
     expect(l.truncated).toBe(true);
     expect(l.nodes.find((n) => n.sha === 'b')!.hasHiddenParents).toBe(true);
     expect(l.edges).toHaveLength(1);
+  });
+
+  it('survives broken / forged histories: self-parent and cycles never crash the layout', () => {
+    const l = buildLayout(
+      data(
+        [
+          commit('c', ['f1', 'b'], 5),
+          commit('b', ['a'], 3),
+          commit('a', [], 1),
+          commit('f1', ['f1'], 4), // 自己是自己的 parent
+          commit('x', ['y'], 2),
+          commit('y', ['x'], 2), // 互相為 parent 的環
+        ],
+        'c',
+      ),
+    );
+    expect(l.nodes.map((n) => n.sha).sort()).toEqual(['a', 'b', 'c']);
+    for (const e of l.edges) {
+      expect(l.nodes.some((n) => n.sha === e.from)).toBe(true);
+      expect(l.nodes.some((n) => n.sha === e.to)).toBe(true);
+    }
   });
 
   it('clips to the newest maxCommits', () => {

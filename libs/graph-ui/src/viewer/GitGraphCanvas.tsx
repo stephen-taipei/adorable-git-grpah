@@ -27,6 +27,8 @@ export interface GitGraphCanvasProps {
   onHover?: (hover: CanvasHover | null) => void;
   onSelect?: (node: GraphNode) => void;
   onError?: (error: unknown) => void;
+  /** 資料來源的識別（例如 local / github）。換來源時即使 repo 同名也要當成全新的圖，而不是增量更新。 */
+  sourceKey?: string;
 }
 
 export function GitGraphCanvas({
@@ -36,6 +38,7 @@ export function GitGraphCanvas({
   onHover,
   onSelect,
   onError,
+  sourceKey,
 }: GitGraphCanvasProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<GitGraphScene | null>(null);
@@ -78,9 +81,14 @@ export function GitGraphCanvas({
     };
   }, []);
 
+  // 同一個 repo 的更新（例如剛 commit）走增量：只讓新的 commit 彈出來，並保留使用者的鏡頭
+  const prev = useRef<{ repo: string; nodes: number } | null>(null);
   useEffect(() => {
-    sceneRef.current?.setLayout(layout);
-  }, [layout]);
+    const repo = `${sourceKey ?? ''}|${layout.repo.owner}/${layout.repo.name}`;
+    const incremental = prev.current?.repo === repo && prev.current.nodes > 0;
+    sceneRef.current?.setLayout(layout, { incremental });
+    prev.current = { repo, nodes: layout.nodes.length };
+  }, [layout, sourceKey]);
 
   useEffect(() => {
     sceneRef.current?.setTheme(theme);

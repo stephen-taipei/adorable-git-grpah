@@ -12,6 +12,9 @@ export interface Messages {
   emptySub: string;
   errorTitle: string;
   retry: string;
+  crashTitle: string;
+  crashSub: string;
+  reload: string;
   commits: (n: number) => string;
   branches: (n: number) => string;
   truncated: string;
@@ -35,6 +38,9 @@ const zhTW: Messages = {
   emptySub: '先 commit 一次，小球就會出現啦',
   errorTitle: '哎呀，出錯了',
   retry: '再試一次',
+  crashTitle: '畫面當機了',
+  crashSub: '資料可能有問題，重新載入通常就會好。',
+  reload: '重新載入',
   commits: (n) => `${n} 個 commit`,
   branches: (n) => `${n} 條分支`,
   truncated: '更早的歷史已省略',
@@ -66,6 +72,9 @@ const en: Messages = {
   emptySub: 'Make a commit and a ball will pop out!',
   errorTitle: 'Oops, something broke',
   retry: 'Try again',
+  crashTitle: 'The view crashed',
+  crashSub: 'Something in the data looks off. Reloading usually fixes it.',
+  reload: 'Reload',
   commits: (n) => `${n} commit${n === 1 ? '' : 's'}`,
   branches: (n) => `${n} branch${n === 1 ? '' : 'es'}`,
   truncated: 'older history omitted',

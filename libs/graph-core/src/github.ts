@@ -1,4 +1,4 @@
-import type { CommitInput, GraphData, RefInput } from './types';
+import type { CommitInput, GraphData, RefInput } from './types.ts';
 
 export type GitHubErrorCode =
   | 'invalid_repo'
@@ -10,14 +10,15 @@ export type GitHubErrorCode =
   | 'unknown';
 
 export class GitHubError extends Error {
-  constructor(
-    readonly code: GitHubErrorCode,
-    message: string,
-    /** rate limit 重置時間（ms epoch） */
-    readonly resetAt?: number,
-  ) {
+  readonly code: GitHubErrorCode;
+  /** rate limit 重置時間（ms epoch） */
+  readonly resetAt?: number;
+
+  constructor(code: GitHubErrorCode, message: string, resetAt?: number) {
     super(message);
     this.name = 'GitHubError';
+    this.code = code;
+    this.resetAt = resetAt;
   }
 }
 

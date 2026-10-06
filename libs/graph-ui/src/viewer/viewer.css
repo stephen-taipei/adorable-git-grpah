@@ -164,6 +164,24 @@
   background: var(--agg-danger);
 }
 
+/* 標題列下方的額外控制項（由使用端提供內容） */
+.agg-subbar {
+  position: absolute;
+  z-index: 3;
+  top: 74px;
+  left: 14px;
+  right: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.agg-subbar > * {
+  pointer-events: auto;
+}
+
 /* ── legend / hint ─────────────────────────────── */
 
 .agg-legend {

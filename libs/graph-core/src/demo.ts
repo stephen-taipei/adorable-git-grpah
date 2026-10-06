@@ -1,4 +1,4 @@
-import type { CommitInput, GraphData, RefInput } from './types';
+import type { CommitInput, GraphData, RefInput } from './types.ts';
 
 /** 決定性假 sha（FNV-1a ×5 → 40 hex），僅供 demo / 測試。 */
 function fakeSha(id: string): string {

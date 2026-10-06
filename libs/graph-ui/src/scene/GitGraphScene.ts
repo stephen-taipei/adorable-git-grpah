@@ -60,8 +60,10 @@ interface Actor {
 interface EdgeActor {
   material: THREE.ShaderMaterial;
   length: number;
-  /** 以 parent 的 actor 決定何時開始長出來 */
+  /** 完整重播時：由 parent 決定何時開始長出來 */
   parent: Actor;
+  /** 增量更新時：新 commit 的邊在它出現前長出來 */
+  child: Actor;
 }
 
 interface Cloud {
@@ -146,6 +148,8 @@ export class GitGraphScene {
   private following = false;
   private replayEnd = 0;
   private replayState: 'idle' | 'playing' | 'done' = 'idle';
+  /** 邊的出現時機：完整重播 or 只讓新增的 commit 長出來 */
+  private edgeTiming: 'replay' | 'incremental' = 'replay';
   private waveStart = 0;
   private maxViewH = 40;
   private minViewH = 5;
@@ -229,7 +233,18 @@ export class GitGraphScene {
     if (!paused) this.lastFrame = performance.now();
   }
 
-  setLayout(layout: GraphLayout, opts: { replay?: boolean } = {}) {
+  /**
+   * 載入圖。`incremental` 為真（同一個 repo 的更新，例如剛 commit 了一筆）時：
+   * 既有的 commit 立刻就位、只有新增的會「彈出來」，並保留使用者目前的鏡頭位置。
+   */
+  setLayout(layout: GraphLayout, opts: { replay?: boolean; incremental?: boolean } = {}) {
+    const previous = opts.incremental ? new Set(this.actorBySha.keys()) : null;
+    const oldX = previous ? new Map(this.actors.map((a) => [a.node.sha, a.cx])) : null;
+    // 「使用者正看著最新的 commit」＝ 鏡頭的目標就是 head 取景（或進場動畫還在跟著跑）。
+    // 看全景 / 自己放大縮小過的人不該被每一筆新 commit 拉回去。
+    const wasIntro = this.following;
+    const followHead = this.layout ? wasIntro || this.isFramingHead(this.layout) : false;
+
     this.clearGraph();
     this.layout = layout;
     this.buildGraph(layout);
@@ -238,12 +253,86 @@ export class GitGraphScene {
     this.maxViewH = Math.max(viewFit.viewH * 1.6, 24);
     this.minViewH = 5;
 
+    if (previous && oldX && previous.size > 0) {
+      this.updateIncrementally(previous, oldX, followHead, wasIntro);
+      return;
+    }
     this.replay(opts.replay ?? true);
+  }
+
+  private headView(layout: GraphLayout) {
+    return this.viewFor(Math.max(0, layout.maxX - 11), layout.maxX, layout);
+  }
+
+  private isFramingHead(layout: GraphLayout): boolean {
+    const head = this.headView(layout);
+    const c = this.cam;
+    return (
+      Math.abs(c.tViewH - head.viewH) < head.viewH * 0.2 &&
+      Math.abs(c.tx - head.cx) < SX * 3 &&
+      Math.abs(c.ty - head.cy) < SY * 2.5
+    );
+  }
+
+  private updateIncrementally(
+    previous: Set<string>,
+    oldX: Map<string, number>,
+    followHead: boolean,
+    wasIntro: boolean,
+  ) {
+    const animated = !this.reduced;
+    const fresh = this.actors.filter((a) => !previous.has(a.node.sha)).length;
+    // 一次進來很多筆（pull / rebase）時要壓縮節奏，不然要等上好幾十秒
+    const step = clamp(2 / Math.max(fresh, 1), 0.03, 0.2);
+    let k = 0;
+    let lastSpawn = this.t;
+    for (const a of this.actors) {
+      a.nextBlink = this.t + 1 + Math.random() * 3;
+      if (previous.has(a.node.sha) || !animated) {
+        a.spawnAt = -1e6;
+        a.group.visible = true;
+      } else {
+        a.spawnAt = this.t + 0.25 + k * step;
+        a.group.visible = false;
+        lastSpawn = a.spawnAt;
+        k++;
+      }
+    }
+    this.edgeTiming = 'incremental';
+    this.replayEnd = lastSpawn + 0.9;
+    this.waveStart = this.replayEnd + 0.5;
+    this.setReplayState(k > 0 ? 'playing' : 'done');
+    this.following = false;
+
+    // 歷史被截斷（只保留最新 N 筆）時，每多一筆 commit，既有節點的 x 都會往左退一格；
+    // 把鏡頭一起平移，使用者正在看的那個 commit 才不會滑走。
+    const shifts: number[] = [];
+    for (const a of this.actors) {
+      const before = oldX.get(a.node.sha);
+      if (before !== undefined) shifts.push(a.cx - before);
+    }
+    shifts.sort((a, b) => a - b);
+    const shift = shifts.length ? (shifts[Math.floor(shifts.length / 2)] ?? 0) : 0;
+    if (shift) {
+      this.cam.cx += shift;
+      this.cam.tx += shift;
+    }
+
+    if (!followHead || (fresh === 0 && !wasIntro)) return;
+    if (fresh <= 12 || !animated) {
+      this.focusHead();
+    } else if (this.layout) {
+      // 新增太多、新節點要花好幾秒才出現：不要先飛到一片空白的 head，改成沿著出現的節奏跟過去
+      this.cam.tViewH = clamp(this.headView(this.layout).viewH, this.minViewH, this.maxViewH);
+      this.cam.vx = this.cam.vy = 0;
+      this.following = true;
+    }
   }
 
   /** 重播：由最舊的 commit 依序長出來。 */
   replay(animate = true) {
     if (!this.layout) return;
+    this.edgeTiming = 'replay';
     const L = this.layout;
     const n = this.actors.length;
     const animated = animate && !this.reduced;
@@ -429,7 +518,8 @@ export class GitGraphScene {
 
     for (const e of layout.edges) {
       const parent = this.actorBySha.get(e.from);
-      if (!parent) continue;
+      const child = this.actorBySha.get(e.to);
+      if (!parent || !child) continue;
       const pts = e.points.map(([x, y]) => [x * SX, y * SY] as const);
       const { geometry, length } = buildRibbon(pts, RIBBON_WIDTH, Z_RIBBON);
       const material = createRibbonMaterial(this.shared, e.color);
@@ -437,7 +527,7 @@ export class GitGraphScene {
       mesh.frustumCulled = false;
       this.world.add(mesh);
       this.graphDisposables.push(geometry, material);
-      this.edgeActors.push({ material, length, parent });
+      this.edgeActors.push({ material, length, parent, child });
     }
 
     // 歷史被截斷的節點：往左畫一小段虛線 + …
@@ -611,8 +701,8 @@ export class GitGraphScene {
     return this.width / Math.max(this.height, 1);
   }
 
-  private viewFor(x0: number, x1: number) {
-    const L = this.layout;
+  private viewFor(x0: number, x1: number, layout: GraphLayout | null = this.layout) {
+    const L = layout;
     const minY = L?.minY ?? 0;
     const maxY = L?.maxY ?? 0;
     const spanW = (x1 - x0) * SX + 6;
@@ -974,7 +1064,10 @@ export class GitGraphScene {
 
   private updateEdges() {
     for (const e of this.edgeActors) {
-      const start = e.parent.spawnAt + 0.1;
+      const start =
+        this.edgeTiming === 'incremental'
+          ? Math.max(e.child.spawnAt - 0.35, e.parent.spawnAt + 0.05)
+          : e.parent.spawnAt + 0.1;
       const p = clamp01((this.t - start) / 0.4);
       e.material.uniforms['uReveal']!.value = p >= 1 ? e.length + 1 : easeInOutCubic(p) * e.length;
     }

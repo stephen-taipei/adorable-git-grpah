@@ -5,16 +5,17 @@
   "description": "Cartoon-style animated git graph (three.js). Stage 1: Chrome extension for github.com. Stage 2: localhost web app.",
   "packageManager": "pnpm@10.28.0",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "build": "nx run-many -t build",
-    "dev": "nx run extension:dev",
+    "dev": "nx run @adorable/extension:dev",
     "typecheck": "nx run-many -t typecheck",
     "test": "nx run-many -t test",
-    "e2e": "nx run extension:e2e",
+    "e2e": "nx run-many -t e2e --parallel=1",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "start": "nx run @adorable/web:start"
   },
   "devDependencies": {
     "nx": "^23.2.1",

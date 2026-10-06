@@ -3,19 +3,45 @@
 用 **three.js** 把 git graph 畫成「卡通插圖式、會動的流程表」：每個 commit 是一顆有表情的小球，
 branch 是流動著箭頭的管線，merge / fork 會自己長出來。純前端，無後端。
 
-| 階段  | 內容                                                                                           | 狀態        |
-| ----- | ---------------------------------------------------------------------------------------------- | ----------- |
-| **1** | `apps/extension` — Chrome extension，在 github.com repo 頁面顯示該 repo 的 git graph           | ✅ 本次完成 |
-| 2     | `apps/web` — `pnpm start` 於 localhost 查看本專案的 git graph（與 extension 共用同一套 UI/UX） | ⏳ 下一階段 |
+| 階段  | 內容                                                                                               | 狀態 |
+| ----- | -------------------------------------------------------------------------------------------------- | ---- |
+| **1** | `apps/extension` — Chrome extension，在 github.com repo 頁面顯示該 repo 的 git graph               | ✅   |
+| **2** | `apps/web` — `pnpm start` 於 localhost 查看**本專案**的 git graph（與 extension 共用同一套 UI/UX） | ✅   |
 
-## 快速開始（Stage 1）
+## 快速開始
 
-需求：Node ≥ 22.12、pnpm ≥ 10.16（`packageManager` 已鎖定）。
+需求：Node ≥ 22.18、pnpm ≥ 10.16（`packageManager` 已鎖定）。
 
 ```bash
 pnpm install
-pnpm build            # → apps/extension/dist
+pnpm start            # 階段 2：http://localhost:4200 ，顯示「本專案」的 git graph
+pnpm build            # 建置所有專案：extension → apps/extension/dist、web → apps/web/dist
 ```
+
+### 階段 2 · Web app（`pnpm start`）
+
+- 預設讀**本機 git**（Vite plugin 執行 `git log`）：離線可用、不吃 GitHub rate limit、包含尚未 push 的 commit / branch。
+- **即時更新**：在終端機 `git commit` / 切 branch / `git fetch`，畫面會自己長出新的小球（不用重新整理，由 HMR 推送）。
+  只有**新增**的 commit 會彈出來，你目前的縮放與平移位置不會被重設（如果你本來就看著最新的 commit，鏡頭會輕輕帶過去）。
+  偵測方式：逐層監看 `.git` 的 `HEAD` / `packed-refs` / `refs/**` 目錄（不用遞迴 `fs.watch`，它在 Linux 上第二次 commit 起就會漏事件），
+  另有每 2 秒比對 ref 清單的安全網；git 暫時出錯時保留上一張好的圖，不會讓 dev server 掛掉。
+- 標題列下方的 `📍 本機 | 🐙 GitHub`：切到 GitHub 後輸入 `owner/repo` 或 GitHub 網址（也可直接開 `/?repo=owner/repo`），
+  從瀏覽器直接呼叫 GitHub REST API（與 extension 同一套 `fetchGitHubGraph`），結果快取 10 分鐘。
+  未登入每小時 60 次，點 ⚙ 可貼入 fine-grained PAT（只存 localStorage、只送往 `api.github.com`；更換 / 清除 token 會一併清掉快取）。
+- 🌓 切換 自動 / 白天 / 夜晚主題（會記住）；點 commit：有 GitHub remote 就開 commit 頁，否則複製完整 sha。
+- 環境變數：`AGG_REPO_DIR`（要看哪個 repo，預設就是本專案；一般 repo、bare repo、shallow clone 都可以）、
+  `AGG_MAX_COMMITS`（預設 300，不再被 layout 偷偷截成 400）、`AGG_MAX_BRANCHES`（預設 8）、
+  `AGG_DEFAULT_BRANCH`（預設依序：`origin/HEAD` → `main` → `master` → 目前 branch；`main` 或 `origin/main` 兩種寫法都可以）。
+  例如看另一個專案：`AGG_REPO_DIR=~/code/other pnpm start`。
+- `pnpm --filter @adorable/web build && pnpm --filter @adorable/web preview`：靜態版，**把建置當下的 git 快照烤進 bundle**。
+
+> ⚠️ 靜態版的 bundle 只含 **commit 的第一行（subject）與作者名稱**，不含 email 與 commit 本文（`Signed-off-by` / `Co-authored-by` 等 trailer 不會被讀進來）。
+> 但 subject、作者名與 branch / tag 名稱仍是公開資訊：**不要把私有 repo 的建置結果公開部署**。
+> dev server 預設只綁 `localhost`；`/__agg/git-snapshot` 只存在於 dev、只回應同源請求（其他 localhost 埠上的頁面讀不到，e2e 有驗證），不會出現在 build 中。
+> 靜態版沒有後端可重讀 git，因此不顯示重新整理按鈕。
+> `pnpm build` 不使用 Nx 快取 web（快照是建置當下的 git 狀態，不是檔案內容的函數）。
+
+### 階段 1 · Chrome extension
 
 載入到 Chrome：`chrome://extensions` → 開啟「開發人員模式」→「載入未封裝項目」→ 選 `apps/extension/dist`。
 然後打開任一 GitHub repo（例如 `https://github.com/stephen-taipei/adorable-git-grpah`）：
@@ -31,21 +57,31 @@ pnpm build            # → apps/extension/dist
 ### 開發
 
 ```bash
+pnpm start            # web app（http://localhost:4200）
 pnpm dev              # extension watch build（改完到 chrome://extensions 按重新載入）
 pnpm typecheck        # nx run-many -t typecheck
-pnpm test             # vitest：layout 演算法、GitHub client、URL 解析、設定
-pnpm e2e              # 真實 Chromium 載入打包後的 extension（見下）
+pnpm test             # vitest：layout 演算法、git log 解析、GitHub client、URL 解析、設定、git 快照 plugin
+pnpm e2e              # 真實 Chromium：web app + extension 端到端（見下）
 ```
 
-`pnpm e2e` 會：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
+`pnpm e2e` 會依序跑 web 與 extension 兩套端到端測試。
+
+**extension**：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
 在假的 `github.com` 頁面上驗證 FAB、overlay、繪圖、hover tooltip、點擊開 commit、縮放/平移、夜間主題、
 404 / rate-limit 錯誤畫面、快取命中與強制重抓、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
-找不到 Chrome 時設定 `CHROME_PATH`。
+**web**：啟動真正的 dev server，對一個臨時建立的 git repo 驗證本機快照、**commit / 建 branch 後畫面即時更新且不重新整理**、
+連續多次 commit / 切 branch、增量更新保留鏡頭、cross-origin 讀不到 dev endpoint、GitHub 來源切換（輸入驗證、404、rate limit、deep link 與快取、token 不外洩且移除後不留帶 token 的快取）、
+主題記憶、本機 build + preview（快照烤進 bundle、無 Refresh、dev endpoint 不存在）。
+
+兩者的截圖輸出到各自的 `e2e/.artifacts/`。找不到 Chrome 時設定 `CHROME_PATH`。
 
 ## 專案結構
 
 ```
 apps/
+  web/                  Vite + React：pnpm start 的 localhost 版
+    plugins/            git-snapshot：執行 git log、監看 .git refs，經 HMR 推送新快照（virtual:git-snapshot）
+    src/                SourceBar（本機 / GitHub 切換）、TokenDialog、useGraphSource
   extension/            Chrome MV3 extension（Vite 多入口打包，無 crxjs 等額外外掛）
     src/background/     service worker：呼叫 GitHub API、快取、token 管理
     src/content/        content script：Shadow DOM 掛載 FAB + overlay，追蹤 SPA 換頁
@@ -53,12 +89,14 @@ apps/
     scripts/build.mjs   content/background 打成 IIFE，options 為一般頁面，並產生 manifest.json
     e2e/run.mjs         端到端測試
 libs/
-  graph-core/           純 TS、零相依：型別、lane 配置演算法、GitHub REST client、demo 資料
-  graph-ui/             three.js 場景 + React viewer（extension 與 Stage 2 web app 共用）
+  graph-core/           純 TS、零相依：型別、lane 配置演算法、GitHub REST client、git log 解析、demo 資料
+  graph-ui/             three.js 場景 + React viewer（extension 與 web app 共用）
+tools/e2e/              e2e 共用：Chrome 偵測、mock GitHub API（含 CORS）、截圖像素判斷
 ```
 
 - `libs/*` 以 `exports → src/index.ts` 提供原始碼，由使用端 bundler 編譯，不需獨立 build。
-- UI/UX 全部在 `graph-ui`（`GitGraphViewer`），Stage 2 的 web app 只需換資料來源、不需重做 UI。
+- `graph-core` 是 **Node 可直接執行的 TS**（相對 import 帶 `.ts`、`erasableSyntaxOnly`），所以 `vite.config.ts` 與腳本能直接 import 它。
+- UI/UX 全部在 `graph-ui`（`GitGraphViewer`），web app 與 extension 只負責資料來源與外框。
 
 ## 運作原理
 
@@ -85,10 +123,6 @@ libs/
 
 - 只顯示最近約 60 筆 × 分支數的歷史，更早的以「… 歷史已省略」標示；超大 repo 不會是完整圖。
 - 未登入時額度很小，連續開多個 repo 會遇到 rate limit（畫面會提示，並可跳到設定頁）。
-- 目前只支援 github.com（不含 GitHub Enterprise、GitLab）。
+- GitHub 來源目前只支援 github.com（不含 GitHub Enterprise、GitLab）；本機來源則任何 git repo 都可以。
+- web app 的本機快照預設讀最近 300 筆 commit、最多 8 條 branch（可用環境變數調整）。
 - 動畫在無 GPU 的環境（軟體 WebGL）會明顯掉幀，屬預期。
-
-## Stage 2（規劃）
-
-`apps/web`：Vite + React，`pnpm start` 於 localhost 渲染同一個 `GitGraphViewer`。資料來源預計兩種：
-GitHub API（沿用 `fetchGitHubGraph`）與 build-time 以 Vite plugin 執行 `git log` 產出的本機快照（離線、不吃 rate limit）。

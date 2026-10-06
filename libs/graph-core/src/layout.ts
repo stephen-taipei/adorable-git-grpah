@@ -1,4 +1,4 @@
-import { colorAt } from './palette';
+import { colorAt } from './palette.ts';
 import type {
   CommitInput,
   CommitKind,
@@ -10,7 +10,7 @@ import type {
   GraphNode,
   LayoutOptions,
   RefInput,
-} from './types';
+} from './types.ts';
 
 const DEFAULT_MAX_COMMITS = 400;
 /** 換 lane 時，S 型曲線佔用的 x 長度（grid unit）。 */
@@ -154,6 +154,9 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
 
   const order = topoOrder(commits);
   const n = order.length;
+  // 循環 / 自己を parent に持つ（壊れた or 偽造された）commit は topoOrder に出てこない。
+  // それらを parent とする辺を作ると後段で未配置ノードを参照して落ちるので、配置済みのものだけを辺の対象にする。
+  const placed = new Set(order);
 
   // 2. lane 配置（git log --graph 演算法）
   const defaultRef = data.refs.find((r) => r.kind === 'branch' && r.isDefault);
@@ -202,6 +205,7 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
         hidden.add(sha);
         return;
       }
+      if (!placed.has(p)) return;
       if (k === 0) {
         // 沿用同一條 lane；就算 parent 已被別條 lane 等待，也要保留，避免中途被別的 branch 佔用。
         lanes[lane] = p;

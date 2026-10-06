@@ -1,6 +1,7 @@
 export * from './scene/GitGraphScene';
 export * from './viewer/GitGraphCanvas';
 export * from './viewer/GitGraphViewer';
+export * from './viewer/ErrorBoundary';
 export * from './viewer/Mascot';
 export * from './i18n';
 import viewerCss from './viewer/viewer.css?inline';

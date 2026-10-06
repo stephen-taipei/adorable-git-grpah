@@ -24,6 +24,10 @@ export interface GitGraphViewerProps {
   onOpenSettings?: () => void;
   /** 預設：開新分頁前往 commit 的 GitHub 頁面。 */
   onSelectNode?: (node: GraphNode) => void;
+  /** 顯示在標題列正下方的額外控制項（例如資料來源切換）。 */
+  headerExtra?: ReactNode;
+  /** 資料來源的識別（例如 `local` / `github`）。同名 repo 換來源時不會被當成「剛 commit 了一筆」的增量更新。 */
+  sourceKey?: string;
 }
 
 function usePrefersDark(): boolean {
@@ -94,6 +98,8 @@ export function GitGraphViewer({
   onClose,
   onOpenSettings,
   onSelectNode,
+  headerExtra,
+  sourceKey,
 }: GitGraphViewerProps) {
   const loc = locale ?? detectLocale();
   const t = getMessages(loc);
@@ -134,6 +140,7 @@ export function GitGraphViewer({
           layout={layout}
           theme={sceneTheme}
           handleRef={canvasRef}
+          sourceKey={sourceKey}
           onHover={setHover}
           onSelect={select}
           onError={() => setWebglFailed(true)}
@@ -158,9 +165,11 @@ export function GitGraphViewer({
           <IconButton label={t.fit} onClick={() => canvasRef.current?.fit()}>
             <FitIcon />
           </IconButton>
-          <IconButton label={t.refresh} onClick={onRefresh}>
-            <RefreshIcon />
-          </IconButton>
+          {onRefresh && (
+            <IconButton label={t.refresh} onClick={onRefresh}>
+              <RefreshIcon />
+            </IconButton>
+          )}
           {onOpenSettings && (
             <IconButton label={t.settings} onClick={onOpenSettings}>
               <GearIcon />
@@ -173,6 +182,8 @@ export function GitGraphViewer({
           )}
         </div>
       </header>
+
+      {headerExtra && <div className="agg-subbar">{headerExtra}</div>}
 
       {state.kind === 'loading' && (
         <div className="agg-center" role="status">
