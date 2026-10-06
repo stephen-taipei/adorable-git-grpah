@@ -1,0 +1,10 @@
+node_modules
+dist
+.nx
+.vite
+*.log
+*.tsbuildinfo
+.DS_Store
+coverage
+test-results
+apps/extension/e2e/.artifacts

@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - libs/*
+
+# Supply-chain guard: 只安裝已發佈超過 24h 的版本（pnpm >= 10.16）
+minimumReleaseAge: 1440
+
+# 僅允許必要的 postinstall（pnpm 10 預設封鎖所有 lifecycle scripts）
+onlyBuiltDependencies:
+  - nx
