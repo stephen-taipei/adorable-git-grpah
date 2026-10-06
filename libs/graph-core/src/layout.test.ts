@@ -117,6 +117,27 @@ describe('buildLayout', () => {
     expect(l.edges).toHaveLength(1);
   });
 
+  it('survives broken / forged histories: self-parent and cycles never crash the layout', () => {
+    const l = buildLayout(
+      data(
+        [
+          commit('c', ['f1', 'b'], 5),
+          commit('b', ['a'], 3),
+          commit('a', [], 1),
+          commit('f1', ['f1'], 4), // 自己是自己的 parent
+          commit('x', ['y'], 2),
+          commit('y', ['x'], 2), // 互相為 parent 的環
+        ],
+        'c',
+      ),
+    );
+    expect(l.nodes.map((n) => n.sha).sort()).toEqual(['a', 'b', 'c']);
+    for (const e of l.edges) {
+      expect(l.nodes.some((n) => n.sha === e.from)).toBe(true);
+      expect(l.nodes.some((n) => n.sha === e.to)).toBe(true);
+    }
+  });
+
   it('clips to the newest maxCommits', () => {
     const cs = Array.from({ length: 10 }, (_, i) => commit(`c${i}`, i ? [`c${i - 1}`] : [], i));
     const l = buildLayout(data(cs, 'c9'), { maxCommits: 4 });

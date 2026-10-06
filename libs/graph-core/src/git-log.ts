@@ -7,11 +7,19 @@ import type { CommitInput, GraphData, RefInput } from './types.ts';
  *   git log --date-order --format=<LOG_FORMAT> -n <N> <selected refs…>
  */
 
-const US = '\x1f';
-const RS = '\x1e';
+/**
+ * git は commit メッセージ / ident に NUL を含めることを許さないので、`git log -z` の NUL を
+ * レコードとフィールドの区切りに使う（0x1e/0x1f などは本文に入り得るので区切りにできない）。
+ */
+const NUL = '\0';
+const FIELDS = 5;
 
-/** 刻意不取 email：只需要名稱，避免把個資放進前端 bundle。 */
-export const GIT_LOG_FORMAT = '%H%x1f%P%x1f%an%x1f%cI%x1f%B%x1e';
+/**
+ * 必ず `git log -z --format=GIT_LOG_FORMAT` で使うこと。
+ * メッセージは `%s`（1 行目）のみ：本文には Signed-off-by / Co-authored-by の email が入りがちで、
+ * 画面にも出さないので、バンドルや dev endpoint に載せない。email 自体も取得しない。
+ */
+export const GIT_LOG_FORMAT = '%H%x00%P%x00%an%x00%cI%x00%s';
 /** refname / objectname / peeled objectname（annotated tag 才有）以 TAB 分隔。 */
 export const GIT_REF_FORMAT = '%(refname)%09%(objectname)%09%(*objectname)';
 
@@ -88,6 +96,8 @@ export interface SelectedRefs {
  * 從所有 ref 中挑出要畫的：default → 目前 branch → 其餘（沿用輸入順序，建議以 committerdate 排序）。
  * 本機與 remote 同名且指向同一 commit 時只留本機；只存在於 remote 的 default 會以去掉 remote 前綴的名稱顯示。
  */
+const bare = (r: ParsedRef): string => (r.remote ? r.name.slice(r.remote.length + 1) : r.name);
+
 export function selectRefs(all: readonly ParsedRef[], opts: SelectRefsOptions = {}): SelectedRefs {
   const branches = all.filter((r) => r.kind === 'branch');
   const local = new Map(branches.filter((b) => !b.remote).map((b) => [b.name, b]));
@@ -120,9 +130,16 @@ export function selectRefs(all: readonly ParsedRef[], opts: SelectRefsOptions = 
     find(opts.currentBranch) ??
     candidates[0];
 
+  // `origin/main` を default に指定されても、同じ commit を指す本機 `main` があればそちらを使う（同名が 2 本並ばないように）
+  const twinOf = (r: ParsedRef | undefined): ParsedRef | undefined => {
+    if (!r?.remote) return r;
+    const twin = local.get(r.name.slice(r.remote.length + 1));
+    return twin && twin.sha === r.sha ? twin : r;
+  };
   const picked: ParsedRef[] = [];
   const add = (r: ParsedRef | undefined) => {
-    if (r && !picked.includes(r)) picked.push(r);
+    const ref = twinOf(r);
+    if (ref && !picked.includes(ref)) picked.push(ref);
   };
   add(def);
   add(find(opts.currentBranch));
@@ -130,7 +147,7 @@ export function selectRefs(all: readonly ParsedRef[], opts: SelectRefsOptions = 
   const limited = picked.slice(0, Math.max(1, opts.maxBranches ?? 8));
 
   const refs: RefInput[] = limited.map((b) => {
-    const isDefault = b === def;
+    const isDefault = b === twinOf(def);
     return {
       name: isDefault && b.remote ? b.name.slice(b.remote.length + 1) : b.name,
       sha: b.sha,
@@ -154,19 +171,24 @@ export function parseGitLog(
   commitUrl?: (sha: string) => string | undefined,
 ): CommitInput[] {
   const out: CommitInput[] = [];
-  for (const rec of text.split(RS)) {
-    const body = rec.replace(/^\n+/, '');
-    if (!body.trim()) continue;
-    const [sha = '', parents = '', author = '', date = '', ...rest] = body.split(US);
-    if (!/^[0-9a-f]{40,64}$/.test(sha)) continue;
+  const parts = text.split(NUL);
+  // NUL を含み得ないフィールドを FIELDS 個ずつ。先頭が sha でなければ 1 つ読み飛ばして同期を取り直す。
+  for (let i = 0; i + FIELDS <= parts.length;) {
+    const sha = (parts[i] ?? '').replace(/^\n+/, '');
+    if (!/^[0-9a-f]{40,64}$/.test(sha)) {
+      i++;
+      continue;
+    }
+    const [, parents = '', author = '', date = '', message = ''] = parts.slice(i, i + FIELDS);
     out.push({
       sha,
       parents: parents.split(' ').filter(Boolean),
       authorName: author,
       date,
-      message: rest.join(US).replace(/\s+$/, ''),
+      message: message.replace(/\s+$/, ''),
       url: commitUrl?.(sha),
     });
+    i += FIELDS;
   }
   return out;
 }

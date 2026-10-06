@@ -78,8 +78,13 @@ export function GitGraphCanvas({
     };
   }, []);
 
+  // 同一個 repo 的更新（例如剛 commit）走增量：只讓新的 commit 彈出來，並保留使用者的鏡頭
+  const prev = useRef<{ repo: string; nodes: number } | null>(null);
   useEffect(() => {
-    sceneRef.current?.setLayout(layout);
+    const repo = `${layout.repo.owner}/${layout.repo.name}`;
+    const incremental = prev.current?.repo === repo && prev.current.nodes > 0;
+    sceneRef.current?.setLayout(layout, { incremental });
+    prev.current = { repo, nodes: layout.nodes.length };
   }, [layout]);
 
   useEffect(() => {

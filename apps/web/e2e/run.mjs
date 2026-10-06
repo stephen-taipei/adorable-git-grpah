@@ -1,5 +1,6 @@
 // End-to-end：啟動真正的 dev server（pnpm start 同一份設定），用 Chromium 驗證：
-//   本機 git 快照 → 即時更新（不重新整理）→ GitHub 來源切換 / 輸入驗證 / token → 主題 → 本機 build + preview。
+//   本機 git 快照 → 即時更新（連續多次、不重新整理、保留鏡頭）→ GitHub 來源切換 / 輸入驗證 / token / 快取
+//   → 安全性（cross-origin 讀不到 dev endpoint）→ 主題 → 本機 build + preview。
 // 資料全部是 e2e 自己建立的暫時 git repo 與 mock GitHub API，不依賴網路。
 //   用法：pnpm e2e        （環境變數 CHROME_PATH 可指定 Chrome）
 import assert from 'node:assert/strict';
@@ -72,6 +73,8 @@ const freePort = () =>
     });
   });
 
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
 function startVite(args, env) {
   const proc = spawn(process.execPath, [viteBin, ...args], {
     cwd: root,
@@ -83,18 +86,26 @@ function startVite(args, env) {
   proc.stdout.on('data', (d) => (log += d));
   proc.stderr.on('data', (d) => (log += d));
   const ready = new Promise((ok, fail) => {
-    const t = setTimeout(() => fail(new Error(`vite did not start:\n${log}`)), 60_000);
-    const poll = setInterval(() => {
-      if (/localhost:\d+/.test(log.replace(/\x1b\[[0-9;]*m/g, ''))) {
-        clearTimeout(t);
-        clearInterval(poll);
-        ok();
-      }
+    // 所有結束路徑都要清掉計時器，否則失敗後行程會一直掛著
+    let timeout;
+    let poll;
+    const done = (fn) => (arg) => {
+      clearTimeout(timeout);
+      clearInterval(poll);
+      fn(arg);
+    };
+    timeout = setTimeout(done(fail), 60_000, new Error(`vite did not start:\n${log}`));
+    poll = setInterval(() => {
+      if (/localhost:\d+/.test(stripAnsi(log))) done(ok)();
     }, 100);
-    proc.once('exit', (code) => fail(new Error(`vite exited (${code}):\n${log}`)));
+    proc.once('exit', (code) => done(fail)(new Error(`vite exited (${code}):\n${log}`)));
   });
   return { proc, ready, log: () => log };
 }
+
+// mock 也會服務頭像 SVG；「有沒有打 GitHub API」只算 /repos 與 /rate_limit
+const apiCalls = () =>
+  seen.paths.filter((p) => p.startsWith('/repos') || p.startsWith('/rate_limit'));
 
 const waitUntil = async (cond, timeout = 20_000) => {
   const t = Date.now();
@@ -124,15 +135,17 @@ const apiBase = `http://127.0.0.1:${mock.address().port}`;
 const port = await freePort();
 const env = { AGG_REPO_DIR: repoDir, VITE_GITHUB_API_BASE: apiBase };
 
-const dev = startVite(['--port', String(port), '--strictPort'], env);
+let dev;
 let preview;
-const browser = await chromium.launch({
-  executablePath: findChrome(),
-  headless: true,
-  args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
-});
+let browser;
 
 try {
+  dev = startVite(['--port', String(port), '--strictPort'], env);
+  browser = await chromium.launch({
+    executablePath: findChrome(),
+    headless: true,
+    args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
+  });
   await dev.ready;
   const base = `http://localhost:${port}`;
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -144,14 +157,24 @@ try {
   const page = await ctx.newPage();
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   page.on('console', (m) => {
-    // 404 / 403 的 mock 回應會被 Chrome 記成 console.error，這是預期的
+    // 404 / 403 的 mock 回應與被 CORS 擋下的請求，Chrome 會記成 console.error：這是預期的
     if (m.type() === 'error' && !/Failed to load resource/.test(m.text()))
       errors.push(`console.error: ${m.text()}`);
   });
 
   const chips = async () => (await page.locator('.agg-chip').allInnerTexts()).join(' | ');
+  const commitCount = async () => Number(/^(\d+)/.exec(await chips())?.[1] ?? NaN);
   const replayDone = () =>
     page.locator('.agg-canvas[data-replay="done"]').waitFor({ timeout: 90_000 });
+  const graphInk = async () => {
+    const box = await page.locator('.agg-canvas').boundingBox();
+    const png = await page.screenshot({
+      clip: { x: box.x, y: box.y + 130, width: box.width, height: box.height - 230 },
+    });
+    return inkRatio(decoder, png);
+  };
+  const waitForCommits = (n) => waitUntil(async () => (await commitCount()) === n, 25_000);
+  let expected = 6;
 
   await step(
     'local snapshot: title, counts, branches, drawn pixels (no GitHub, no network)',
@@ -164,14 +187,10 @@ try {
       await replayDone();
       await page.waitForTimeout(1500);
       await page.screenshot({ path: resolve(artifacts, '1-local.png') });
-      const box = await page.locator('.agg-canvas').boundingBox();
-      const png = await page.screenshot({
-        clip: { x: box.x, y: box.y + 130, width: box.width, height: box.height - 230 },
-      });
-      const ratio = await inkRatio(decoder, png);
+      const ratio = await graphInk();
       console.log('  ink pixel ratio:', ratio.toFixed(4));
       assert.ok(ratio > 0.003, `graph area looks empty (${ratio})`);
-      assert.deepEqual(seen.paths, [], 'local mode must not touch the GitHub API');
+      assert.deepEqual(apiCalls(), [], 'local mode must not touch the GitHub API');
     },
   );
 
@@ -183,48 +202,137 @@ try {
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 6 });
     await page.locator('.agg-tip').waitFor({ timeout: 5000 });
     assert.match(await page.locator('.agg-tip').innerText(), /fix: side two/);
+    // 提示只含第一行：commit 本文與 email 不會出現在畫面上
+    assert.doesNotMatch(await page.locator('.agg-tip').innerText(), /@/);
     await page.screenshot({ path: resolve(artifacts, '2-hover.png') });
+    await page.getByRole('button', { name: /^(全景|Fit)$/ }).click();
+    await page.waitForTimeout(1500);
   });
 
   await step(
     'clicking a node opens the GitHub commit page of the remote (url derived from origin)',
     async () => {
       const box = await page.locator('.agg-canvas').boundingBox();
+      await page.locator('.agg-branch', { hasText: 'feat/x' }).click();
+      await page.waitForTimeout(1700);
       const [popup] = await Promise.all([
         ctx.waitForEvent('page'),
         page.mouse.click(box.x + box.width / 2, box.y + box.height / 2),
       ]);
       assert.match(popup.url(), /^https:\/\/github\.com\/octo\/cat\/commit\/[0-9a-f]{40}$/);
       await popup.close();
+      await page.getByRole('button', { name: /^(全景|Fit)$/ }).click();
+      await page.waitForTimeout(1500);
     },
   );
 
-  await step('LIVE: a new git commit appears without reloading the page', async () => {
-    await page.evaluate(() => (window.__alive = 'yes'));
-    commit(repoDir, 'live: brand new commit');
-    await waitUntil(async () => /^7 /.test(await chips()), 20_000);
-    assert.equal(await page.evaluate(() => window.__alive), 'yes', 'page must not have reloaded');
-    await replayDone();
-    await page.waitForTimeout(800);
-    await page.screenshot({ path: resolve(artifacts, '3-live-update.png') });
-  });
+  await step(
+    'LIVE: EVERY consecutive commit shows up without reloading (not just the first)',
+    async () => {
+      await page.evaluate(() => (window.__alive = 'yes'));
+      for (const msg of ['live: first', 'live: second', 'live: third', 'live: fourth']) {
+        commit(repoDir, msg);
+        expected++;
+        await waitForCommits(expected);
+        assert.equal(
+          await page.evaluate(() => window.__alive),
+          'yes',
+          'page must not have reloaded',
+        );
+      }
+      await replayDone();
+      await page.waitForTimeout(800);
+      await page.screenshot({ path: resolve(artifacts, '3-live-update.png') });
+    },
+  );
 
-  await step('LIVE: creating a branch and checking out is reflected too', async () => {
+  await step('LIVE: new branch, commit on it, switch back and forth — all reflected', async () => {
     git(repoDir, 'checkout', '-q', '-b', 'wip/new-idea');
     commit(repoDir, 'feat: idea');
-    await waitUntil(async () => /^8 /.test(await chips()) && /3 /.test(await chips()), 20_000);
+    expected++;
+    await waitForCommits(expected);
     assert.equal(await page.locator('.agg-branch', { hasText: 'wip/new-idea' }).count(), 1);
+    git(repoDir, 'checkout', '-q', 'main');
+    commit(repoDir, 'docs: back on main'); // 切回 main 之後的 commit 也要收得到
+    expected++;
+    await waitForCommits(expected);
+    git(repoDir, 'checkout', '-q', 'wip/new-idea');
+    commit(repoDir, 'feat: idea two');
+    expected++;
+    await waitForCommits(expected);
     git(repoDir, 'checkout', '-q', 'main');
   });
 
-  await step('refresh button re-reads the local repository', async () => {
-    await page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click();
-    await page.waitForTimeout(800);
-    assert.match(await chips(), /^8 /);
+  await step(
+    'LIVE: an update keeps the user’s camera and only animates the new commit',
+    async () => {
+      await page.getByRole('button', { name: /^(全景|Fit)$/ }).click();
+      await page.waitForTimeout(1500);
+      const fit = await graphInk();
+      // 在左側放大並停在那裡（遠離最新的 commit，所以鏡頭不會被帶去 HEAD）
+      const box = await page.locator('.agg-canvas').boundingBox();
+      await page.mouse.move(box.x + 160, box.y + box.height / 2);
+      for (let i = 0; i < 5; i++) {
+        await page.mouse.wheel(0, -300);
+        await page.waitForTimeout(120);
+      }
+      await page.mouse.move(box.x + box.width - 60, box.y + 140);
+      await page.waitForTimeout(900);
+      const before = await graphInk();
+      console.log(`  ink ratio fit=${fit.toFixed(4)} zoomed=${before.toFixed(4)}`);
+      assert.ok(before > fit * 1.4, 'the zoom step should visibly change the picture');
+
+      commit(repoDir, 'live: while zoomed');
+      expected++;
+      await waitForCommits(expected);
+      await replayDone();
+      await page.waitForTimeout(1200);
+      const after = await graphInk();
+      console.log(`  ink ratio after the update=${after.toFixed(4)}`);
+      assert.ok(
+        Math.abs(after - before) / before < 0.4,
+        `camera was reset by a live update (${before} → ${after})`,
+      );
+      await page.screenshot({ path: resolve(artifacts, '3b-camera-kept.png') });
+      await page.getByRole('button', { name: /^(全景|Fit)$/ }).click();
+      await page.waitForTimeout(1200);
+    },
+  );
+
+  await step('refresh button re-reads the local repository through the dev endpoint', async () => {
+    const [req] = await Promise.all([
+      page.waitForRequest((r) => r.url().endsWith('/__agg/git-snapshot')),
+      page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click(),
+    ]);
+    assert.equal(req.method(), 'GET');
+    await page.waitForTimeout(500);
+    assert.equal(await commitCount(), expected);
+  });
+
+  await step('SECURITY: other origins cannot read the dev snapshot endpoint', async () => {
+    const other = await ctx.newPage();
+    await other.goto(`${apiBase}/avatar/x.svg`); // 不同 origin（127.0.0.1:<另一個埠>）
+    const outcome = await other.evaluate(async (url) => {
+      try {
+        const res = await fetch(url);
+        return `readable:${res.status}`;
+      } catch {
+        return 'blocked';
+      }
+    }, `${base}/__agg/git-snapshot`);
+    assert.equal(
+      outcome,
+      'blocked',
+      'cross-origin pages must not be able to read local commit data',
+    );
+    await other.close();
+    // 同源（頁面自己）仍然可以
+    const same = await page.evaluate(async () => (await fetch('/__agg/git-snapshot')).status);
+    assert.equal(same, 200);
   });
 
   await step(
-    'source switch: GitHub 404 is friendly; invalid input is rejected client-side',
+    'source switch: GitHub 404 / rate limit are friendly; invalid input is rejected client-side',
     async () => {
       await page.getByRole('button', { name: /GitHub$/ }).click();
       const input = page.locator('.web-input');
@@ -232,7 +340,7 @@ try {
       await input.press('Enter');
       assert.equal(await input.getAttribute('aria-invalid'), 'true');
       assert.equal(new URL(page.url()).search, '', 'invalid input must not navigate');
-      assert.deepEqual(seen.paths, [], 'invalid input must not hit the API');
+      assert.deepEqual(apiCalls(), [], 'invalid input must not hit the API');
 
       await input.fill('ghost/missing');
       await input.press('Enter');
@@ -246,11 +354,31 @@ try {
       await input.press('Enter');
       await page.locator('.agg-center[role="alert"]').getByText(/60/).waitFor();
       assert.match(await page.locator('.agg-center').innerText(), /分鐘|min/);
+
+      // 相同網址再送一次不應多疊一筆歷史
+      const before = await page.evaluate(() => history.length);
+      await input.press('Enter');
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => history.length), before);
     },
   );
 
   await step(
-    'source switch: any GitHub repo renders through the same viewer (mock API)',
+    'LIVE: a commit made while viewing GitHub is there when you come back to Local',
+    async () => {
+      commit(repoDir, 'live: made while on GitHub');
+      expected++;
+      // 沒有在看本機圖的期間，推送也必須被收下
+      await page.waitForTimeout(1500);
+      await page.getByRole('button', { name: /Local$|本機$/ }).click();
+      await page.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
+      await waitForCommits(expected);
+      await page.getByRole('button', { name: /GitHub$/ }).click();
+    },
+  );
+
+  await step(
+    'source switch: any GitHub repo renders through the same viewer; deep link + cache',
     async () => {
       const input = page.locator('.web-input');
       await input.fill('https://github.com/demo/adorable-git-graph/tree/main');
@@ -261,6 +389,14 @@ try {
       await replayDone();
       await page.waitForTimeout(1500);
       await page.screenshot({ path: resolve(artifacts, '5-github.png') });
+
+      // deep link 重新整理：第二次要走 sessionStorage 快取，不再打 API
+      const requests = apiCalls().length;
+      await page.goto(`${base}/?repo=demo/adorable-git-graph`);
+      await page.locator('.agg-title-text', { hasText: 'demo/adorable-git-graph' }).waitFor();
+      await page.locator('.agg-canvas canvas').waitFor();
+      await page.waitForTimeout(500);
+      assert.equal(apiCalls().length, requests, 'the second load must be served from the cache');
     },
   );
 
@@ -270,6 +406,13 @@ try {
       seen.auth.length = 0;
       await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
       await page.locator('.web-dialog').waitFor();
+      // 對話框開著時，背景的 render（例如 refetch）不可以把焦點搶回輸入框
+      await page.getByRole('button', { name: /^(取消|Cancel)$/ }).focus();
+      await page.waitForTimeout(300);
+      assert.equal(
+        await page.evaluate(() => document.activeElement?.textContent?.trim()),
+        await page.getByRole('button', { name: /^(取消|Cancel)$/ }).innerText(),
+      );
       await page.screenshot({ path: resolve(artifacts, '6-token-dialog.png') });
       await page.locator('.web-dialog input[type="password"]').fill('github_pat_web_secret');
       await page.getByRole('button', { name: /^(儲存|Save)$/ }).click();
@@ -282,16 +425,24 @@ try {
         'token must not be rendered into the DOM',
       );
       assert.ok(seen.paths.every((p) => !p.includes('github_pat')));
-      // 清除
+      await page.locator('.agg-canvas canvas').waitFor();
+
+      // 帶 token 抓到的快取，token 移除後不可再被拿來顯示
+      const cacheEntries = () =>
+        page.evaluate(() =>
+          Object.keys(sessionStorage)
+            .filter((k) => k.startsWith('agg:gh:'))
+            .map((k) => JSON.parse(sessionStorage.getItem(k)).authed),
+        );
+      await waitUntil(async () => (await cacheEntries()).includes(true));
       await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
       await page.getByRole('button', { name: /^(清除|Clear)$/ }).click();
       assert.equal(await page.evaluate(() => localStorage.getItem('agg.github-token')), null);
-      assert.equal(
-        await page.evaluate(
-          () => Object.keys(sessionStorage).filter((k) => k.startsWith('agg:gh:')).length,
-        ),
-        0,
-        'clearing the token must purge cached GitHub data',
+      await page.locator('.agg-canvas canvas').waitFor();
+      await page.waitForTimeout(500);
+      assert.ok(
+        !(await cacheEntries()).includes(true),
+        'authenticated cache entries must not survive clearing the token',
       );
     },
   );
@@ -299,13 +450,19 @@ try {
   await step(
     'browser back/forward follow the source; Local button returns to the git snapshot',
     async () => {
-      await page.goBack(); // ghost/missing
-      await page.locator('.agg-center[role="alert"]').waitFor();
+      await page.goBack();
+      await waitUntil(
+        async () =>
+          new URL(page.url()).search.includes('demo') || new URL(page.url()).search === '',
+      );
+      const afterBack = new URL(page.url()).search;
+      await page.goForward();
+      await waitUntil(async () => new URL(page.url()).search !== afterBack);
       await page.getByRole('button', { name: /Local$|本機$/ }).click();
       await page.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
       await page.locator('.agg-canvas canvas').waitFor();
       assert.equal(new URL(page.url()).search, '');
-      assert.match(await chips(), /^8 /);
+      await waitForCommits(expected);
     },
   );
 
@@ -323,7 +480,7 @@ try {
   });
 
   await step(
-    'production build bakes the snapshot in and does not expose the dev endpoint',
+    'production build bakes the snapshot in, hides Refresh, and has no dev endpoint',
     async () => {
       const outDir = resolve(artifacts, 'dist');
       execFileSync(process.execPath, [viteBin, 'build', '--outDir', outDir, '--emptyOutDir'], {
@@ -349,7 +506,15 @@ try {
       const p2 = await ctx.newPage();
       await p2.goto(`http://localhost:${pPort}/`);
       await p2.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
-      await p2.locator('.agg-chip', { hasText: /^8 / }).first().waitFor();
+      await p2
+        .locator('.agg-chip', { hasText: new RegExp(`^${expected} `) })
+        .first()
+        .waitFor();
+      assert.equal(
+        await p2.getByRole('button', { name: /^(重新整理|Refresh)$/ }).count(),
+        0,
+        'a static build cannot re-read git',
+      );
       const res = await p2.request.get(`http://localhost:${pPort}/__agg/git-snapshot`);
       assert.ok(
         !(res.headers()['content-type'] ?? '').includes('json'),
@@ -364,11 +529,11 @@ try {
 } catch (err) {
   console.error('\n✘ web e2e failed:', err);
   if (errors.length) console.error('browser errors:\n' + errors.join('\n'));
-  console.error('\n--- vite log ---\n' + dev.log().slice(-1500));
+  if (dev) console.error('\n--- vite log ---\n' + dev.log().slice(-1500));
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  dev.proc.kill();
+  await browser?.close();
+  dev?.proc.kill();
   preview?.proc.kill();
   mock.close();
   rmSync(repoDir, { recursive: true, force: true });

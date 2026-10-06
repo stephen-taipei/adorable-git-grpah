@@ -161,9 +161,11 @@ export function GitGraphViewer({
           <IconButton label={t.fit} onClick={() => canvasRef.current?.fit()}>
             <FitIcon />
           </IconButton>
-          <IconButton label={t.refresh} onClick={onRefresh}>
-            <RefreshIcon />
-          </IconButton>
+          {onRefresh && (
+            <IconButton label={t.refresh} onClick={onRefresh}>
+              <RefreshIcon />
+            </IconButton>
+          )}
           {onOpenSettings && (
             <IconButton label={t.settings} onClick={onOpenSettings}>
               <GearIcon />

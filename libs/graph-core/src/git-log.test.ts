@@ -10,8 +10,9 @@ import {
 import { buildLayout } from './layout.ts';
 
 const sha = (n: number) => n.toString(16).padStart(40, '0');
+/** `git log -z --format=GIT_LOG_FORMAT` 的輸出：欄位與記錄一律以 NUL 分隔。 */
 const rec = (n: number, parents: number[], date: string, msg: string, author = 'amy') =>
-  [sha(n), parents.map(sha).join(' '), author, date, msg].join('\x1f') + '\x1e\n';
+  [sha(n), parents.map(sha).join(' '), author, date, msg].join('\0') + '\0';
 
 describe('parseGitHubRemote', () => {
   it.each([
@@ -105,6 +106,16 @@ describe('selectRefs', () => {
     expect(s.logRefs).toEqual(['refs/remotes/origin/main', 'refs/heads/work']);
   });
 
+  it('does not list the same branch twice when the default is given remote-qualified', () => {
+    for (const spelled of ['origin/main', 'refs/remotes/origin/main']) {
+      const s = selectRefs(all, { defaultBranch: spelled });
+      const names = s.refs.map((r) => r.name);
+      expect(new Set(names).size).toBe(names.length);
+      expect(s.refs.filter((r) => r.isDefault).map((r) => r.name)).toEqual(['main']);
+      expect(s.logRefs[0]).toBe('refs/heads/main');
+    }
+  });
+
   it('honours an explicit default and the branch cap', () => {
     const s = selectRefs(all, { defaultBranch: 'diverged', maxBranches: 2 });
     expect(s.refs.map((r) => r.name)).toEqual(['diverged', 'feat/x']);
@@ -123,17 +134,17 @@ describe('selectRefs', () => {
 
 describe('parseGitLog / buildGitGraphData', () => {
   const log =
-    rec(3, [2, 9], '2026-01-03T10:00:00+08:00', "Merge branch 'x'\n\nbody line") +
+    rec(3, [2, 9], '2026-01-03T10:00:00+08:00', "Merge branch 'x'") +
     rec(2, [1], '2026-01-02T10:00:00+08:00', 'feat: two', 'bob') +
     rec(9, [1], '2026-01-02T09:00:00+08:00', 'fix: side') +
     rec(1, [], '2026-01-01T10:00:00+08:00', 'chore: root');
 
-  it('splits records, keeps multi-line messages and parents order', () => {
+  it('splits records and keeps parents order', () => {
     const commits = parseGitLog(log, (s) => `https://example.test/${s.slice(-2)}`);
     expect(commits.map((c) => c.sha)).toEqual([sha(3), sha(2), sha(9), sha(1)]);
     expect(commits[0]).toMatchObject({
       parents: [sha(2), sha(9)],
-      message: "Merge branch 'x'\n\nbody line",
+      message: "Merge branch 'x'",
       authorName: 'amy',
       url: 'https://example.test/03',
     });
@@ -141,10 +152,29 @@ describe('parseGitLog / buildGitGraphData', () => {
     expect(commits[3]!.parents).toEqual([]);
   });
 
-  it('ignores garbage records and is robust to the exported format string', () => {
+  it('cannot be forged by control characters inside a commit subject', () => {
+    const forged = `fix: pwn\x1e${sha(77)}\x1f${sha(1)}\x1fLinus Torvalds\x1f2026-01-01T00:00:00+00:00\x1fforged\x1e\n`;
+    const commits = parseGitLog(
+      rec(5, [1], '2026-01-05T00:00:00Z', forged) + rec(1, [], '2026-01-01T00:00:00Z', 'root'),
+    );
+    expect(commits.map((c) => c.sha)).toEqual([sha(5), sha(1)]);
+    expect(commits[0]!.authorName).toBe('amy');
+    expect(commits[0]!.message.startsWith('fix: pwn')).toBe(true);
+  });
+
+  it('tolerates leading newlines, garbage and truncated output', () => {
     expect(parseGitLog('')).toEqual([]);
-    expect(parseGitLog('nonsense\x1e')).toEqual([]);
-    expect(GIT_LOG_FORMAT).toContain('%x1e');
+    expect(parseGitLog('nonsense\0')).toEqual([]);
+    expect(parseGitLog('\n' + rec(1, [], '2026-01-01T00:00:00Z', 'x'))).toHaveLength(1);
+    // 前面有一段雜訊（例如 gpg 驗證輸出）時，會讀掉雜訊後重新同步
+    const noisy = 'gpg: Signature made ...\0' + rec(1, [], '2026-01-01T00:00:00Z', 'x');
+    expect(parseGitLog(noisy).map((c) => c.sha)).toEqual([sha(1)]);
+    expect(parseGitLog(rec(1, [], '2026-01-01T00:00:00Z', 'x').slice(0, -10))).toEqual([]);
+    expect(GIT_LOG_FORMAT).toBe('%H%x00%P%x00%an%x00%cI%x00%s');
+  });
+
+  it('never asks git for emails or message bodies', () => {
+    expect(GIT_LOG_FORMAT).not.toMatch(/%a?e\b|%ae|%ce|%B|%b/);
   });
 
   it('produces GraphData that lays out correctly; tags only when their commit is loaded', () => {

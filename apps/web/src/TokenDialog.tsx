@@ -14,12 +14,16 @@ export function TokenDialog({
   const [value, setValue] = useState(token);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // onClose 的身分每次 render 都會變：放進 ref，避免 effect 重跑把焦點搶回輸入框
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     inputRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCloseRef.current();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, []);
 
   return (
     <div

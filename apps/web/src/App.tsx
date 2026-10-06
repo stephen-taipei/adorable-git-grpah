@@ -19,7 +19,9 @@ function useSource(): [Source, (s: Source) => void] {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
   const navigate = useCallback((next: Source) => {
-    history.pushState({}, '', `${location.pathname}${searchFromSource(next)}`);
+    const url = `${location.pathname}${searchFromSource(next)}`;
+    // 同一個網址不要再疊一筆歷史（否則上一頁要按好幾次才會動）
+    if (url !== `${location.pathname}${location.search}`) history.pushState({}, '', url);
     setSource(next);
   }, []);
   return [source, navigate];

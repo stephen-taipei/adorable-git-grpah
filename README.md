@@ -22,17 +22,24 @@ pnpm build            # 建置所有專案：extension → apps/extension/dist�
 
 - 預設讀**本機 git**（Vite plugin 執行 `git log`）：離線可用、不吃 GitHub rate limit、包含尚未 push 的 commit / branch。
 - **即時更新**：在終端機 `git commit` / 切 branch / `git fetch`，畫面會自己長出新的小球（不用重新整理，由 HMR 推送）。
+  只有**新增**的 commit 會彈出來，你目前的縮放與平移位置不會被重設（如果你本來就看著最新的 commit，鏡頭會輕輕帶過去）。
+  偵測方式：逐層監看 `.git` 的 `HEAD` / `packed-refs` / `refs/**` 目錄（不用遞迴 `fs.watch`，它在 Linux 上第二次 commit 起就會漏事件），
+  另有每 2 秒比對 ref 清單的安全網；git 暫時出錯時保留上一張好的圖，不會讓 dev server 掛掉。
 - 標題列下方的 `📍 本機 | 🐙 GitHub`：切到 GitHub 後輸入 `owner/repo` 或 GitHub 網址（也可直接開 `/?repo=owner/repo`），
   從瀏覽器直接呼叫 GitHub REST API（與 extension 同一套 `fetchGitHubGraph`），結果快取 10 分鐘。
   未登入每小時 60 次，點 ⚙ 可貼入 fine-grained PAT（只存 localStorage、只送往 `api.github.com`；更換 / 清除 token 會一併清掉快取）。
 - 🌓 切換 自動 / 白天 / 夜晚主題（會記住）；點 commit：有 GitHub remote 就開 commit 頁，否則複製完整 sha。
-- 環境變數：`AGG_REPO_DIR`（要看哪個 repo，預設就是本專案）、`AGG_MAX_COMMITS`（預設 300）、`AGG_MAX_BRANCHES`（預設 8）、
-  `AGG_DEFAULT_BRANCH`（預設依序：`origin/HEAD` → `main` → `master` → 目前 branch）。
+- 環境變數：`AGG_REPO_DIR`（要看哪個 repo，預設就是本專案；一般 repo、bare repo、shallow clone 都可以）、
+  `AGG_MAX_COMMITS`（預設 300，不再被 layout 偷偷截成 400）、`AGG_MAX_BRANCHES`（預設 8）、
+  `AGG_DEFAULT_BRANCH`（預設依序：`origin/HEAD` → `main` → `master` → 目前 branch；`main` 或 `origin/main` 兩種寫法都可以）。
   例如看另一個專案：`AGG_REPO_DIR=~/code/other pnpm start`。
 - `pnpm --filter @adorable/web build && pnpm --filter @adorable/web preview`：靜態版，**把建置當下的 git 快照烤進 bundle**。
 
-> ⚠️ 靜態版的 bundle 內含 commit 訊息與作者名稱（不含 email）。**不要把私有 repo 的建置結果公開部署**。
-> dev server 預設只綁 `localhost`；`/__agg/git-snapshot` 只存在於 dev，不會出現在 build 中（e2e 有驗證）。
+> ⚠️ 靜態版的 bundle 只含 **commit 的第一行（subject）與作者名稱**，不含 email 與 commit 本文（`Signed-off-by` / `Co-authored-by` 等 trailer 不會被讀進來）。
+> 但 subject、作者名與 branch / tag 名稱仍是公開資訊：**不要把私有 repo 的建置結果公開部署**。
+> dev server 預設只綁 `localhost`；`/__agg/git-snapshot` 只存在於 dev、只回應同源請求（其他 localhost 埠上的頁面讀不到，e2e 有驗證），不會出現在 build 中。
+> 靜態版沒有後端可重讀 git，因此不顯示重新整理按鈕。
+> `pnpm build` 不使用 Nx 快取 web（快照是建置當下的 git 狀態，不是檔案內容的函數）。
 
 ### 階段 1 · Chrome extension
 
@@ -63,7 +70,8 @@ pnpm e2e              # 真實 Chromium：web app + extension 端到端（見下
 在假的 `github.com` 頁面上驗證 FAB、overlay、繪圖、hover tooltip、點擊開 commit、縮放/平移、夜間主題、
 404 / rate-limit 錯誤畫面、快取命中與強制重抓、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
 **web**：啟動真正的 dev server，對一個臨時建立的 git repo 驗證本機快照、**commit / 建 branch 後畫面即時更新且不重新整理**、
-GitHub 來源切換（輸入驗證、404、rate limit、token 不外洩）、主題記憶、本機 build + preview（快照烤進 bundle、dev endpoint 不存在）。
+連續多次 commit / 切 branch、增量更新保留鏡頭、cross-origin 讀不到 dev endpoint、GitHub 來源切換（輸入驗證、404、rate limit、deep link 與快取、token 不外洩且移除後不留帶 token 的快取）、
+主題記憶、本機 build + preview（快照烤進 bundle、無 Refresh、dev endpoint 不存在）。
 
 兩者的截圖輸出到各自的 `e2e/.artifacts/`。找不到 Chrome 時設定 `CHROME_PATH`。
 

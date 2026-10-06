@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { GitGraphViewer } from '@adorable/graph-ui';
+import { ErrorBoundary, GitGraphViewer } from '@adorable/graph-ui';
 import { sendToBackground } from '../shared/messages';
 import type { RepoRef } from '../shared/repo';
 import { useGraph } from './useGraph';
@@ -51,14 +51,16 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
         aria-modal="true"
         aria-label={`Git graph · ${repo.owner}/${repo.repo}`}
       >
-        <GitGraphViewer
-          title={`${repo.owner}/${repo.repo}`}
-          state={state}
-          theme={githubTheme()}
-          onRefresh={refresh}
-          onClose={onClose}
-          onOpenSettings={() => void sendToBackground({ type: 'open-options' })}
-        />
+        <ErrorBoundary>
+          <GitGraphViewer
+            title={`${repo.owner}/${repo.repo}`}
+            state={state}
+            theme={githubTheme()}
+            onRefresh={refresh}
+            onClose={onClose}
+            onOpenSettings={() => void sendToBackground({ type: 'open-options' })}
+          />
+        </ErrorBoundary>
       </div>
     </div>
   );
