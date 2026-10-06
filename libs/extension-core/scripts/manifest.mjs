@@ -33,6 +33,14 @@ export function createManifest({
   apiBase = GITHUB_API_ORIGIN,
   extraMatches = [],
 }) {
+  // 手書きの樣式は hostPattern() を通らないので、ポート付き（Firefox では黙って無効になる）をここで弾く
+  for (const m of extraMatches) {
+    if (/^[a-z*]+:\/\/[^/]+:\d+\//.test(m)) {
+      throw new Error(
+        `Match pattern must not include a port (it would silently never match): ${m}`,
+      );
+    }
+  }
   // Set で重複を排除（e2e では apiBase と extraMatches が同じホストになる）
   const hostPermissions = new Set([
     `${GITHUB_API_ORIGIN}/*`,

@@ -4,12 +4,26 @@
   "namedInputs": {
     "default": ["{projectRoot}/**/*", "sharedGlobals"],
     "sharedGlobals": ["{workspaceRoot}/tsconfig.base.json", "{workspaceRoot}/pnpm-lock.yaml"],
-    "production": ["default", "!{projectRoot}/**/*.test.ts", "!{projectRoot}/e2e/**/*"]
+    "production": ["default", "!{projectRoot}/**/*.test.ts", "!{projectRoot}/e2e/**/*"],
+    "buildEnv": [
+      {
+        "env": "AGG_DEV"
+      },
+      {
+        "env": "AGG_API_BASE"
+      },
+      {
+        "env": "AGG_EXTRA_MATCH"
+      },
+      {
+        "env": "AGG_OUT_DIR"
+      }
+    ]
   },
   "targetDefaults": {
     "build": {
       "dependsOn": ["^build"],
-      "inputs": ["production", "^production"],
+      "inputs": ["production", "^production", "buildEnv"],
       "outputs": ["{projectRoot}/dist"],
       "cache": true
     },
@@ -37,7 +51,7 @@
     },
     "lint": {
       "dependsOn": ["build"],
-      "inputs": ["production", "^production"],
+      "inputs": ["production", "^production", "buildEnv"],
       "cache": true
     }
   }

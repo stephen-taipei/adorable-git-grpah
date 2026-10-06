@@ -12,8 +12,9 @@ import { startFakeGithub } from '../../../tools/e2e/fake-github-page.mjs';
 import { SPECS, seen, startMock } from '../../../tools/e2e/mock-github-api.mjs';
 import { inkRatio } from '../../../tools/e2e/pixels.mjs';
 import {
+  backgroundControl,
   backgroundHandle,
-  chromeEval,
+  extensionConsoleErrors,
   clickExtByText,
   clickToolbarButton,
   fillExt,
@@ -237,13 +238,22 @@ try {
   });
 
   await step(
-    'mouse wheel zooms and a drag pans — and a drag must NOT open a commit page',
+    'mouse wheel zooms in (picture changes) and a drag must NOT open a commit page',
     async () => {
       const before = newTabs;
+      await button(/^(Fit|全景)$/);
+      await sleep(1500);
+      const fit = await graphInk();
       const box = await canvasBox();
-      await page.mouse.move(box.x + 400, box.y + 400);
-      await page.mouse.wheel({ deltaY: -300 });
-      await sleep(200);
+      await page.mouse.move(box.x + 160, box.y + box.height / 2);
+      for (let i = 0; i < 5; i++) {
+        await page.mouse.wheel({ deltaY: -300 });
+        await sleep(120);
+      }
+      await sleep(900);
+      const zoomed = await graphInk();
+      console.log(`  ink ratio fit=${fit.toFixed(4)} zoomed=${zoomed.toFixed(4)}`);
+      assert.ok(zoomed > fit * 1.3, 'the wheel should zoom in and visibly change the picture');
       await page.mouse.down();
       await page.mouse.move(box.x + 700, box.y + 450, { steps: 8 });
       await page.mouse.up();
@@ -368,9 +378,13 @@ try {
       await button(/^(Refresh|重新整理)$/);
       await waitUntil(() => seen.auth.length > 0);
       assert.ok(seen.auth.every((a) => a === 'Bearer github_pat_e2e_secret'));
+      // extension 的畫面都在 open shadow root 裡，page.content() 看不到，所以連 shadow tree 一起檢查
+      const shadowHtml = await shadow((sr) => sr?.innerHTML ?? '');
+      assert.ok(shadowHtml.length > 100, 'expected to read the overlay markup');
       assert.ok(
-        !(await page.content()).includes('github_pat_e2e_secret'),
-        'token must never reach the page DOM',
+        !(await page.content()).includes('github_pat_e2e_secret') &&
+          !shadowHtml.includes('github_pat_e2e_secret'),
+        'token must never reach the page DOM (light or shadow)',
       );
       assert.ok(
         seen.paths.every((p) => !p.includes('github_pat')),
@@ -382,34 +396,29 @@ try {
   );
 
   await step(
-    'the event page still answers after it has been idle past its timeout (suspend → wake)',
+    'the event page is suspended, and the next request wakes it and is answered (suspend → wake)',
     async () => {
-      // 本機預設 30 秒就會停掉 event page；縮短到 3 秒，等它真的停掉，再用一個「必須由 background 回應」的操作確認它會被喚醒
-      await chromeEval(browser, () =>
-        Services.prefs.setIntPref('extensions.background.idle.timeout', 3000),
+      // 直接終止 event page（見 backgroundControl 的說明），而不是等閒置逾時
+      assert.equal(await backgroundControl(browser, GECKO_ID, 'terminate'), 'stopped');
+      assert.equal(await backgroundControl(browser, GECKO_ID, 'state'), 'stopped');
+      const before = apiCalls();
+      await openOverlay();
+      await button(/^(Refresh|重新整理)$/);
+      await waitUntil(() => apiCalls() > before);
+      await waitFor('.agg-canvas canvas');
+      assert.equal(
+        await exists('.agg-center[role="alert"]'),
+        false,
+        'the woken event page must serve the request',
       );
-      try {
-        await sleep(7000);
-        const before = apiCalls();
-        await openOverlay();
-        await button(/^(Refresh|重新整理)$/);
-        await waitUntil(() => apiCalls() > before);
-        await waitFor('.agg-canvas canvas');
-        assert.equal(
-          await exists('.agg-center[role="alert"]'),
-          false,
-          'the woken event page must serve the request',
-        );
-        await page.keyboard.press('Escape');
-        await waitGone('.agg-panel');
-      } finally {
-        await chromeEval(browser, () =>
-          Services.prefs.setIntPref('extensions.background.idle.timeout', 600000),
-        );
-      }
+      assert.equal(await backgroundControl(browser, GECKO_ID, 'state'), 'running');
+      await page.keyboard.press('Escape');
+      await waitGone('.agg-panel');
     },
   );
 
+  // event page / options page 的未捕捉錯誤（content script 的錯誤已由 page 的 console 事件收進 errors）
+  errors.push(...(await extensionConsoleErrors(browser, EXT_UUID)));
   assert.deepEqual(errors, [], `unexpected console errors:\n${errors.join('\n')}`);
   console.log(`\nAll ${results.length} Firefox e2e steps passed. Screenshots → ${artifacts}`);
 } catch (err) {

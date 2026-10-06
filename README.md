@@ -16,7 +16,7 @@ branch 是流動著箭頭的管線，merge / fork 會自己長出來。純前端
 ```bash
 pnpm install
 pnpm start            # 階段 2：http://localhost:4200 ，顯示「本專案」的 git graph
-pnpm build            # 建置所有專案：extension → apps/extension/dist、web → apps/web/dist
+pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Firefox → apps/extension-firefox/dist、web → apps/web/dist
 ```
 
 ### 階段 2 · Web app（`pnpm start`）
@@ -68,7 +68,7 @@ pnpm --filter @adorable/extension-firefox build     # → apps/extension-firefox
 - 使用方式、畫面與 Chrome 版完全相同（同一份原始碼、同一套 `GitGraphViewer`）。
 - Firefox 的 MV3 把 host 權限當成使用者可撤銷的「網站存取」：若在附加元件設定裡關掉 `github.com` 的存取，浮動按鈕就不會出現，點工具列圖示會看到 `!` 徽章。
 
-**與 Chrome 版的差異**（全部在 `libs/extension-core/scripts/manifest.mjs`，程式碼沒有分支）
+**與 Chrome 版的差異**（manifest 全部在 `libs/extension-core/scripts/manifest.mjs`；另外 vite 轉譯目標依瀏覽器各取其最低版本，`build.mjs` 內一行；應用程式碼沒有分支）
 
 |            | Chrome                        | Firefox                                                                   |
 | ---------- | ----------------------------- | ------------------------------------------------------------------------- |
@@ -76,15 +76,23 @@ pnpm --filter @adorable/extension-firefox build     # → apps/extension-firefox
 | 識別       | —                             | `browser_specific_settings.gecko.id`（GUID）+ `strict_min_version: 140.0` |
 | 其他       | `minimum_chrome_version: 116` | `gecko_android.strict_min_version: 142.0`、`data_collection_permissions`  |
 
-event page 閒置 30 秒會被停掉、等待中的非同步回應不會延命，所以 background 對 GitHub 的請求一律設 25 秒上限（逾時會顯示「網路錯誤」而不是莫名失敗）。
+event page 閒置 30 秒會被停掉，而以 `sendResponse` 非同步回覆的訊息不會延長它的壽命（背景若改成回傳 Promise 則可以，目前沒這樣做），
+所以 background 對 GitHub 的請求設了 25 秒上限（`AbortSignal.timeout`；兩個瀏覽器共用同一份程式，逾時顯示「網路錯誤」而不是莫名失敗）。
 
 #### AMO 上架（addons.mozilla.org）
 
 ```bash
-pnpm --filter @adorable/extension-firefox build
+git status                                         # 必須是乾淨的（已 commit）：source zip 取自 HEAD
+pnpm --filter @adorable/extension-firefox release  # 一條龍：以乾淨環境建置 → 檢查產物 → lint → 打包 add-on → 打包 source zip
+```
+
+`release`（`apps/extension-firefox/scripts/release.mjs`）做的事，也可以分開跑：
+
+```bash
+pnpm --filter @adorable/extension-firefox build           # 注意：會吃環境裡殘留的 AGG_* 變數（開發 / e2e 用）；release 會先清掉
 pnpm --filter @adorable/extension-firefox lint            # web-ext lint：目前 0 個錯誤
 pnpm --filter @adorable/extension-firefox package         # → web-ext-artifacts/adorable_git_graph-<version>.zip
-pnpm --filter @adorable/extension-firefox package:source  # → web-ext-artifacts/adorable-git-graph-source.zip（git archive）
+pnpm --filter @adorable/extension-firefox package:source  # → web-ext-artifacts/adorable-git-graph-source.zip（git archive HEAD；working tree 不乾淨會拒絕）
 ```
 
 - **原始碼要一起上傳**：bundle 是壓縮過的（React、three.js），AMO 審查要求提供原始碼與建置步驟。`package:source` 產生的壓縮檔含 `pnpm-lock.yaml`；
@@ -94,7 +102,8 @@ pnpm --filter @adorable/extension-firefox package:source  # → web-ext-artifact
 - **`strict_min_version` 為什麼是 140**：`data_collection_permissions` 是 Firefox 140（Android 142）才有的欄位，宣告它就不能把最低版本設得更低（`web-ext lint` 會警告）。
 - ⚠️ **請自行確認 `data_collection_permissions: { required: ["none"] }` 是否符合 AMO 的政策**（信心：中低）。本 extension 不會把任何資料送給開發者，
   但會把 repo 的 owner / 名稱，以及使用者**自行輸入**的 GitHub token 送到 `api.github.com`；Mozilla 是否把這算作「資料收集」我無法確認（政策頁面在此環境讀不到）。
-  若審查不接受，零程式碼的修法是改成 `required: ["authenticationInfo"]`。
+  若審查不接受，可能的修法是把 token 宣告成**選用**的資料類別（`optional: ["authenticationInfo"]`，使用者不輸入 token 就沒有任何資料送出）；
+  不要直接改成 `required`，那會在安裝時對一個選用功能要求同意。實際該宣告什麼請以 AMO 當時的政策為準。
 - Firefox for Android 沒有測試過（觸控縮放尚未支援），`gecko_android` 只是為了讓 manifest 通過檢查。
 
 ### 開發
@@ -108,9 +117,9 @@ pnpm test             # vitest：layout 演算法、git log 解析、GitHub clie
 pnpm e2e              # 真實瀏覽器：web app + Chrome extension + Firefox extension 端到端（見下）
 ```
 
-`pnpm e2e` 會依序跑 web、Chrome extension、Firefox extension 三套端到端測試。
+`pnpm e2e` 會一次一套（`--parallel=1`）跑 Chrome extension、web、Firefox extension 三套端到端測試（順序由 nx 決定）。
 
-**extension**：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
+**Chrome extension**：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
 在假的 `github.com` 頁面上驗證 FAB、overlay、繪圖、hover tooltip、點擊開 commit、縮放/平移、夜間主題、
 404 / rate-limit 錯誤畫面、快取命中與強制重抓、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
 **web**：啟動真正的 dev server，對一個臨時建立的 git repo 驗證本機快照、**commit / 建 branch 後畫面即時更新且不重新整理**、
@@ -118,14 +127,15 @@ pnpm e2e              # 真實瀏覽器：web app + Chrome extension + Firefox e
 主題記憶、本機 build + preview（快照烤進 bundle、無 Refresh、dev endpoint 不存在）。
 
 **Firefox extension**：用 puppeteer-core 經 WebDriver BiDi 驅動**真正的 Firefox**，載入打包後的 add-on（等同「載入暫時性附加元件」），
-頁面由本機假的 github 伺服器提供（Firefox 無法攔截 `https://github.com`，所以 e2e 版 manifest 額外比對 `http://127.0.0.1/*`）。
-涵蓋 14 個步驟：FAB、真實 WebGL 繪圖、hover、點擊開 commit 分頁、拖曳**不會**誤開分頁、快取與強制重抓、夜間主題、SPA 換頁的錯誤畫面、
+頁面由本機假的 github 伺服器提供（e2e 版 manifest 額外比對 `http://127.0.0.1/*`，所以跑的不是正式 manifest；正式 manifest 由單元測試、`web-ext lint` 與 `release` 的產物檢查把關）。
+涵蓋 14 個步驟：FAB、真實 WebGL 繪圖、hover、點擊開 commit 分頁、滾輪放大（畫面像素有變）與拖曳**不會**誤開分頁、快取與強制重抓、夜間主題、SPA 換頁的錯誤畫面、
 **真的按下工具列按鈕**（`action.onClicked` → `tabs.sendMessage`）、沒有 content script 的頁面顯示 `!` 徽章、從設定按鈕開 `moz-extension://…/options.html` 並驗證 token 只以 Bearer header 送出、
-以及 event page 閒置超過逾時後仍能被喚醒回應。
+以及 **event page 被終止後**（直接呼叫 Firefox 內部的 `terminateBackground()`，確認狀態為 `stopped`）下一個請求能喚醒它並正常回應。
+另外，結尾會檢查 content script、event page、options 頁都沒有未捕捉的 console 錯誤，token 也不得出現在頁面（含 shadow DOM）或任何 URL。
 需求：Firefox（`FIREFOX_PATH` 可指定）與 Xvfb（headless Firefox 沒有 EGL，WebGL 要靠虛擬顯示器；或用 `xvfb-run` 包起來）。
 找不到 Firefox 時會提示並略過，設了 `CI` 或 `REQUIRE_FIREFOX` 則視為失敗。
 
-兩者的截圖輸出到各自的 `e2e/.artifacts/`。Chrome 找不到時設定 `CHROME_PATH`。
+三套的截圖輸出到各自的 `e2e/.artifacts/`。Chrome 找不到時設定 `CHROME_PATH`；`FIREFOX_PATH` 指向不存在的檔案會直接報錯（不會悄悄改用別的 Firefox）。
 
 ## 專案結構
 
@@ -144,10 +154,11 @@ libs/
 tools/e2e/              e2e 共用：Chrome 偵測、mock GitHub API（含 CORS）、假的 GitHub 頁面、截圖像素判斷
 ```
 
-- `libs/*` 以 `exports → src/index.ts` 提供原始碼，由使用端 bundler 編譯，不需獨立 build。
+- `graph-core` / `graph-ui` 以 `exports → src/index.ts` 提供原始碼，由使用端 bundler 編譯，不需獨立 build；`extension-core` 例外：它是建置工具 + 原始碼套件（`exports` 為 `./build`、`./manifest`、`./icons`），由兩個 extension app 呼叫。
 - `graph-core` 是 **Node 可直接執行的 TS**（相對 import 帶 `.ts`、`erasableSyntaxOnly`），所以 `vite.config.ts` 與腳本能直接 import 它。
 - UI/UX 全部在 `graph-ui`（`GitGraphViewer`），web app 與 extension 只負責資料來源與外框。
-- 兩個瀏覽器版本的原始碼是同一份（`libs/extension-core`）；差異只在 manifest（`createManifest({ target })`），有單元測試鎖住。
+- 兩個瀏覽器版本的原始碼是同一份（`libs/extension-core`）；差異只在 manifest（`createManifest({ target })`）與 vite 轉譯目標，manifest 有單元測試鎖住。
+- Nx 的 `build` 快取已把 `AGG_*` 環境變數算進 hash（它們會改變產物），所以 dev / e2e 的建置不會被當成正式版從快取還原；`pnpm --filter … build` 本來就繞過 Nx。
 
 ## 運作原理
 

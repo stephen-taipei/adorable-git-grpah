@@ -15,8 +15,10 @@ export const fakeGithubPage = (title) => `<!doctype html>
 
 /**
  * 在本機起一個假的 github.com：任何路徑都回傳假頁面。
- * Firefox 無法像 Playwright 那樣攔截 https://github.com 的請求，所以 e2e 改成讓 content script
- * 額外比對 `http://127.0.0.1/*`（見 libs/extension-core 的 AGG_EXTRA_MATCH），頁面由這個伺服器提供。
+ * Firefox e2e 沒有照 Chrome e2e 的做法攔截 https://github.com，而是讓 content script 額外比對 `http://127.0.0.1/*`
+ * （見 libs/extension-core 的 AGG_EXTRA_MATCH），頁面由這個伺服器提供：不依賴請求攔截、網路完全封閉，比較單純。
+ * 代價：Firefox e2e 跑的是「多了本機 match 的 e2e 建置」，不是正式打包的 manifest；正式 manifest 由
+ * manifest.test.mjs 與 `web-ext lint` 把關，release 腳本也會再檢查一次產物。
  * @returns {Promise<import('node:http').Server>}
  */
 export function startFakeGithub() {

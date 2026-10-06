@@ -69,6 +69,14 @@ describe('createManifest', () => {
     }
   });
 
+  it('rejects hand-written extra matches that carry a port', () => {
+    for (const target of ['chrome', 'firefox']) {
+      expect(() =>
+        createManifest({ ...base, target, extraMatches: ['http://127.0.0.1:4321/*'] }),
+      ).toThrow(/must not include a port/);
+    }
+  });
+
   it('rejects unknown targets', () => {
     expect(() => createManifest({ ...base, target: 'safari' })).toThrow(/Unknown target/);
   });

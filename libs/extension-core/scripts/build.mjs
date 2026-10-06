@@ -1,4 +1,4 @@
-// extension 的共用建置：Chrome 與 Firefox 版本用同一份原始碼，只有 manifest 不同。
+// extension 的共用建置：Chrome 與 Firefox 版本用同一份原始碼；只有 manifest 與轉譯目標版本（vite target）依瀏覽器而不同。
 //   content.js    → IIFE（content script 不能使用 ES module import）
 //   background.js → IIFE（Chrome：service worker；Firefox：event page）
 //   options.html  → 一般 Vite 頁面
@@ -49,8 +49,8 @@ export async function buildExtension({ target, appRoot, watch = false, env = pro
     emptyOutDir: false,
     minify: !dev,
     sourcemap: dev,
-    // Chrome 116 / Firefox 128（manifest 的最低版本）都支援
-    target: target === 'firefox' ? 'firefox128' : 'chrome116',
+    // 與 manifest 的最低版本一致：Chrome 116 / Firefox 140（見 manifest.mjs 的 strict_min_version）
+    target: target === 'firefox' ? 'firefox140' : 'chrome116',
     watch: watch ? {} : null,
     reportCompressedSize: false,
   };

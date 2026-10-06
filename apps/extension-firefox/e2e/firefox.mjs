@@ -8,8 +8,13 @@ import puppeteer from 'puppeteer-core';
 
 /** 找得到的第一個 Firefox：FIREFOX_PATH → 常見位置 → PATH。找不到回傳 undefined。 */
 export function findFirefox() {
+  const explicit = process.env.FIREFOX_PATH;
+  if (explicit && !existsSync(explicit)) {
+    // 明確指定卻打錯路徑時，不要默默改用別的 Firefox（或在沒有 CI 變數的環境「略過」而回報成功）
+    throw new Error(`FIREFOX_PATH 指向不存在的檔案：${explicit}`);
+  }
   const candidates = [
-    process.env.FIREFOX_PATH,
+    explicit,
     '/opt/ff-env/bin/firefox',
     '/usr/bin/firefox',
     '/usr/lib/firefox/firefox',
@@ -50,7 +55,16 @@ export function startXvfb() {
       buf += d;
       if (buf.includes('\n')) {
         p.removeAllListeners('exit');
-        resolve({ display: `:${buf.trim()}`, stop: () => p.kill() });
+        const stop = () => p.kill();
+        // Ctrl-C / 被 kill 時別留下孤兒 Xvfb（puppeteer 自己只管 Firefox）
+        process.once('exit', stop);
+        for (const sig of ['SIGINT', 'SIGTERM']) {
+          process.once(sig, () => {
+            stop();
+            process.exit(130);
+          });
+        }
+        resolve({ display: `:${buf.trim()}`, stop });
       }
     });
   });
@@ -138,6 +152,47 @@ export async function clickToolbarButton(browser, geckoId) {
   );
 }
 
+/**
+ * 在瀏覽器內部（chrome 範圍）取得 extension 物件並對 event page 做事。
+ *   'terminate' : 立刻停掉 event page（等同閒置逾時；`extensions.background.idle.timeout` 的計時器只在背景啟動時武裝一次，
+ *                 事後改 pref 不會生效，所以不能靠縮短逾時來測 suspend）
+ *   'state'     : 'running' | 'stopped' | …（ext.backgroundState）
+ * 用到 Firefox 內部 API（ExtensionParent）：升級 Firefox 時要重新驗證。
+ */
+export function backgroundControl(browser, geckoId, op) {
+  return chromeEval(
+    browser,
+    async (id, what) => {
+      const { ExtensionParent } = ChromeUtils.importESModule(
+        'resource://gre/modules/ExtensionParent.sys.mjs',
+      );
+      const ext = ExtensionParent.GlobalManager.getExtension(id);
+      if (!ext) throw new Error(`extension ${id} not found`);
+      if (what === 'terminate') await ext.terminateBackground();
+      return ext.backgroundState;
+    },
+    geckoId,
+    op,
+  );
+}
+
+/** extension 自己的頁面 / event page 丟出的 console 錯誤（content script 的在 page 的 console 事件裡，這裡抓不到的那一半）。 */
+export function extensionConsoleErrors(browser, uuid) {
+  return chromeEval(
+    browser,
+    (u) =>
+      (Services.console.getMessageArray() ?? [])
+        .filter(
+          (m) =>
+            m instanceof Ci.nsIScriptError &&
+            !(m.flags & Ci.nsIScriptError.warningFlag) &&
+            (m.sourceName ?? '').startsWith(`moz-extension://${u}/`),
+        )
+        .map((m) => `${m.sourceName}:${m.lineNumber} ${m.errorMessage}`),
+    uuid,
+  );
+}
+
 // ---- 分頁 --------------------------------------------------------------------------------------
 /** 被擋掉的網路請求會變成 about:neterror / about:certerror?...&u=<原網址>：還原成原本要去的網址，其他網址不變。 */
 export function realUrl(u) {
@@ -164,14 +219,25 @@ export async function tabUrl(page) {
 
 /** 執行 `action`，回傳它開出來的第一個分頁（window.open、runtime.openOptionsPage…）。 */
 export async function newTabFrom(browser, action, timeout = 10000) {
+  let timer;
+  let onCreated;
   const created = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`no new tab within ${timeout}ms`)), timeout);
-    browser.once('targetcreated', (target) => {
+    timer = setTimeout(() => reject(new Error(`no new tab within ${timeout}ms`)), timeout);
+    onCreated = (target) => {
       clearTimeout(timer);
       resolve(target);
-    });
+    };
+    browser.once('targetcreated', onCreated);
   });
-  await action();
+  try {
+    await action();
+  } catch (err) {
+    // action 本身失敗：收掉計時器與監聽，否則 10 秒後會再冒出一個誤導的 "no new tab" 未處理 rejection
+    clearTimeout(timer);
+    browser.off('targetcreated', onCreated);
+    created.catch(() => {});
+    throw err;
+  }
   return (await created).page();
 }
 
