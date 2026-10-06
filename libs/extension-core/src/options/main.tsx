@@ -15,7 +15,7 @@ const T = {
     tokenHelp:
       '未登入每小時只能呼叫 60 次 GitHub API；加入 token 可提升到 5,000 次，並可讀取私有 repo。',
     tokenWarn:
-      '請使用 fine-grained token，Repository access 只勾要看的 repo，權限只開 Contents: Read-only 與 Metadata: Read-only。Token 只存在本機 chrome.storage.local，且只會送往 api.github.com。請勿使用有寫入權限的 token。',
+      '請使用 fine-grained token，Repository access 只勾要看的 repo，權限只開 Contents: Read-only 與 Metadata: Read-only。Token 只存在這個瀏覽器的本機 extension 儲存空間，且只會送往 api.github.com。請勿使用有寫入權限的 token。',
     maxBranches: '最多顯示幾條分支',
     maxCommits: '每條分支抓幾筆 commit',
     cache: '快取（分鐘，0 = 不快取）',
@@ -34,7 +34,7 @@ const T = {
     tokenHelp:
       'Anonymous requests are limited to 60 GitHub API calls per hour. A token raises that to 5,000 and unlocks private repositories.',
     tokenWarn:
-      'Use a fine-grained token limited to the repositories you want to view, with only Contents: Read-only and Metadata: Read-only. It is stored in local chrome.storage only and sent solely to api.github.com. Never use a token with write access.',
+      'Use a fine-grained token limited to the repositories you want to view, with only Contents: Read-only and Metadata: Read-only. It is stored only in the local extension storage of this browser and sent solely to api.github.com. Never use a token with write access.',
     maxBranches: 'Max branches to show',
     maxCommits: 'Commits fetched per branch',
     cache: 'Cache (minutes, 0 = off)',

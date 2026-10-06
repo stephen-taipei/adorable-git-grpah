@@ -11,6 +11,16 @@ export const GECKO_ID = '{a7e41ba9-0aed-427f-8ecb-26518af4920a}';
 export const GITHUB_API_ORIGIN = 'https://api.github.com';
 
 /**
+ * URL → match pattern。**ポートは含めない**：Firefox は `http://127.0.0.1:1234/*` のようなポート付きパターンを
+ * エラーも警告も出さずに受け付け、そして決してマッチしない（host 許可としても効かない）。
+ * `http://127.0.0.1/*` なら任意のポートにマッチする。
+ */
+export function hostPattern(url) {
+  const u = new URL(url);
+  return `${u.protocol}//${u.hostname}/*`;
+}
+
+/**
  * @param {object} o
  * @param {'chrome' | 'firefox'} o.target
  * @param {string} o.version
@@ -23,10 +33,10 @@ export function createManifest({
   apiBase = GITHUB_API_ORIGIN,
   extraMatches = [],
 }) {
-  // Set で重複を排除（e2e では apiBase と extraMatches が同じオリジンになる）
+  // Set で重複を排除（e2e では apiBase と extraMatches が同じホストになる）
   const hostPermissions = new Set([
     `${GITHUB_API_ORIGIN}/*`,
-    `${new URL(apiBase).origin}/*`,
+    hostPattern(apiBase),
     ...extraMatches,
   ]);
 

@@ -120,6 +120,23 @@ describe('fetchGitHubGraph', () => {
     expect(net).toMatchObject({ code: 'network' });
   });
 
+  it('maps a timeout to a network error but lets a deliberate abort through', async () => {
+    const timeout = await fetchGitHubGraph('o', 'r', {
+      fetchImpl: async () => {
+        throw new DOMException('The operation timed out.', 'TimeoutError');
+      },
+    }).catch((e) => e);
+    expect(timeout).toMatchObject({ code: 'network' });
+
+    const aborted = await fetchGitHubGraph('o', 'r', {
+      fetchImpl: async () => {
+        throw new DOMException('aborted', 'AbortError');
+      },
+    }).catch((e) => e);
+    expect(aborted).not.toBeInstanceOf(GitHubError);
+    expect(aborted.name).toBe('AbortError');
+  });
+
   it('sends the token only as a Bearer header', async () => {
     let auth: string | undefined;
     const { impl } = fakeApi();

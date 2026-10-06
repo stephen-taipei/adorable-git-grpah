@@ -10,13 +10,14 @@
     "lint": "web-ext lint --source-dir dist",
     "package": "web-ext build --source-dir dist --artifacts-dir web-ext-artifacts --overwrite-dest",
     "package:source": "mkdir -p web-ext-artifacts && git -C ../.. archive --format=zip --prefix=adorable-git-graph/ -o apps/extension-firefox/web-ext-artifacts/adorable-git-graph-source.zip HEAD",
-    "run": "web-ext run --source-dir dist --start-url https://github.com/stephen-taipei/adorable-git-grpah",
+    "start": "web-ext run --source-dir dist --start-url https://github.com/stephen-taipei/adorable-git-grpah",
     "e2e": "node e2e/run.mjs"
   },
   "dependencies": {
     "@adorable/extension-core": "workspace:*"
   },
   "devDependencies": {
+    "puppeteer-core": "25.12.0",
     "web-ext": "^10.7.0"
   }
 }

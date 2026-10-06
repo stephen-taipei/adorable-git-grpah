@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GECKO_ID, createManifest } from './manifest.mjs';
+import { GECKO_ID, createManifest, hostPattern } from './manifest.mjs';
 
 const base = { version: '1.2.3' };
 
@@ -53,13 +53,20 @@ describe('createManifest', () => {
       ...base,
       target: 'firefox',
       apiBase: 'http://127.0.0.1:5555',
-      extraMatches: ['http://127.0.0.1:5555/*'],
+      extraMatches: ['http://127.0.0.1/*'],
     });
-    expect(e2e.host_permissions).toEqual(['https://api.github.com/*', 'http://127.0.0.1:5555/*']);
-    expect(e2e.content_scripts[0].matches).toEqual([
-      'https://github.com/*',
-      'http://127.0.0.1:5555/*',
-    ]);
+    expect(e2e.host_permissions).toEqual(['https://api.github.com/*', 'http://127.0.0.1/*']);
+    expect(e2e.content_scripts[0].matches).toEqual(['https://github.com/*', 'http://127.0.0.1/*']);
+  });
+
+  it('never emits port-qualified patterns: Firefox accepts them silently and they never match', () => {
+    expect(hostPattern('http://127.0.0.1:5555')).toBe('http://127.0.0.1/*');
+    expect(hostPattern('http://localhost:8080/some/path?x=1')).toBe('http://localhost/*');
+    expect(hostPattern('https://api.github.com')).toBe('https://api.github.com/*');
+    const m = createManifest({ ...base, target: 'firefox', apiBase: 'http://localhost:9999' });
+    for (const p of [...m.host_permissions, ...m.content_scripts[0].matches]) {
+      expect(p).not.toMatch(/^[a-z]+:\/\/[^/]+:\d+\//);
+    }
   });
 
   it('rejects unknown targets', () => {

@@ -34,6 +34,11 @@
     "preview": {
       "continuous": true,
       "dependsOn": ["build"]
+    },
+    "lint": {
+      "dependsOn": ["build"],
+      "inputs": ["production", "^production"],
+      "cache": true
     }
   }
 }
