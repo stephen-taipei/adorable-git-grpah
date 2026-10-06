@@ -620,7 +620,7 @@ export class GitGraphScene {
     return {
       cx: ((x0 + x1) / 2) * SX,
       cy: ((minY + maxY) / 2) * SY + 0.35,
-      viewH: Math.max(spanH, spanW / this.aspect(), 7),
+      viewH: Math.max(spanH, spanW / this.aspect(), 10),
     };
   }
 

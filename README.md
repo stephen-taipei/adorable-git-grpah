@@ -39,7 +39,7 @@ pnpm e2e              # 真實 Chromium 載入打包後的 extension（見下）
 
 `pnpm e2e` 會：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
 在假的 `github.com` 頁面上驗證 FAB、overlay、繪圖、hover tooltip、點擊開 commit、縮放/平移、夜間主題、
-404 / rate-limit 錯誤畫面、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
+404 / rate-limit 錯誤畫面、快取命中與強制重抓、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
 找不到 Chrome 時設定 `CHROME_PATH`。
 
 ## 專案結構

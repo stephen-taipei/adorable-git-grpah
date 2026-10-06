@@ -178,6 +178,13 @@ const fakeGithubPage = (title) => `<!doctype html>
 
 const errors = [];
 const results = [];
+const waitUntil = async (cond, timeout = 15_000) => {
+  const t = Date.now();
+  while (!(await cond())) {
+    if (Date.now() - t > timeout) throw new Error('waitUntil timed out');
+    await new Promise((r) => setTimeout(r, 100));
+  }
+};
 const step = async (name, fn) => {
   const t = Date.now();
   await fn();
@@ -341,6 +348,18 @@ try {
     await page.keyboard.press('Escape');
     await page.locator('.agg-panel').waitFor({ state: 'detached' });
     await page.locator('.agg-fab').waitFor();
+  });
+
+  await step('second open is served from cache; refresh button forces a re-fetch', async () => {
+    const before = seen.paths.length;
+    await page.locator('.agg-fab').click();
+    await page.locator('.agg-canvas canvas').waitFor();
+    await page.waitForTimeout(500);
+    assert.equal(seen.paths.length, before, 'expected a cache hit (no new API requests)');
+    await page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click();
+    await waitUntil(() => seen.paths.length > before);
+    await page.locator('.agg-canvas canvas').waitFor();
+    await page.keyboard.press('Escape');
   });
 
   await step('night theme follows GitHub color mode', async () => {
