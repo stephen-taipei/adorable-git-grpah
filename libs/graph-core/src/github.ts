@@ -126,14 +126,25 @@ export async function fetchGitHubGraph(
     };
     if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`;
 
+    // 逾時（TimeoutError）/ 連線中斷 → network；呼叫端主動 abort（AbortError）原樣往外丟。fetch 與讀 body 兩段都可能發生
+    const asNetworkError = (err: unknown): unknown =>
+      (err as { name?: string }).name === 'AbortError'
+        ? err
+        : new GitHubError('network', `Network error: ${(err as Error).message}`);
+
     let res: Response;
     try {
       res = await doFetch(url.toString(), { headers, signal: opts.signal });
     } catch (err) {
-      if ((err as { name?: string }).name === 'AbortError') throw err;
-      throw new GitHubError('network', `Network error: ${(err as Error).message}`);
+      throw asNetworkError(err);
     }
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      try {
+        return (await res.json()) as T;
+      } catch (err) {
+        throw asNetworkError(err);
+      }
+    }
 
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = Number(res.headers.get('x-ratelimit-reset')) * 1000 || undefined;

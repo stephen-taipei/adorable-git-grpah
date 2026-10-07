@@ -10,6 +10,13 @@ import type {
 } from '../shared/messages';
 import { SETTINGS_KEY, loadSettings } from '../shared/settings';
 
+/**
+ * GitHub への要求にかける時間の上限。Firefox の background は event page で、アイドルが 30 秒続くと停止する。
+ * 応答待ちの `sendResponse` はそれを延命しないので、その前に「ネットワークエラー」として明示的に失敗させる
+ * （上限なしだと content script 側は "Receiving end does not exist" という分かりにくい失敗になる）。
+ */
+const FETCH_TIMEOUT_MS = 25_000;
+
 const CACHE_PREFIX = 'cache:';
 const CACHE_MAX_ENTRIES = 12;
 
@@ -63,6 +70,7 @@ async function fetchGraph(
       branchHint: req.branchHint,
       maxBranches: settings.maxBranches,
       maxCommitsPerBranch: settings.maxCommitsPerBranch,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (settings.cacheMinutes > 0) {
       await chrome.storage.local.set({
@@ -80,6 +88,7 @@ async function rateLimit(): Promise<RateLimitResponse> {
   const settings = await loadSettings();
   try {
     const res = await fetch(`${__AGG_API_BASE__}/rate_limit`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       headers: {
         Accept: 'application/vnd.github+json',
         ...(settings.token ? { Authorization: `Bearer ${settings.token}` } : {}),

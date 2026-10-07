@@ -10,6 +10,7 @@
   "scripts": {
     "build": "nx run-many -t build",
     "dev": "nx run @adorable/extension:dev",
+    "dev:firefox": "nx run @adorable/extension-firefox:dev",
     "typecheck": "nx run-many -t typecheck",
     "test": "nx run-many -t test",
     "e2e": "nx run-many -t e2e --parallel=1",

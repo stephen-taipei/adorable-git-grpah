@@ -5,7 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
 
-const out = resolve(dirname(fileURLToPath(import.meta.url)), '../public/icons');
+// 圖示放在共用 lib：Chrome 與 Firefox 版共用同一組
+const out = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../../../libs/extension-core/assets/icons',
+);
 await mkdir(out, { recursive: true });
 
 const INK = '#2b2140';

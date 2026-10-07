@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["chrome", "vite/client"]
   },
-  "include": ["src", "scripts/*.d.ts"]
+  "include": ["src"]
 }

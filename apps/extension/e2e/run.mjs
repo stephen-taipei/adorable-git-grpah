@@ -8,6 +8,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
+import { fakeGithubPage } from '../../../tools/e2e/fake-github-page.mjs';
 import { SPECS, seen, startMock } from '../../../tools/e2e/mock-github-api.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,18 +26,6 @@ function run(cmd, args, env) {
     );
   });
 }
-
-const fakeGithubPage = (title) => `<!doctype html>
-<html lang="en" data-color-mode="light" data-light-theme="light" data-dark-theme="dark">
-<head><meta charset="utf-8"><title>${title}</title>
-<style>
-  body{margin:0;font:14px -apple-system,Segoe UI,sans-serif;color:#1f2328;background:#fff}
-  header{height:64px;background:#f6f8fa;border-bottom:1px solid #d0d7de;display:flex;align-items:center;padding:0 24px;font-weight:600}
-  main{max-width:1000px;margin:24px auto;padding:0 24px}
-  .row{height:36px;border-bottom:1px solid #d8dee4;display:flex;align-items:center;gap:12px}
-</style></head>
-<body><header>${title}</header>
-<main><h1>${title}</h1>${'<div class="row">📄 some-file.ts <span style="color:#656d76">fix: something</span></div>'.repeat(12)}</main></body></html>`;
 
 const errors = [];
 const results = [];

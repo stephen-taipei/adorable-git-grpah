@@ -22,7 +22,15 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      # Mozilla 的 add-on 檢查（manifest 欄位、最低版本、不安全的 API 用法）。目前 0 個錯誤；
+      # 警告是 react-dom 內部的 innerHTML（見 README 的 AMO 說明），不使 CI 失敗。
+      - run: pnpm --filter @adorable/extension-firefox lint
+      - run: pnpm --filter @adorable/extension-firefox package
       - uses: actions/upload-artifact@v4
         with:
           name: chrome-extension
           path: apps/extension/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firefox-addon
+          path: apps/extension-firefox/web-ext-artifacts/*.zip
