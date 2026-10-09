@@ -112,11 +112,28 @@
   min-width: 0;
 }
 
+/* 統計 chips 永遠一行（放不下就橫向捲動）：搜尋 / 聚焦時多出的「顯示 N / M」不會讓整個列表往下跳 */
 .agg-stats {
   display: flex;
-  flex-wrap: wrap;
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding-bottom: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.agg-stats::-webkit-scrollbar {
+  display: none;
+}
+
+.agg-stats .agg-chip {
+  flex: none;
 }
 
 .agg-chip {
@@ -327,10 +344,19 @@
   flex: 1 1 100%;
   flex-wrap: wrap;
   gap: 6px;
-  max-height: 74px;
+  /* 剛好兩行 chip（字高 1.35em + 上下 padding 2 + 邊框 6），多的捲動，不會露出半截第三行；
+     font-size 與 .agg-branch 相同，em 才算得準 */
+  font-size: 12.5px;
+  max-height: calc(2 * (1.35em + 8px) + 12px);
   padding: 2px 2px 4px;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+@media (pointer: coarse) {
+  .agg-branches {
+    max-height: calc(2 * 36px + 12px);
+  }
 }
 
 .agg-branch {
