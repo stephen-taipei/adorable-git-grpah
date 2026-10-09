@@ -114,7 +114,8 @@ export function computeMetrics(
 ): LogMetrics {
   const size = sizeClassFor(rootWidth);
   const radius = RADIUS[size];
-  const padSide = radius + 8; // 留給選取環 / hover 放大，不然會被 canvas 邊緣裁掉
+  // 留給最大的 node（merge 1.2 × HEAD 1.1）的選取環（1.4×）與 hover 彈跳，不然會被 canvas 邊緣裁掉
+  const padSide = Math.ceil(radius * 1.9) + 1;
   const lanes = Math.max(1, Math.floor(laneCount));
   const maxPitch = MAX_PITCH[size];
   const listW = listWidthFor(rootWidth, detailOpen);

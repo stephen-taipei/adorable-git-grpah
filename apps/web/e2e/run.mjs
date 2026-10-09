@@ -14,7 +14,7 @@
 //   · 安全性（cross-origin 讀不到 dev endpoint、快照與 bundle 沒有 commit 本文 / email）→ 主題記憶 → zh-TW → 其他本機 repo
 //     （沒有 remote / 空的 / 不是 git）→ 本機 build + preview。
 // 軟體 WebGL（SwiftShader）在 CPU 吃緊時很慢：一律等「狀態」（data-replay、定位器、輪詢），不用固定 sleep 當判斷依據；
-// 像素判斷失敗時會重截幾次才判定。截圖輸出到 e2e/.artifacts。
+// 像素判斷失敗時會重截幾次才判定；逾時乘上 E2E_TIMEOUT_SCALE（預設 2）。截圖輸出到 e2e/.artifacts。
 //   用法：pnpm e2e        （環境變數 CHROME_PATH 可指定 Chrome）
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -162,11 +162,15 @@ const apiCalls = () =>
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 軟體 WebGL + 別的程序一起吃 CPU 時很慢：所有輪詢逾時（與 Playwright 的預設逾時）都乘上這個倍率（預設 2；E2E_TIMEOUT_SCALE 可調）
+const SCALE = Number(process.env.E2E_TIMEOUT_SCALE) || 2;
+
 /** 輪詢直到條件成立；逾時會把 `what` 放進錯誤訊息，方便從 log 看出卡在哪。 */
 const waitUntil = async (cond, timeout = 20_000, what = '') => {
   const t = Date.now();
   while (!(await cond())) {
-    if (Date.now() - t > timeout) throw new Error(`waitUntil timed out${what ? `: ${what}` : ''}`);
+    if (Date.now() - t > timeout * SCALE)
+      throw new Error(`waitUntil timed out${what ? `: ${what}` : ''}`);
     await sleep(100);
   }
 };
@@ -296,6 +300,8 @@ try {
     viewport: { width: 1440, height: 900 },
     locale: 'en-US',
   });
+  ctx.setDefaultTimeout(30_000 * SCALE);
+  ctx.setDefaultNavigationTimeout(30_000 * SCALE);
   await ctx.route('https://github.com/**', (r) =>
     r.fulfill({ status: 200, contentType: 'text/html', body: '<title>fake github</title>' }),
   );
@@ -1470,7 +1476,9 @@ try {
       assert.equal(await btn.getAttribute('data-state'), 'idle');
       await page.evaluate(() => navigator.clipboard.writeText('stale'));
       await btn.click();
-      await page.locator('.agg-detail .agg-mini-btn[data-state="ok"]').waitFor({ timeout: 5000 });
+      await page
+        .locator('.agg-detail .agg-mini-btn[data-state="ok"]')
+        .waitFor({ timeout: 5000 * SCALE });
       assert.match(await btn.innerText(), /Copied/);
       assert.equal(await readClipboard(), target.sha, 'the full 40-hex sha is in the clipboard');
       await waitUntil(
@@ -1485,7 +1493,9 @@ try {
       const other = gitLog(repoDir)[7];
       await page.evaluate(() => navigator.clipboard.writeText('stale'));
       await rowLoc(other.sha).locator('.agg-sha').click();
-      await rowLoc(other.sha).locator('.agg-sha[data-state="ok"]').waitFor({ timeout: 5000 });
+      await rowLoc(other.sha)
+        .locator('.agg-sha[data-state="ok"]')
+        .waitFor({ timeout: 5000 * SCALE });
       assert.equal(await readClipboard(), other.sha);
       assert.equal(await selectedSha(), null, 'copying must not select the row');
       assert.equal(await page.locator('.agg-detail').count(), 0);
@@ -2322,7 +2332,7 @@ try {
       );
       assert.equal(await page.locator('.agg-scroll').count(), 0, 'no list while loading');
       await page.locator('.agg-title-text', { hasText: 'demo/adorable-git-graph' }).waitFor();
-      await page.locator('.agg-canvas canvas').waitFor({ timeout: 30_000 });
+      await page.locator('.agg-canvas canvas').waitFor({ timeout: 30_000 * SCALE });
       await page.unroute(`${apiBase}/**`, slowApi);
       assert.equal(await page.locator('.agg-center').count(), 0, 'the loading panel is gone');
       assert.match(await chips(), new RegExp(`^${SPECS.length} `));
@@ -2489,7 +2499,7 @@ try {
       // 失敗的重新整理：錯誤面板取代列表（網路錯誤），按「再試一次」復原
       await page.route(`${apiBase}/**`, (r) => r.abort());
       await page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click();
-      await page.locator('.agg-center[role="alert"]').waitFor({ timeout: 15_000 });
+      await page.locator('.agg-center[role="alert"]').waitFor({ timeout: 15_000 * SCALE });
       assert.match(
         await page.locator('.agg-center[role="alert"]').innerText(),
         /Network error|網路錯誤/,
@@ -2498,7 +2508,7 @@ try {
       assert.equal(await page.locator('.agg-detail').count(), 0);
       await page.unroute(`${apiBase}/**`);
       await page.locator('.agg-center .agg-cta', { hasText: /Try again|再試一次/ }).click();
-      await page.locator('.agg-scroll').waitFor({ timeout: 15_000 });
+      await page.locator('.agg-scroll').waitFor({ timeout: 15_000 * SCALE });
       await waitUntil(
         async () => (await domRows()).length === SPECS.length,
         10_000,
@@ -2680,6 +2690,8 @@ try {
       viewport: { width: 1440, height: 900 },
       locale: 'zh-TW',
     });
+    zhCtx.setDefaultTimeout(30_000 * SCALE);
+    zhCtx.setDefaultNavigationTimeout(30_000 * SCALE);
     try {
       await zhCtx.route('https://github.com/**', (r) =>
         r.fulfill({ status: 200, contentType: 'text/html', body: '<title>fake github</title>' }),
@@ -2732,7 +2744,7 @@ try {
       await zh
         .locator('.agg-mini-btn[data-state]')
         .filter({ hasText: /已複製|複製失敗/ })
-        .waitFor({ timeout: 5000 });
+        .waitFor({ timeout: 5000 * SCALE });
       await zh.close();
     } finally {
       await zhCtx.close();

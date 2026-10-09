@@ -31,7 +31,13 @@ export type ViewerState =
   | { kind: 'loading' }
   | { kind: 'error'; code: string; message?: string; resetAt?: number }
   /** `refreshing`：已有圖、正在背景重新抓取（保留捲動位置與選取，只讓重新整理按鈕轉圈）。 */
-  | { kind: 'ready'; layout: GraphLayout; refreshing?: boolean };
+  | {
+      kind: 'ready';
+      layout: GraphLayout;
+      refreshing?: boolean;
+      /** 背景重新抓取失敗：保留原本的圖，另外顯示一行錯誤。 */
+      refreshError?: { code: string; message?: string };
+    };
 
 export interface GitGraphViewerProps {
   /** 例如 `owner/repo` */
@@ -240,7 +246,9 @@ export function GitGraphViewer({
       const y = topPad + row * rowH;
       const h = sc.clientHeight;
       let top = sc.scrollTop;
-      if (how === 'center') top = y + rowH / 2 - h / 2;
+      if (h < rowH * 2.5)
+        top = y; // 矮到放不下幾列：直接讓那一列貼齊上緣
+      else if (how === 'center') top = y + rowH / 2 - h / 2;
       else if (y < sc.scrollTop + rowH * 0.25) top = y - rowH * 0.75;
       else if (y + rowH > sc.scrollTop + h - rowH * 0.25) top = y + rowH * 1.75 - h;
       else return;
@@ -261,21 +269,31 @@ export function GitGraphViewer({
     [derived, scrollToRow],
   );
 
-  // 手機的底部面板在 flex 流程裡（列表的可視高度會縮小）：選取後等版面更新完，再把那一列捲到看得見的地方
+  // 手機的底部面板在 flex 流程裡（列表的可視高度會縮小）：面板「剛打開」時，等版面更新完再把那一列捲到看得見的地方。
+  // 面板已經開著時（上一個 / 下一個、搜尋跳轉）由 select() 自己決定對齊方式，這裡不要再蓋掉。
+  const sheetWasOpen = useRef(false);
   useLayoutEffect(() => {
-    if (metrics.size === 'narrow' && selectedNode) scrollToRow(selectedNode.row, 'nearest');
+    const open = metrics.size === 'narrow' && Boolean(selectedNode);
+    if (open && !sheetWasOpen.current && selectedNode) scrollToRow(selectedNode.row, 'nearest');
+    sheetWasOpen.current = open;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在選取 / 尺寸等級改變時跑
   }, [selectedNode?.sha, metrics.size]);
 
-  // 鍵盤焦點：開啟時、詳情關閉（按鈕被移除）、焦點落在被 disable 的按鈕（上一個 / 下一個走到底）時，把焦點收回 viewer，
+  // 鍵盤焦點：開啟時、詳情關閉（按鈕被移除）、焦點落在被 disable 或被隱藏的按鈕時，把焦點收回 viewer，
   // 否則快捷鍵失效，而且在 extension 裡按鍵會落到 GitHub 的頁面快捷鍵。
+  // 焦點在 viewer 外面的正常元素上（例如 web app 的 token 對話框）時不搶。
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
     const scope = root.getRootNode() as Document | ShadowRoot;
     const active = scope.activeElement as (HTMLElement & { disabled?: boolean }) | null;
-    const alive = active && active !== document.body && root.contains(active) && !active.disabled;
-    if (!alive) root.focus({ preventScroll: true });
+    const lost =
+      !active ||
+      active === document.body ||
+      (root.contains(active) &&
+        active !== root &&
+        (Boolean(active.disabled) || active.getClientRects().length === 0));
+    if (lost) root.focus({ preventScroll: true });
   }, [selectedNode?.sha]);
 
   const onRowSelect = useCallback(
@@ -343,9 +361,10 @@ export function GitGraphViewer({
     const typing = (e.target as HTMLElement).closest?.('input, textarea, select');
     if (e.key === 'Escape') {
       // 一次只收掉一層：詳情 → 搜尋 → branch 聚焦；都沒有才交給外層（例如關閉 overlay）
-      if (selectedSha) setSelectedSha(null);
-      else if (query) setQuery('');
-      else if (focusBranch) setFocusBranch(null);
+      // 只收「看得到」的層：錯誤 / 載入畫面上，看不見的舊選取或搜尋不該吃掉關閉 overlay 的 Esc
+      if (selectedNode) setSelectedSha(null);
+      else if (hasRows && query) setQuery('');
+      else if (hasRows && focusBranch) setFocusBranch(null);
       else return;
       e.stopPropagation();
       return;
@@ -515,6 +534,14 @@ export function GitGraphViewer({
             {webglFailed && (
               <div className="agg-banner" role="status">
                 {t.webglFail}
+              </div>
+            )}
+            {state.kind === 'ready' && state.refreshError && (
+              <div className="agg-banner agg-banner--error" role="alert">
+                {t.refreshFailed}{' '}
+                {t.errors[state.refreshError.code] ??
+                  state.refreshError.message ??
+                  t.errors['unknown']}
               </div>
             )}
             <div className="agg-colhead-wrap">

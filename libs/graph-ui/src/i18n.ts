@@ -23,6 +23,7 @@ export interface Messages {
   lastCommit: (rel: string) => string;
   truncated: string;
   webglFail: string;
+  refreshFailed: string;
   // 列表 / 搜尋
   listLabel: string;
   colGraph: string;
@@ -99,6 +100,7 @@ const zhTW: Messages = {
   lastCommit: (rel) => `最新 ${rel}`,
   truncated: '更早的歷史已省略',
   webglFail: '這個瀏覽器無法使用 WebGL，無法繪製動畫。',
+  refreshFailed: '重新整理失敗，顯示的是上一次的資料。',
   listLabel: 'Commit 歷史',
   colGraph: '線圖',
   colMessage: '說明',
@@ -190,6 +192,7 @@ const en: Messages = {
   lastCommit: (rel) => `latest ${rel}`,
   truncated: 'older history omitted',
   webglFail: 'WebGL is not available in this browser.',
+  refreshFailed: 'Refresh failed; showing the previous data.',
   listLabel: 'Commit history',
   colGraph: 'Graph',
   colMessage: 'Description',

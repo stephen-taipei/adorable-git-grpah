@@ -239,11 +239,25 @@ export class LogGraphScene {
 
   /** 列高 / lane 間距 / 欄寬改變（視窗寬度跨過斷點、lane 數變了）：用新尺寸重建，不重播動畫。 */
   setMetrics(metrics: LogMetrics) {
+    const p = this.metrics;
+    // size / cols 只影響 DOM；畫面幾何沒變就不要重建（開關詳情面板時常常只換了欄位組合）
+    if (
+      this.win &&
+      p.rowH === metrics.rowH &&
+      p.topPad === metrics.topPad &&
+      p.lanePitch === metrics.lanePitch &&
+      p.padLeft === metrics.padLeft &&
+      p.graphW === metrics.graphW &&
+      p.radius === metrics.radius
+    ) {
+      this.metrics = metrics;
+      return;
+    }
     this.metrics = metrics;
     this.u = metrics.radius / BASE_RADIUS;
     this.win = null;
     if (this.layout) {
-      const keep = new Map(this.actors.map((a) => [a.node.sha, a.spawnAt]));
+      const keep = new Map(this.actors.map((a) => [a.node.sha, a]));
       this.rebuild(keep);
     }
     this.applyWindow(true);
@@ -430,14 +444,23 @@ export class LogGraphScene {
     this.stubs = [];
   }
 
-  /** `keepSpawn`：重建時沿用既有的出現時間（尺寸改變時不重播動畫）。 */
-  private rebuild(keepSpawn: Map<string, number> | null) {
+  /** `keep`：重建時沿用舊 actor 的狀態（出現時間、hover 彈簧、視線、眨眼節奏），尺寸改變時不重播、不會整排一起眨眼。 */
+  private rebuild(keep: Map<string, Actor> | null) {
     const hoverSha = this.hovered?.node.sha ?? null;
     this.clearGraph();
     if (!this.layout) return;
     this.buildGraph(this.layout);
-    if (keepSpawn) {
-      for (const a of this.actors) a.spawnAt = keepSpawn.get(a.node.sha) ?? -1e6;
+    for (const a of this.actors) {
+      const old = keep?.get(a.node.sha);
+      if (old) {
+        a.spawnAt = old.spawnAt;
+        a.hover = { ...old.hover };
+        a.look = { ...old.look };
+        a.nextBlink = old.nextBlink;
+        a.blinkStart = old.blinkStart;
+      } else {
+        a.nextBlink = this.t + 1 + Math.random() * 3;
+      }
     }
     this.hovered = (hoverSha && this.actorBySha.get(hoverSha)) || null;
     this.selected = (this.selectedSha && this.actorBySha.get(this.selectedSha)) || null;
@@ -484,13 +507,17 @@ export class LogGraphScene {
     }
 
     // 歷史被截斷的 node：往下畫一小段虛線 + …
+    // 已經有一條邊從這個 node 沿自己的 lane 直直往下時不畫（虛線會蓋在那條真的邊上）
+    const straightDown = new Set(
+      layout.edges.filter((e) => e.points[1]?.[0] === e.points[0]?.[0]).map((e) => e.to),
+    );
     const stubLen = (m.rowH * 0.85) / this.u;
     for (const node of layout.nodes) {
       if (!node.hasHiddenParents) continue;
       // 只有 first parent 被截掉才畫虛線尾巴；只是被 merge 進來的那條線的 parent 不在範圍內時，
       // 虛線會蓋在真正的 first-parent 邊上
       const first = node.parents[0];
-      if (first && this.actorBySha.has(first)) continue;
+      if ((first && this.actorBySha.has(first)) || straightDown.has(node.sha)) continue;
       const actor = this.actorBySha.get(node.sha)!;
       const x = actor.cx;
       const y = actor.cy;

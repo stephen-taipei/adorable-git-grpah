@@ -16,12 +16,29 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
 
   // overlay 開著時，後面的 GitHub 頁面不能被滾輪 / 觸控捲動（捲動鏈接）：直接鎖住頁面的捲動，
   // 並保留捲軸的位置（scrollbar-gutter），背景才不會因為捲軸消失而位移。
+  // 同時把頁面設成 inert：Tab / Shift+Tab 不會跑進後面看不見的 GitHub 元素（也就不會把頁面捲到那裡）。
+  // overlay 的 shadow host 掛在 <html> 底下、不在 <body> 裡，所以不受影響。GitHub（Turbo）換頁會換掉 <body>，新的也要設。
   useEffect(() => {
     const html = document.documentElement;
+    const hadScrollbar = window.innerWidth > html.clientWidth;
     const prev = { overflow: html.style.overflow, gutter: html.style.scrollbarGutter };
     html.style.overflow = 'hidden';
-    html.style.scrollbarGutter = 'stable';
+    // 原本有捲軸才保留它的位置；沒有捲軸的頁面加上 gutter 反而會讓版面位移
+    if (hadScrollbar) html.style.scrollbarGutter = 'stable';
+    const inerted = new Map<HTMLElement, boolean>();
+    const makeInert = () => {
+      const body = document.body;
+      if (body && !inerted.has(body)) {
+        inerted.set(body, body.inert);
+        body.inert = true;
+      }
+    };
+    makeInert();
+    const mo = new MutationObserver(makeInert);
+    mo.observe(html, { childList: true });
     return () => {
+      mo.disconnect();
+      for (const [el, was] of inerted) el.inert = was;
       html.style.overflow = prev.overflow;
       html.style.scrollbarGutter = prev.gutter;
     };
@@ -41,7 +58,10 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
       if (e.composedPath().includes(panel)) return; // overlay 內部：由 React / viewer 的處理器負責
       e.stopPropagation();
       if (e.key === 'Escape') onClose();
-      else (panel.querySelector<HTMLElement>('.agg-root') ?? panel).focus({ preventScroll: true });
+      else
+        (panel.querySelector<HTMLElement>('.agg-root[tabindex]') ?? panel).focus({
+          preventScroll: true,
+        });
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);

@@ -102,7 +102,7 @@ export const CommitRow = memo(function CommitRow({
           color={node.color}
           currentBranch={currentBranch}
           t={t}
-          max={size === 'narrow' ? 2 : 4}
+          max={size === 'narrow' ? 1 : 4}
         />
         {isMerge && (
           <span className="agg-merge" title={t.mergeOf(new Set(node.parents).size)}>

@@ -115,7 +115,8 @@
 /* 統計 chips 永遠一行（放不下就橫向捲動）：搜尋 / 聚焦時多出的「顯示 N / M」不會讓整個列表往下跳 */
 .agg-stats {
   display: flex;
-  flex: 0 1 auto;
+  /* 寬度基準不看內容：要不要換到下一行只取決於工具列寬度，多出「顯示 N / M」時不會跳行 */
+  flex: 1 1 720px;
   flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
@@ -442,6 +443,10 @@
   box-shadow: 0 4px 0 var(--agg-ink);
 }
 
+.agg-banner--error {
+  background: #ffd9de;
+}
+
 .agg-banner {
   flex: none;
   padding: 5px 12px;
@@ -736,6 +741,7 @@
   display: inline-flex;
   flex: 0 1 auto;
   min-width: 0;
+  overflow: hidden;
   align-items: center;
   gap: 3px;
   max-width: 170px;
@@ -1214,11 +1220,11 @@
   display: none;
 }
 
-.agg-root[data-size='narrow'] .agg-ref {
-  max-width: 72px;
+.agg-root[data-size='narrow'] .agg-commit .agg-ref {
+  max-width: 120px;
 }
 
-.agg-root[data-size='narrow'] .agg-refs {
+.agg-root[data-size='narrow'] .agg-commit .agg-refs {
   max-width: 48%;
 }
 
@@ -1285,6 +1291,10 @@
     width: 40px;
     height: 40px;
   }
+  /* 搜尋框裡的小按鈕：點擊範圍變大，但不撐高搜尋框（否則一打字列表就往下跳） */
+  .agg-search .agg-mini-icon {
+    margin-block: -8px;
+  }
   .agg-sha {
     min-height: 34px;
     padding: 4px 10px;
@@ -1326,7 +1336,7 @@
     padding-top: 8px;
   }
   .agg-root[data-detail] .agg-subbar,
-  .agg-root[data-detail] .agg-toolbar {
+  .agg-root[data-detail] .agg-branches {
     display: none;
   }
   .agg-root[data-size] .agg-detail {
@@ -1336,6 +1346,7 @@
   }
   .agg-root[data-size='narrow'] .agg-detail {
     top: auto;
+    bottom: auto;
     max-height: 60%;
   }
 }

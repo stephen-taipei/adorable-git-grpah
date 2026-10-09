@@ -79,7 +79,8 @@ describe('computeMetrics', () => {
   it('leaves headroom above the first row for the crown and beside lane 0 for the selection ring', () => {
     const m = computeMetrics(1200, 3);
     expect(m.topPad).toBeGreaterThanOrEqual(8);
-    expect(m.padLeft).toBeGreaterThanOrEqual(m.radius * 1.4 + 1);
+    // 最大的 node（merge × HEAD = 1.32r）加上 1.4 倍的選取環
+    expect(m.padLeft).toBeGreaterThanOrEqual(m.radius * 1.32 * 1.4);
   });
 
   it('handles zero and one lane', () => {
