@@ -17,8 +17,17 @@ export function sizeClassFor(rootWidth: number): SizeClass {
   return 'wide';
 }
 
+/**
+ * 欄位組合（說明欄之外的欄位）：
+ *   full    作者 + 日期 + sha     compact  作者頭像 + 日期（相對）+ sha     min  只留 sha
+ * 由「列表實際可用寬度」決定，而不是視窗寬度：詳情面板開著、lane 很多時列表會變窄。
+ * 窄螢幕（兩行式的列）一律 'min'，作者 / 日期 / sha 排在第二行。
+ */
+export type ColsClass = 'full' | 'compact' | 'min';
+
 export interface LogMetrics {
   size: SizeClass;
+  cols: ColsClass;
   /** 一列的高度（px）。窄螢幕是兩行式的列，比較高。 */
   rowH: number;
   /** 第一列上方的留白（px） */
@@ -33,27 +42,105 @@ export interface LogMetrics {
   radius: number;
 }
 
+/** 這些數字同時是 CSS 的 custom property（GitGraphViewer 設在 .agg-root 上），版面與計算不會各算各的。 */
+export const LAYOUT = {
+  bodyPad: { wide: 14, medium: 14, narrow: 8 } as Record<SizeClass, number>,
+  cardBorder: { wide: 3, medium: 3, narrow: 2 } as Record<SizeClass, number>,
+  /** 寬螢幕時詳情面板的寬度；與列表之間的間距 */
+  detailW: 380,
+  gap: 12,
+  /** 各欄位組合的欄寬（px）與欄距 / 右側 padding */
+  col: {
+    full: { author: 150, date: 160, sha: 96 },
+    compact: { author: 30, date: 118, sha: 92 },
+    min: { author: 0, date: 0, sha: 92 },
+  } as Record<ColsClass, { author: number; date: number; sha: number }>,
+  colGap: 10,
+  rowPadRight: 12,
+};
+
+/** 說明欄以外所有固定寬度的總和（含欄距與右側 padding；不含線圖欄） */
+export function fixedColumnsWidth(cols: ColsClass): number {
+  const c = LAYOUT.col[cols];
+  const n = cols === 'min' ? 2 : 4; // 欄距數：graph|subject(|author|date)|sha
+  return c.author + c.date + c.sha + n * LAYOUT.colGap + LAYOUT.rowPadRight;
+}
+
 const ROW_H: Record<SizeClass, number> = { wide: 44, medium: 44, narrow: 62 };
 const TOP_PAD = 10;
 const RADIUS: Record<SizeClass, number> = { wide: 14, medium: 14, narrow: 15 };
+/** 線圖欄的寬度上限，以及不管 lane 多寡都要留給說明欄的最小寬度 */
 const MAX_GRAPH_W: Record<SizeClass, number> = { wide: 340, medium: 240, narrow: 150 };
 const MAX_PITCH: Record<SizeClass, number> = { wide: 28, medium: 26, narrow: 18 };
 const MIN_PITCH = 8;
+const SUBJECT_MIN = { full: 220, compact: 180, min: 150 } as const;
 
-/** 依容器寬度與 lane 數決定列高、lane 間距與線圖欄寬；lane 太多時壓縮間距，而不是讓線圖欄無限變寬。 */
-export function computeMetrics(rootWidth: number, laneCount: number): LogMetrics {
+const sameMetrics = (a: LogMetrics, b: LogMetrics) =>
+  a.size === b.size &&
+  a.cols === b.cols &&
+  a.rowH === b.rowH &&
+  a.topPad === b.topPad &&
+  a.lanePitch === b.lanePitch &&
+  a.padLeft === b.padLeft &&
+  a.graphW === b.graphW &&
+  a.radius === b.radius;
+
+/** 數值相同就回傳舊物件：視窗每變 1px 寬都重算一次，但只有真的變了才該讓下游（場景重建）動起來。 */
+export function stableMetrics(prev: LogMetrics | null, next: LogMetrics): LogMetrics {
+  return prev && sameMetrics(prev, next) ? prev : next;
+}
+
+/** 列表（卡片內容區）的可用寬度。`detailOpen` 且為寬螢幕時詳情面板靠右並排，其餘尺寸是浮在上面的抽屜 / 底部面板。 */
+export function listWidthFor(rootWidth: number, detailOpen: boolean): number {
+  const size = sizeClassFor(rootWidth);
+  const docked = detailOpen && size === 'wide';
+  return (
+    rootWidth -
+    2 * LAYOUT.bodyPad[size] -
+    2 * LAYOUT.cardBorder[size] -
+    (docked ? LAYOUT.detailW + LAYOUT.gap : 0)
+  );
+}
+
+/**
+ * 依容器寬度、lane 數與詳情是否並排，決定列高、欄位組合、lane 間距與線圖欄寬。
+ * 先看「列表真正剩多少寬度」選欄位組合（作者 / 日期放不下就收起來），再把線圖欄限制在不擠壞說明欄的範圍內；
+ * lane 太多時壓縮間距，而不是讓線圖欄無限變寬。
+ */
+export function computeMetrics(
+  rootWidth: number,
+  laneCount: number,
+  detailOpen = false,
+): LogMetrics {
   const size = sizeClassFor(rootWidth);
   const radius = RADIUS[size];
-  const padSide = radius + (size === 'narrow' ? 4 : 6);
-  const maxW = Math.min(MAX_GRAPH_W[size], Math.max(80, rootWidth * 0.36));
+  const padSide = radius + 8; // 留給選取環 / hover 放大，不然會被 canvas 邊緣裁掉
   const lanes = Math.max(1, Math.floor(laneCount));
   const maxPitch = MAX_PITCH[size];
+  const listW = listWidthFor(rootWidth, detailOpen);
+
+  const capW = Math.max(
+    2 * padSide,
+    Math.min(MAX_GRAPH_W[size], listW * (size === 'narrow' ? 0.34 : 0.45)),
+  );
+  const idealW = Math.min(capW, 2 * padSide + (lanes - 1) * maxPitch);
+
+  let cols: ColsClass = 'min';
+  if (size !== 'narrow') {
+    if (listW - idealW - fixedColumnsWidth('full') >= SUBJECT_MIN.full) cols = 'full';
+    else if (listW - idealW - fixedColumnsWidth('compact') >= SUBJECT_MIN.compact) cols = 'compact';
+  }
+
+  const fixed = size === 'narrow' ? LAYOUT.colGap + LAYOUT.rowPadRight : fixedColumnsWidth(cols);
+  const avail = listW - fixed - SUBJECT_MIN[cols];
+  const maxW = Math.max(2 * padSide, Math.min(capW, avail));
   const lanePitch =
     lanes <= 1
       ? maxPitch
       : Math.min(maxPitch, Math.max(MIN_PITCH, (maxW - 2 * padSide) / (lanes - 1)));
   return {
     size,
+    cols,
     rowH: ROW_H[size],
     topPad: TOP_PAD,
     lanePitch,

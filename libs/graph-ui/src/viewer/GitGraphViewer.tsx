@@ -10,7 +10,14 @@ import {
 import type { GraphLayout, GraphNode } from '@adorable/graph-core';
 import { detectLocale, formatDuration, formatRelative, getMessages } from '../i18n';
 import type { Locale } from '../i18n';
-import { anchoredScrollTop, computeMetrics, visibleRows } from '../scene/geometry';
+import {
+  LAYOUT,
+  anchoredScrollTop,
+  computeMetrics,
+  stableMetrics,
+  visibleRows,
+} from '../scene/geometry';
+import type { LogMetrics } from '../scene/geometry';
 import { CommitDetail } from './CommitDetail';
 import { ColumnHeader, CommitRow, rowDomId } from './CommitList';
 import { GitGraphCanvas } from './GitGraphCanvas';
@@ -23,7 +30,8 @@ import { GearIcon, PlayIcon, RefreshIcon, CloseIcon, TopIcon } from './icons';
 export type ViewerState =
   | { kind: 'loading' }
   | { kind: 'error'; code: string; message?: string; resetAt?: number }
-  | { kind: 'ready'; layout: GraphLayout };
+  /** `refreshing`：已有圖、正在背景重新抓取（保留捲動位置與選取，只讓重新整理按鈕轉圈）。 */
+  | { kind: 'ready'; layout: GraphLayout; refreshing?: boolean };
 
 export interface GitGraphViewerProps {
   /** 例如 `owner/repo` */
@@ -47,19 +55,22 @@ function IconButton({
   onClick,
   children,
   tone,
+  busy,
 }: {
   label: string;
   onClick?: () => void;
   children: ReactNode;
   tone?: 'danger';
+  busy?: boolean;
 }) {
   return (
     <button
       type="button"
-      className={`agg-btn${tone ? ` agg-btn--${tone}` : ''}`}
+      className={`agg-btn${tone ? ` agg-btn--${tone}` : ''}${busy ? ' agg-btn--busy' : ''}`}
       onClick={onClick}
       title={label}
       aria-label={label}
+      aria-busy={busy || undefined}
     >
       {children}
     </button>
@@ -111,11 +122,6 @@ export function GitGraphViewer({
   const layout = state.kind === 'ready' ? state.layout : null;
   const hasRows = Boolean(layout && layout.nodes.length > 0);
 
-  const metrics = useMemo(
-    () => computeMetrics(rootWidth || 1200, layout?.laneCount ?? 1),
-    [rootWidth, layout?.laneCount],
-  );
-
   // ── 由 layout 衍生的資料（統計、可到達性、搜尋） ──────────────────────────
   const derived = useMemo(() => {
     if (!layout) return null;
@@ -131,20 +137,34 @@ export function GitGraphViewer({
     }
     return { bySha, reach, stats: computeStats(layout), defaultName, ahead, commitsOn };
   }, [layout]);
+  const selectedNode = selectedSha && derived ? derived.bySha.get(selectedSha) : undefined;
+
+  // 版面尺寸：依「列表實際可用寬度」計算（詳情並排時列表變窄）；數值沒變就沿用舊物件，
+  // 否則拖動視窗每 1px 都會讓場景整個重建。
+  const metricsPrev = useRef<LogMetrics | null>(null);
+  const metrics = stableMetrics(
+    metricsPrev.current,
+    computeMetrics(rootWidth || 1200, layout?.laneCount ?? 1, Boolean(selectedNode)),
+  );
+  metricsPrev.current = metrics;
+
   const now = useMemo(() => Date.now(), [layout]);
 
-  const matchShas = useMemo(
-    () =>
-      layout && query.trim()
-        ? layout.nodes.filter((n) => matchesQuery(n, query)).map((n) => n.sha)
-        : null,
-    [layout, query],
-  );
-  const matchSet = useMemo(() => (matchShas ? new Set(matchShas) : null), [matchShas]);
   const branchSet = useMemo(
     () => (focusBranch && derived ? (derived.reach.get(focusBranch) ?? null) : null),
     [focusBranch, derived],
   );
+  // 搜尋結果只算「沒被 branch 聚焦淡化掉」的列：計數、上一筆 / 下一筆、淡化三者一致
+  const matchShas = useMemo(
+    () =>
+      layout && query.trim()
+        ? layout.nodes
+            .filter((n) => matchesQuery(n, query) && (!branchSet || branchSet.has(n.sha)))
+            .map((n) => n.sha)
+        : null,
+    [layout, query, branchSet],
+  );
+  const matchSet = useMemo(() => (matchShas ? new Set(matchShas) : null), [matchShas]);
   const active = useMemo(() => intersect(matchSet, branchSet), [matchSet, branchSet]);
   const sceneFocus = useMemo(() => ({ active, edges: branchSet !== null }), [active, branchSet]);
 
@@ -241,6 +261,23 @@ export function GitGraphViewer({
     [derived, scrollToRow],
   );
 
+  // 手機的底部面板在 flex 流程裡（列表的可視高度會縮小）：選取後等版面更新完，再把那一列捲到看得見的地方
+  useLayoutEffect(() => {
+    if (metrics.size === 'narrow' && selectedNode) scrollToRow(selectedNode.row, 'nearest');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在選取 / 尺寸等級改變時跑
+  }, [selectedNode?.sha, metrics.size]);
+
+  // 鍵盤焦點：開啟時、詳情關閉（按鈕被移除）、焦點落在被 disable 的按鈕（上一個 / 下一個走到底）時，把焦點收回 viewer，
+  // 否則快捷鍵失效，而且在 extension 裡按鍵會落到 GitHub 的頁面快捷鍵。
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const scope = root.getRootNode() as Document | ShadowRoot;
+    const active = scope.activeElement as (HTMLElement & { disabled?: boolean }) | null;
+    const alive = active && active !== document.body && root.contains(active) && !active.disabled;
+    if (!alive) root.focus({ preventScroll: true });
+  }, [selectedNode?.sha]);
+
   const onRowSelect = useCallback(
     (sha: string) => setSelectedSha((cur) => (cur === sha ? null : sha)),
     [],
@@ -301,6 +338,8 @@ export function GitGraphViewer({
   );
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // 輸入法選字中（Enter 是確認候選字、Esc 是取消組字）不是快捷鍵
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     const typing = (e.target as HTMLElement).closest?.('input, textarea, select');
     if (e.key === 'Escape') {
       // 一次只收掉一層：詳情 → 搜尋 → branch 聚焦；都沒有才交給外層（例如關閉 overlay）
@@ -343,14 +382,18 @@ export function GitGraphViewer({
   };
   const onTrackLeave = () => canvasRef.current?.setHover(null);
 
-  const selectedNode = selectedSha && derived ? derived.bySha.get(selectedSha) : undefined;
   const stats = derived?.stats;
   const filtered = active ? active.size : null;
 
   const statChips = layout && stats && (
     <div className="agg-stats">
-      <span className="agg-chip">{t.commits(stats.commits)}</span>
-      <span className="agg-chip">{t.branches(stats.branches)}</span>
+      {filtered !== null && (
+        <span className="agg-chip agg-chip--filter" role="status">
+          {t.filtering(filtered, stats.commits)}
+        </span>
+      )}
+      <span className="agg-chip agg-chip--commits">{t.commits(stats.commits)}</span>
+      <span className="agg-chip agg-chip--branches">{t.branches(stats.branches)}</span>
       {stats.tags > 0 && <span className="agg-chip">{t.tags(stats.tags)}</span>}
       {stats.authors.length > 0 && (
         <span
@@ -369,11 +412,6 @@ export function GitGraphViewer({
           {t.lastCommit(formatRelative(stats.lastDate, loc, now))}
         </span>
       )}
-      {filtered !== null && (
-        <span className="agg-chip agg-chip--filter" role="status">
-          {t.filtering(filtered, stats.commits)}
-        </span>
-      )}
     </div>
   );
 
@@ -383,13 +421,21 @@ export function GitGraphViewer({
       ref={rootRef}
       data-theme={sceneTheme}
       data-size={metrics.size}
+      data-cols={metrics.cols}
       data-detail={selectedNode ? '' : undefined}
+      tabIndex={-1}
       style={
         {
           '--agg-row-h': `${metrics.rowH}px`,
           '--agg-top-pad': `${metrics.topPad}px`,
-          '--agg-graph-w': `${metrics.graphW}px`,
+          // WebGL 不能用時整個線圖欄只留一條窄縫，把空間還給說明欄
+          '--agg-graph-w': `${webglFailed ? 12 : metrics.graphW}px`,
           '--agg-sbw': `${scrollbarW}px`,
+          '--agg-body-pad': `${LAYOUT.bodyPad[metrics.size]}px`,
+          '--agg-detail-w': `${LAYOUT.detailW}px`,
+          '--agg-col-author': `${LAYOUT.col[metrics.cols].author}px`,
+          '--agg-col-date': `${LAYOUT.col[metrics.cols].date}px`,
+          '--agg-col-sha': `${LAYOUT.col[metrics.cols].sha}px`,
         } as CSSProperties
       }
       onKeyDown={onKeyDown}
@@ -421,7 +467,11 @@ export function GitGraphViewer({
             </>
           )}
           {onRefresh && (
-            <IconButton label={t.refresh} onClick={onRefresh}>
+            <IconButton
+              label={t.refresh}
+              onClick={onRefresh}
+              busy={state.kind === 'ready' && state.refreshing}
+            >
               <RefreshIcon />
             </IconButton>
           )}

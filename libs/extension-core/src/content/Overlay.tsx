@@ -12,31 +12,52 @@ function githubTheme(): 'day' | 'night' | 'auto' {
 export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void }) {
   const { state, refresh } = useGraph(repo);
   const panelRef = useRef<HTMLDivElement>(null);
+  const downOnBackdrop = useRef(false);
 
-  const backdropRef = useRef<HTMLDivElement>(null);
-
+  // overlay 開著時，後面的 GitHub 頁面不能被滾輪 / 觸控捲動（捲動鏈接）：直接鎖住頁面的捲動，
+  // 並保留捲軸的位置（scrollbar-gutter），背景才不會因為捲軸消失而位移。
   useEffect(() => {
-    // overlay 開著時，滾輪不該捲動後面的 GitHub 頁面：捲動區自己處理（overscroll-behavior: contain），
-    // 其餘地方（標題列、背景）的滾輪直接吃掉。
-    const el = backdropRef.current;
-    const stop = (e: WheelEvent) => {
-      if (!(e.target as Element | null)?.closest?.('.agg-scroll, .agg-detail-body, .agg-branches'))
-        e.preventDefault();
+    const html = document.documentElement;
+    const prev = { overflow: html.style.overflow, gutter: html.style.scrollbarGutter };
+    html.style.overflow = 'hidden';
+    html.style.scrollbarGutter = 'stable';
+    return () => {
+      html.style.overflow = prev.overflow;
+      html.style.scrollbarGutter = prev.gutter;
     };
-    el?.addEventListener('wheel', stop, { passive: false });
-    return () => el?.removeEventListener('wheel', stop);
   }, []);
 
+  // viewer 會自己拿到鍵盤焦點（見 GitGraphViewer）；這裡只處理兩件事：
+  // 1. 萬一焦點掉到 overlay 外面（例如點了被 disable 的按鈕、focus 的元素被移除），按鍵不能漏給 GitHub 的快捷鍵，
+  //    Esc 仍然要能關閉，其他按鍵把焦點拉回 overlay。
+  // 2. viewer 沒有渲染出來（ErrorBoundary 的當機畫面）時，由 panel 接手焦點。
   useEffect(() => {
-    panelRef.current?.focus();
-  }, []);
+    const panel = panelRef.current;
+    if (!panel) return;
+    const scope = panel.getRootNode() as Document | ShadowRoot;
+    if (!scope.activeElement || !panel.contains(scope.activeElement)) panel.focus();
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.composedPath().includes(panel)) return; // overlay 內部：由 React / viewer 的處理器負責
+      e.stopPropagation();
+      if (e.key === 'Escape') onClose();
+      else (panel.querySelector<HTMLElement>('.agg-root') ?? panel).focus({ preventScroll: true });
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
 
   return (
     <div
       className="agg-backdrop"
-      ref={backdropRef}
+      // 點背景才關閉；從面板裡按下、拖到背景放開（選文字）不算。用 click 而不是 pointerdown：
+      // 觸控時 pointerdown 就關掉的話，同一下點擊會穿透到底下的 GitHub 元素。
       onPointerDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        downOnBackdrop.current = e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        if (downOnBackdrop.current && e.target === e.currentTarget) onClose();
+        downOnBackdrop.current = false;
       }}
     >
       <div

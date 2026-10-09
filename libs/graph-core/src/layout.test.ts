@@ -170,6 +170,31 @@ describe('buildLayout', () => {
     expect(l.truncated).toBe(true);
   });
 
+  it('keeps the default branch tip (and its recent history) when other branches are much newer', () => {
+    // main の tip は 5 本目の古い commit。別 branch が新しい commit を大量に持っていても、clip で main が消えない
+    const main = Array.from({ length: 5 }, (_, i) => commit(`m${i}`, i ? [`m${i - 1}`] : [], i));
+    const side = Array.from({ length: 30 }, (_, i) =>
+      commit(`s${i}`, i ? [`s${i - 1}`] : ['m0'], 100 + i),
+    );
+    const l = buildLayout(
+      {
+        repo: { owner: 'o', name: 'r', defaultBranch: 'main' },
+        commits: [...main, ...side],
+        refs: [
+          { name: 'main', sha: 'm4', kind: 'branch', isDefault: true },
+          { name: 'feat', sha: 's29', kind: 'branch' },
+        ],
+      },
+      { maxCommits: 10 },
+    );
+    expect(l.truncated).toBe(true);
+    expect(l.nodes.length).toBe(10);
+    const head = l.nodes.find((n) => n.isHead);
+    expect(head?.sha).toBe('m4');
+    expect(head?.lane).toBe(0);
+    expect(l.branches.map((b) => b.name)).toContain('main');
+  });
+
   it('survives an empty repo and duplicate commits', () => {
     expect(buildLayout(data([], 'x')).nodes).toEqual([]);
     const c = commit('a', [], 1);

@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  LAYOUT,
   MAX_DEVICE_PX,
   anchoredScrollTop,
   computeMetrics,
+  fixedColumnsWidth,
+  listWidthFor,
   planWindow,
   sizeClassFor,
+  stableMetrics,
   visibleRows,
 } from './geometry.ts';
 
@@ -24,31 +28,86 @@ describe('computeMetrics', () => {
     expect(computeMetrics(390, 3).rowH).toBeGreaterThan(computeMetrics(1280, 3).rowH);
   });
 
-  it('keeps the graph column within the budget by squeezing the lane pitch', () => {
+  it('squeezes the lane pitch (not the subject column) when there are many lanes', () => {
     for (const width of [360, 390, 768, 1024, 1440]) {
       const few = computeMetrics(width, 2);
       const many = computeMetrics(width, 12);
       expect(many.lanePitch).toBeLessThanOrEqual(few.lanePitch);
-      expect(many.graphW).toBeLessThanOrEqual(width * 0.5);
       expect(many.graphW).toBeGreaterThanOrEqual(many.radius * 2);
     }
   });
 
-  it('never lets the graph column eat a phone screen, even with absurdly many lanes', () => {
-    const m = computeMetrics(360, 40);
-    expect(m.lanePitch).toBeGreaterThanOrEqual(8);
-    // 40 lanes × 8px = 312px：此時寧可超出預算也不讓 lane 重疊，但呼叫端會裁掉；數值要有限
-    expect(Number.isFinite(m.graphW)).toBe(true);
+  it('always leaves room for the subject, at every width, lane count and detail state', () => {
+    for (const width of [
+      320, 360, 390, 414, 600, 639, 640, 700, 768, 820, 979, 980, 1024, 1100, 1280, 1440, 1920,
+    ]) {
+      for (const lanes of [1, 2, 4, 8, 12]) {
+        for (const detailOpen of [false, true]) {
+          const m = computeMetrics(width, lanes, detailOpen);
+          const fixed =
+            m.size === 'narrow' ? LAYOUT.colGap + LAYOUT.rowPadRight : fixedColumnsWidth(m.cols);
+          const subject = listWidthFor(width, detailOpen) - m.graphW - fixed;
+          // 12 條 lane 在手機上會被 MIN_PITCH 撐到超出預算；其他情況說明欄至少要有 120px
+          const tooManyLanes = m.size === 'narrow' && lanes >= 8;
+          if (!tooManyLanes) {
+            expect(
+              subject,
+              `${width}px, ${lanes} lanes, detail ${detailOpen}`,
+            ).toBeGreaterThanOrEqual(120);
+          }
+        }
+      }
+    }
   });
 
-  it('leaves headroom above the first row for the crown', () => {
-    expect(computeMetrics(1200, 3).topPad).toBeGreaterThanOrEqual(8);
+  it('drops secondary columns as the list gets narrower (the detail panel eats width on wide screens)', () => {
+    const open = computeMetrics(1024, 8, true);
+    const closed = computeMetrics(1024, 8, false);
+    expect(['compact', 'min']).toContain(open.cols);
+    expect(open.cols).not.toBe('full');
+    expect(closed.cols).toBe('full');
+    expect(computeMetrics(1440, 3, false).cols).toBe('full');
+    expect(computeMetrics(390, 3).cols).toBe('min');
+  });
+
+  it('only a docked detail (wide) shrinks the list', () => {
+    expect(listWidthFor(1200, true)).toBe(listWidthFor(1200, false) - LAYOUT.detailW - LAYOUT.gap);
+    expect(listWidthFor(800, true)).toBe(listWidthFor(800, false));
+    expect(listWidthFor(390, true)).toBe(listWidthFor(390, false));
+  });
+
+  it('leaves headroom above the first row for the crown and beside lane 0 for the selection ring', () => {
+    const m = computeMetrics(1200, 3);
+    expect(m.topPad).toBeGreaterThanOrEqual(8);
+    expect(m.padLeft).toBeGreaterThanOrEqual(m.radius * 1.4 + 1);
   });
 
   it('handles zero and one lane', () => {
     expect(computeMetrics(1000, 0).graphW).toBe(computeMetrics(1000, 1).graphW);
     const one = computeMetrics(1000, 1);
     expect(one.padLeft).toBeGreaterThan(one.radius);
+  });
+
+  it('is finite for absurd inputs', () => {
+    const m = computeMetrics(360, 40);
+    expect(m.lanePitch).toBeGreaterThanOrEqual(8);
+    expect(Number.isFinite(m.graphW)).toBe(true);
+    expect(Number.isFinite(computeMetrics(0, 3).graphW)).toBe(true);
+  });
+});
+
+describe('stableMetrics', () => {
+  it('returns the previous object while every value is unchanged (1px resizes must not rebuild the scene)', () => {
+    const a = computeMetrics(1440, 3);
+    for (const w of [1441, 1442, 1500, 1920]) {
+      expect(stableMetrics(a, computeMetrics(w, 3))).toBe(a);
+    }
+  });
+  it('returns the new object as soon as something changes', () => {
+    const a = computeMetrics(1440, 3);
+    const b = computeMetrics(900, 3);
+    expect(stableMetrics(a, b)).toBe(b);
+    expect(stableMetrics(null, a)).toBe(a);
   });
 });
 

@@ -375,6 +375,11 @@ export class LogGraphScene {
     this.host.style.width = `${width}px`;
     this.host.style.height = `${next.height}px`;
     this.host.dataset['winTop'] = String(next.top);
+    // 給 e2e / 除錯：node 中心 = (padLeft + lane * lanePitch, topPad + (row + 0.5) * rowH)，單位 CSS px（track 座標）
+    this.host.dataset['padLeft'] = String(this.metrics.padLeft);
+    this.host.dataset['lanePitch'] = String(this.metrics.lanePitch);
+    this.host.dataset['rowH'] = String(this.metrics.rowH);
+    this.host.dataset['topPad'] = String(this.metrics.topPad);
 
     const u = this.u;
     const cam = this.camera;
@@ -436,7 +441,7 @@ export class LogGraphScene {
     }
     this.hovered = (hoverSha && this.actorBySha.get(hoverSha)) || null;
     this.selected = (this.selectedSha && this.actorBySha.get(this.selectedSha)) || null;
-    this.applyFocus();
+    this.applyFocus(true);
   }
 
   private worldOf(lane: number, row: number): [number, number] {
@@ -482,6 +487,10 @@ export class LogGraphScene {
     const stubLen = (m.rowH * 0.85) / this.u;
     for (const node of layout.nodes) {
       if (!node.hasHiddenParents) continue;
+      // 只有 first parent 被截掉才畫虛線尾巴；只是被 merge 進來的那條線的 parent 不在範圍內時，
+      // 虛線會蓋在真正的 first-parent 邊上
+      const first = node.parents[0];
+      if (first && this.actorBySha.has(first)) continue;
       const actor = this.actorBySha.get(node.sha)!;
       const x = actor.cx;
       const y = actor.cy;
@@ -619,12 +628,14 @@ export class LogGraphScene {
 
   // ───────────────────────── focus / dimming ─────────────────────────
 
-  private applyFocus() {
+  /** `snap`：重建後立刻套用（不要讓已淡化的 node 又從全尺寸慢慢縮回去）。 */
+  private applyFocus(snap = false) {
     const { active, edges } = this.focus;
     const dim = DIM[this.theme];
     for (const a of this.actors) {
       const dimmed = active !== null && !active.has(a.node.sha);
       a.dim = dimmed;
+      if (snap) a.dimV = dimmed ? 1 : 0;
       a.body.material = dimmed ? this.dimBodyMat : a.bodyMat;
       a.hull.material = dimmed ? this.dimHullMat : this.hullMat;
       a.face.visible = !dimmed;
@@ -646,29 +657,33 @@ export class LogGraphScene {
 
   private updateIncrementally(previous: Set<string>) {
     const animated = !this.reduced;
-    // 新增的 commit 由舊到新依序彈出來
-    const fresh = this.actors.filter((a) => !previous.has(a.node.sha)).reverse();
-    // 一次進來很多筆（pull / rebase）時要壓縮節奏，不然要等上好幾十秒
+    // 只讓可視範圍附近的新 commit 彈出來（由舊到新）；畫面外的立刻就位，不然要白等一長串看不到的動畫
+    const { first, last } = this.visible();
+    const fresh = this.actors
+      .filter((a) => !previous.has(a.node.sha))
+      .filter((a) => a.node.row >= first - 2 && a.node.row <= last + 2)
+      .reverse();
+    const animate = new Set(animated ? fresh : []);
+    // 一次進來很多筆（pull / rebase）時要壓縮節奏
     const step = clamp(2 / Math.max(fresh.length, 1), 0.03, 0.2);
-    let lastSpawn = this.t;
     for (const a of this.actors) {
       a.nextBlink = this.t + 1 + Math.random() * 3;
-      if (previous.has(a.node.sha) || !animated) {
+      if (!animate.has(a)) {
         a.spawnAt = -1e6;
         a.group.visible = true;
       }
     }
-    if (animated) {
-      fresh.forEach((a, k) => {
-        a.spawnAt = this.t + 0.25 + k * step;
-        a.group.visible = false;
-        lastSpawn = a.spawnAt;
-      });
-    }
+    let lastSpawn = this.t;
+    fresh.forEach((a, k) => {
+      if (!animate.has(a)) return;
+      a.spawnAt = this.t + 0.25 + k * step;
+      a.group.visible = false;
+      lastSpawn = a.spawnAt;
+    });
     this.edgeTiming = 'incremental';
     this.replayEnd = lastSpawn + 0.9;
     this.waveStart = this.replayEnd + 0.5;
-    this.setReplayState(fresh.length > 0 && animated ? 'playing' : 'done');
+    this.setReplayState(animate.size > 0 ? 'playing' : 'done');
   }
 
   private tick = (now: number) => {
@@ -681,7 +696,8 @@ export class LogGraphScene {
     const dt = Math.min(0.05, (now - this.lastFrame) / 1000);
     this.lastFrame = now;
     this.t += dt;
-    this.shared.uTime.value = this.t;
+    // prefers-reduced-motion：管線上流動的箭頭也要停下來（uTime 固定）
+    this.shared.uTime.value = this.reduced ? 0 : this.t;
 
     if (this.replayState === 'playing' && this.t > this.replayEnd) this.setReplayState('done');
     this.updateActors(dt);
@@ -796,7 +812,7 @@ export class LogGraphScene {
           ex.sprite.position.y = ex.base.y + Math.abs(w) * 0.05;
           ex.sprite.material.rotation = w * 0.1;
         } else if (ex.kind === 'sparkle') {
-          const sc = 0.36 * (0.8 + 0.3 * Math.sin(this.t * 4 + a.phase));
+          const sc = 0.36 * (0.8 + 0.3 * Math.sin(this.t * 4 + a.phase) * motion);
           ex.sprite.scale.set(sc, sc, 1);
           ex.sprite.material.rotation = this.t * 0.8 * motion;
         } else if (ex.kind === 'sweat') {
@@ -813,7 +829,7 @@ export class LogGraphScene {
       this.selection.visible = true;
       this.selection.position.set(sel.group.position.x, sel.group.position.y, -0.2);
       const pulse = 1 + Math.sin(this.t * 4.2) * 0.05 * motion;
-      this.selection.scale.setScalar(sel.radius * 1.5 * pulse);
+      this.selection.scale.setScalar(sel.radius * 1.4 * pulse);
     } else {
       this.selection.visible = false;
     }

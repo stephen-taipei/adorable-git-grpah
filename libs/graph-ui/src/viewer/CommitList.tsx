@@ -29,6 +29,8 @@ function ShaButton({ node, t }: { node: GraphNode; t: Messages }) {
     <button
       type="button"
       className="agg-sha"
+      // 400 列各一個 tab 停駐點太多：鍵盤使用者用詳情面板的「複製 SHA」；滑鼠 / 觸控照常
+      tabIndex={-1}
       data-state={state}
       title={
         state === 'ok'
@@ -86,6 +88,8 @@ export const CommitRow = memo(function CommitRow({
       aria-selected={selected}
       className="agg-commit"
       data-sha={node.sha}
+      data-row={node.row}
+      data-lane={node.lane}
       data-kind={node.kind}
       data-selected={selected || undefined}
       data-dim={dim || undefined}
@@ -114,7 +118,7 @@ export const CommitRow = memo(function CommitRow({
             </span>
           )}
           {parsed.scope && <span className="agg-scope">{parsed.scope}</span>}
-          {parsed.type ? parsed.rest : node.subject || '(no message)'}
+          {parsed.type ? parsed.rest : node.subject || t.noMessage}
         </span>
       </div>
       <div className="agg-c-author" title={node.authorName}>

@@ -130,11 +130,11 @@
   white-space: nowrap;
 }
 
-.agg-chip:nth-child(1) {
+.agg-chip--commits {
   background: #e7defc;
 }
 
-.agg-chip:nth-child(2) {
+.agg-chip--branches {
   background: #ffe6a8;
 }
 
@@ -253,7 +253,7 @@
 }
 
 .agg-search input::placeholder {
-  color: #9a90bd;
+  color: #6f6590;
   font-weight: 700;
 }
 
@@ -313,6 +313,15 @@
   outline-offset: 1px;
 }
 
+/* 列表被卡片的 overflow:hidden 包住，外側的 outline 會被裁掉：焦點框畫在裡面 */
+.agg-scroll:focus-visible {
+  outline-offset: -3px;
+}
+
+.agg-root:focus {
+  outline: none;
+}
+
 .agg-branches {
   display: flex;
   flex: 1 1 100%;
@@ -321,6 +330,7 @@
   max-height: 74px;
   padding: 2px 2px 4px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .agg-branch {
@@ -390,7 +400,7 @@
   flex: 1;
   gap: 12px;
   min-height: 0;
-  padding: 12px 14px 14px;
+  padding: 12px var(--agg-body-pad, 14px) var(--agg-body-pad, 14px);
 }
 
 .agg-main {
@@ -415,11 +425,16 @@
   border-bottom: 2px solid var(--agg-ink);
 }
 
-/* 欄位：線圖 / 說明 / 作者 / 日期 / commit。窄一點的容器逐步收掉次要欄位（container query，不影響列高） */
+/*
+ * 欄位：線圖 / 說明 / 作者 / 日期 / commit。放哪幾欄由 JS 依「列表實際可用寬度」決定（data-cols，見 geometry.ts 的
+ * computeMetrics），欄寬是 --agg-col-*；標題列與每一列共用同一組變數，所以一定對得齊。
+ */
 .agg-colhead,
 .agg-commit {
   display: grid;
-  grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) 150px 160px 96px;
+  grid-template-columns:
+    var(--agg-graph-w) minmax(0, 1fr) var(--agg-col-author, 150px) var(--agg-col-date, 160px)
+    var(--agg-col-sha, 96px);
   align-items: center;
   column-gap: 10px;
   padding-right: 12px;
@@ -458,8 +473,6 @@
   overflow-anchor: none;
   overscroll-behavior: contain;
   outline: none;
-  container-type: inline-size;
-  container-name: agg-list;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--agg-card-ink) 35%, transparent) transparent;
 }
@@ -498,8 +511,13 @@
   box-shadow: inset 4px 0 0 var(--agg-ink);
 }
 
+.agg-root[data-theme='night'] .agg-commit[data-selected] {
+  background: color-mix(in srgb, #fff 13%, transparent);
+  box-shadow: inset 4px 0 0 var(--agg-pop);
+}
+
 .agg-commit[data-dim] {
-  opacity: 0.36;
+  opacity: 0.46;
 }
 
 .agg-commit[data-dim]:hover {
@@ -515,7 +533,7 @@
 }
 
 .agg-subject {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
   overflow: hidden;
   font-weight: 800;
@@ -679,15 +697,19 @@
 
 .agg-refs {
   display: inline-flex;
-  flex: none;
+  flex: 0 1 auto;
   gap: 4px;
+  min-width: 0;
   max-width: 52%;
-  overflow: hidden;
+  /* 目前 branch 的外圈光暈（box-shadow）不被裁掉 */
+  padding: 2px;
+  margin: -2px;
 }
 
 .agg-ref {
   display: inline-flex;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   align-items: center;
   gap: 3px;
   max-width: 170px;
@@ -735,6 +757,7 @@
 }
 
 .agg-ref--more {
+  flex: none;
   max-width: none;
   color: var(--agg-card-muted);
   background: transparent;
@@ -743,11 +766,18 @@
 
 /* ── 詳情 ──────────────────────────────────────────────────── */
 
+.agg-root[data-size] .agg-detail .agg-refs {
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  max-width: none;
+  overflow: visible;
+}
+
 .agg-detail {
   display: flex;
   flex: none;
   flex-direction: column;
-  width: 380px;
+  width: var(--agg-detail-w, 380px);
   min-height: 0;
   overflow: hidden;
   color: var(--agg-card-ink);
@@ -1005,34 +1035,33 @@
 
 /* ── RWD ───────────────────────────────────────────────────── */
 
-/* 列表容器變窄（例如詳情面板開著）：先收掉作者名稱，再收掉日期與作者 */
-@container agg-list (max-width: 860px) {
-  .agg-colhead,
-  .agg-commit {
-    grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) 30px 118px 92px;
-  }
-  .agg-author-name,
-  .agg-colhead .agg-c-author {
-    display: none;
-  }
-  .agg-date-abs {
-    display: none;
-  }
-  .agg-date-rel {
-    display: inline;
-  }
+/* compact：作者只留頭像、日期改相對時間（標題列的作者格保留寬度，DATE / COMMIT 才不會跑位） */
+.agg-root[data-cols='compact'] .agg-author-name {
+  display: none;
 }
 
-@container agg-list (max-width: 560px) {
-  .agg-colhead,
-  .agg-commit {
-    grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) 92px;
-  }
-  .agg-c-author,
-  .agg-c-date,
-  .agg-colhead .agg-c-date {
-    display: none;
-  }
+.agg-root[data-cols='compact'] .agg-colhead .agg-c-author {
+  visibility: hidden;
+}
+
+.agg-root[data-cols='compact'] .agg-date-abs,
+.agg-root[data-cols='min'] .agg-date-abs {
+  display: none;
+}
+
+.agg-root[data-cols='compact'] .agg-date-rel {
+  display: inline;
+}
+
+/* min：只剩 sha */
+.agg-root[data-cols='min'] .agg-colhead,
+.agg-root[data-cols='min'] .agg-commit {
+  grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) var(--agg-col-sha, 92px);
+}
+
+.agg-root[data-cols='min'] .agg-c-author,
+.agg-root[data-cols='min'] .agg-c-date {
+  display: none;
 }
 
 /* 中等寬度：詳情改成浮在右側的抽屜，不擠壓列表 */
@@ -1160,25 +1189,31 @@
 }
 
 .agg-root[data-size='narrow'] .agg-ref {
-  max-width: 96px;
+  max-width: 72px;
 }
 
 .agg-root[data-size='narrow'] .agg-refs {
-  max-width: 62%;
+  max-width: 48%;
 }
 
+/* 窄螢幕：有標籤的列把空間讓給說明文字（類型小標籤與 scope 省略） */
+.agg-root[data-size='narrow'] .agg-refs ~ .agg-subject .agg-type,
+.agg-root[data-size='narrow'] .agg-refs ~ .agg-subject .agg-scope {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-body {
+  flex-direction: column;
+}
+
+/* 底部面板在 flex 流程裡：列表的可視高度會縮小，被選取的那一列與最後幾列不會被面板蓋住 */
 .agg-root[data-size='narrow'] .agg-detail {
-  position: absolute;
-  z-index: 5;
-  right: 8px;
-  bottom: 8px;
-  left: 8px;
+  position: relative;
+  flex: 0 1 auto;
   width: auto;
-  max-height: 66%;
+  max-height: 50%;
   border-radius: 18px 18px 14px 14px;
-  box-shadow:
-    0 3px 0 var(--agg-ink),
-    0 -10px 30px rgba(43, 33, 64, 0.3);
+  box-shadow: 0 3px 0 var(--agg-ink);
   animation-name: agg-sheet-in;
 }
 
@@ -1198,13 +1233,84 @@
   padding-top: 8px;
 }
 
+.agg-root[data-size='narrow'] .agg-top {
+  flex-wrap: wrap;
+}
+
 .agg-root[data-size='narrow'] .agg-title {
+  flex: 1 1 140px;
   max-width: none;
 }
 
 @media (hover: none) {
   .agg-sha svg {
     opacity: 0.7;
+  }
+}
+
+/* 觸控 / 粗指標：點擊目標至少 ~36–44px；輸入框 16px 才不會讓 iOS Safari 在聚焦時放大頁面 */
+@media (pointer: coarse) {
+  .agg-btn {
+    width: 42px;
+    height: 42px;
+  }
+  .agg-btn--sm,
+  .agg-mini-icon {
+    width: 40px;
+    height: 40px;
+  }
+  .agg-sha {
+    min-height: 34px;
+    padding: 4px 10px;
+  }
+  .agg-branch {
+    min-height: 36px;
+  }
+  .agg-link {
+    min-height: 34px;
+  }
+  .agg-mini-btn {
+    min-height: 34px;
+  }
+  .agg-search input {
+    font-size: 16px;
+  }
+}
+
+/* 矮視窗（橫放的手機）：把工具列壓扁，詳情打開時整個讓給列表與面板 */
+@media (max-height: 520px) {
+  .agg-root .agg-top,
+  .agg-root .agg-subbar,
+  .agg-root .agg-toolbar {
+    padding-top: 6px;
+  }
+  .agg-root .agg-stats {
+    display: none;
+  }
+  .agg-root .agg-branches {
+    flex-wrap: nowrap;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .agg-root .agg-branch {
+    flex: none;
+  }
+  .agg-root .agg-body {
+    padding-top: 8px;
+  }
+  .agg-root[data-detail] .agg-subbar,
+  .agg-root[data-detail] .agg-toolbar {
+    display: none;
+  }
+  .agg-root[data-size] .agg-detail {
+    top: 8px;
+    bottom: 8px;
+    max-height: none;
+  }
+  .agg-root[data-size='narrow'] .agg-detail {
+    top: auto;
+    max-height: 60%;
   }
 }
 
@@ -1344,7 +1450,18 @@
   font-weight: 900;
 }
 
+@keyframes agg-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agg-btn--busy svg {
+  animation: agg-spin 0.9s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .agg-btn--busy svg,
   .agg-bounce,
   .agg-shadow,
   .agg-wobble,

@@ -49,6 +49,43 @@ interface PendingEdge {
   colorIndex: number;
 }
 
+/** 超過上限時，保證 default / 目前 branch 的 tip 與它們最近的祖先一定留下（其餘依日期新→舊補滿）。 */
+const KEEP_TIP_HISTORY = 40;
+
+function clipToNewest(list: CommitInput[], data: GraphData, maxCommits: number): CommitInput[] {
+  const bySha = new Map(list.map((c) => [c.sha, c]));
+  const keep = new Set<string>();
+  const tips = new Set<string>();
+  const defaultRef = data.refs.find((r) => r.kind === 'branch' && r.isDefault);
+  if (defaultRef) tips.add(defaultRef.sha);
+  const cur = data.repo.currentBranch;
+  const currentRef = cur
+    ? data.refs.find((r) => r.kind === 'branch' && !r.remote && r.name === cur)
+    : undefined;
+  if (currentRef) tips.add(currentRef.sha);
+  // 保留的筆數不能吃掉整個上限（maxCommits 還是上限）：每個 tip 至多佔上限的一半 / tip 數
+  const perTip = Math.max(
+    1,
+    Math.min(KEEP_TIP_HISTORY, Math.floor(maxCommits / (2 * Math.max(1, tips.size)))),
+  );
+  for (const tip of tips) {
+    // 沿 first parent 往回
+    let sha: string | undefined = tip;
+    for (let i = 0; i < perTip && sha && bySha.has(sha) && !keep.has(sha); i++) {
+      keep.add(sha);
+      sha = bySha.get(sha)!.parents[0];
+    }
+  }
+  const budget = maxCommits;
+  const newest = [...list].sort((a, b) => (Date.parse(b.date) || 0) - (Date.parse(a.date) || 0));
+  const out = newest.filter((c) => keep.has(c.sha));
+  for (const c of newest) {
+    if (out.length >= budget) break;
+    if (!keep.has(c.sha)) out.push(c);
+  }
+  return out;
+}
+
 /** children-first 的拓樸排序；同層以日期新→舊為先。 */
 function topoOrder(commits: Map<string, CommitInput>): string[] {
   const remaining = new Map<string, number>();
@@ -145,9 +182,7 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
   let list = [...new Map(data.commits.map((c) => [c.sha, c])).values()];
   let clipped = false;
   if (list.length > maxCommits) {
-    list = list
-      .sort((a, b) => (Date.parse(b.date) || 0) - (Date.parse(a.date) || 0))
-      .slice(0, maxCommits);
+    list = clipToNewest(list, data, maxCommits);
     clipped = true;
   }
   const commits = new Map(list.map((c) => [c.sha, c]));

@@ -133,7 +133,7 @@ export function CommitDetail({
       </header>
 
       <div className="agg-detail-body">
-        <h2 className="agg-detail-subject">{node.subject || '(no message)'}</h2>
+        <h2 className="agg-detail-subject">{node.subject || t.noMessage}</h2>
         {body && <pre className="agg-detail-message">{body}</pre>}
 
         <dl className="agg-facts">

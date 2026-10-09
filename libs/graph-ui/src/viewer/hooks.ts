@@ -9,12 +9,13 @@ export function useElementSize<T extends HTMLElement>(
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+    // 量「版面」尺寸（offset*），不是 getBoundingClientRect：後者含 CSS transform，
+    // extension 的 overlay 開場動畫是 scale(0.94)，會把錯誤的寬度鎖進去（ResizeObserver 之後不會再通知）
     const read = () => {
-      const r = el.getBoundingClientRect();
+      const width = el.offsetWidth;
+      const height = el.offsetHeight;
       setSize((prev) =>
-        prev.width === r.width && prev.height === r.height
-          ? prev
-          : { width: r.width, height: r.height },
+        prev.width === width && prev.height === height ? prev : { width, height },
       );
     };
     read();

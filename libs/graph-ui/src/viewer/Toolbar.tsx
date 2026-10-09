@@ -54,6 +54,11 @@ export function Toolbar({
           spellCheck={false}
           onChange={(e) => onQuery(e.target.value)}
           onKeyDown={(e) => {
+            // 輸入法選字中：Enter 是確認候選字、Esc 是取消組字，都不該觸發跳轉 / 清除
+            if (e.nativeEvent.isComposing || e.keyCode === 229) {
+              e.stopPropagation();
+              return;
+            }
             if (e.key === 'Enter') {
               e.preventDefault();
               onStep(e.shiftKey ? -1 : 1);

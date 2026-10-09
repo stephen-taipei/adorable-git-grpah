@@ -22,7 +22,7 @@ export function Avatar({ url, name, size = 20 }: { url?: string; name: string; s
       style={{ width: size, height: size, fontSize: Math.round(size * 0.5) }}
       aria-hidden="true"
     >
-      {(name || '?').slice(0, 1).toUpperCase()}
+      {(Array.from((name || '').trim())[0] ?? '?').toLocaleUpperCase()}
     </span>
   );
 }

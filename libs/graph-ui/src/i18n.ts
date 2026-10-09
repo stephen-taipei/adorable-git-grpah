@@ -67,7 +67,7 @@ export interface Messages {
   refsLabel: string;
   containedIn: string;
   containedInNote: string;
-  messageLabel: string;
+  noMessage: string;
   prevCommit: string;
   nextCommit: string;
   kinds: Record<string, string>;
@@ -141,7 +141,7 @@ const zhTW: Messages = {
   refsLabel: '指向這裡的分支 / tag',
   containedIn: '包含於',
   containedInNote: '只計算已載入的範圍',
-  messageLabel: '完整說明',
+  noMessage: '（沒有說明）',
   prevCommit: '上一個（較新）',
   nextCommit: '下一個（較舊）',
   kinds: {
@@ -232,7 +232,7 @@ const en: Messages = {
   refsLabel: 'Branches / tags at this commit',
   containedIn: 'In branches',
   containedInNote: 'only counts the loaded range',
-  messageLabel: 'Full message',
+  noMessage: '(no message)',
   prevCommit: 'Previous (newer)',
   nextCommit: 'Next (older)',
   kinds: {
