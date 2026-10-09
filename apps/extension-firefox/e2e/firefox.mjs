@@ -2,6 +2,13 @@
 // 驅動方式：puppeteer-core 經 WebDriver BiDi（browser.installExtension = about:debugging 的「載入暫時性附加元件」）。
 // 已驗證版本：Firefox 157.0.1 / puppeteer-core 25.12.0（已鎖定版本：下面的 chrome 範圍操作依賴 puppeteer 與 Firefox 的內部細節，
 // 升級時要重新驗證）。
+//
+// 內容：啟動（findFirefox / startXvfb / launchFirefox）、瀏覽器 UI（chrome 範圍）操作（工具列按鈕、event page 控制、extension 的
+// console 錯誤、剪貼簿讀寫）、組合鍵、content script 畫面（open shadow root）的查詢 / 點擊（shadowKit）、分頁與 extension 頁面的輔助。
+// Firefox 的幾個限制（e2e 都繞過了，改動前先讀）：
+//   - moz-extension:// 頁面是特權範圍：BiDi 不能對它截圖、不接受真實的滑鼠 / 鍵盤輸入（所以設定頁用 JS 操作 DOM）
+//   - 內容頁的 navigator.clipboard 需要 user activation + 貼上提示：剪貼簿改在 chrome 範圍（system principal）讀寫
+//   - 封閉網路：外部網址（例如 commit 頁）會變成 about:neterror，網址要用 realUrl() 還原
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import puppeteer from 'puppeteer-core';
@@ -191,6 +198,100 @@ export function extensionConsoleErrors(browser, uuid) {
         .map((m) => `${m.sourceName}:${m.lineNumber} ${m.errorMessage}`),
     uuid,
   );
+}
+
+// ---- 剪貼簿 / 組合鍵 ----------------------------------------------------------------------------
+// 內容頁的 navigator.clipboard 需要 user activation（而且 Firefox 會跳出「貼上」的提示），BiDi 也沒有 clipboard 權限可以授予；
+// 瀏覽器 UI（chrome 範圍）是 system principal，不受這些限制，所以讀 / 寫剪貼簿都在那邊做（Xvfb 底下是真正的 X 剪貼簿）。
+/** 目前剪貼簿的文字；讀不到（例如沒有剪貼簿服務）回傳 null。 */
+export const readClipboard = (browser) =>
+  chromeEval(browser, () => navigator.clipboard.readText()).catch(() => null);
+
+export const writeClipboard = (browser, text) =>
+  chromeEval(browser, (t) => navigator.clipboard.writeText(t), text);
+
+/**
+ * 按組合鍵（puppeteer 的 keyboard.press 只吃單一按鍵）：`chord(page, ['Shift'], 'Enter')`、`chord(page, ['Control'], 'a')`。
+ * 不管按鍵成不成功，修飾鍵一定會放開，免得影響後面的步驟。
+ */
+export async function chord(page, modifiers, key) {
+  for (const m of modifiers) await page.keyboard.down(m);
+  try {
+    await page.keyboard.press(key);
+  } finally {
+    for (const m of [...modifiers].reverse()) await page.keyboard.up(m);
+  }
+}
+
+// ---- content script 的畫面（Shadow DOM） ---------------------------------------------------------
+/**
+ * content script 的所有畫面都在 open shadow root（#adorable-git-graph-host）裡，puppeteer 的一般選擇器 / page.content() 看不到。
+ * 回傳一組查詢與操作函式：
+ *   shadow(fn, ...args) / ui(fn, ...args)  在頁面裡執行 `fn(shadowRoot, ...args)` / `fn(.agg-root 元素, ...args)`
+ *                                          （fn 會被序列化，不能引用外部變數；window / document 是頁面的）
+ *   exists / count / textOf / text         selector 是否存在 / 有幾個 / textContent / innerText
+ *   waitFor / waitGone                     等 selector 出現 / 消失（以間隔輪詢，分頁在背景時也不會停）
+ *   find(selector, pattern?, by?)          回傳 ElementHandle；pattern 是 regex，比對 textContent 或 `by` 指定的屬性
+ *   click(selector, pattern?, by?)         真的滑鼠點擊（puppeteer 會先把元素捲進可視範圍、算出點擊座標）
+ */
+export function shadowKit(page, hostId = 'adorable-git-graph-host') {
+  const sr$ = `document.getElementById(${JSON.stringify(hostId)})?.shadowRoot`;
+  const shadow = (fn, ...args) =>
+    page.evaluate(
+      new Function('...args', `const sr = ${sr$}; return (${fn.toString()})(sr, ...args);`),
+      ...args,
+    );
+  const ui = (fn, ...args) =>
+    page.evaluate(
+      new Function(
+        '...args',
+        `const r = ${sr$}?.querySelector('.agg-root'); return (${fn.toString()})(r, ...args);`,
+      ),
+      ...args,
+    );
+  const exists = (sel) => shadow((sr, s) => Boolean(sr?.querySelector(s)), sel);
+  const count = (sel) => shadow((sr, s) => sr?.querySelectorAll(s).length ?? 0, sel);
+  const textOf = (sel) => shadow((sr, s) => sr?.querySelector(s)?.textContent ?? null, sel);
+  const text = (sel) => shadow((sr, s) => sr?.querySelector(s)?.innerText ?? null, sel);
+  const waitFor = (sel, timeout = 20_000) =>
+    page.waitForFunction(
+      new Function('s', `return Boolean(${sr$}?.querySelector(s));`),
+      { timeout, polling: 100 },
+      sel,
+    );
+  const waitGone = (sel, timeout = 20_000) =>
+    page.waitForFunction(
+      new Function('s', `return !${sr$}?.querySelector(s);`),
+      { timeout, polling: 100 },
+      sel,
+    );
+  const find = async (selector, pattern, by = 'textContent') => {
+    const h = await page.evaluateHandle(
+      new Function(
+        's',
+        'src',
+        'by',
+        `const sr = ${sr$};
+         const re = src ? new RegExp(src) : null;
+         return [...(sr?.querySelectorAll(s) ?? [])].find((e) => !re || re.test(by === 'textContent' ? e.textContent ?? '' : e.getAttribute(by) ?? '')) ?? null;`,
+      ),
+      selector,
+      pattern?.source ?? null,
+      by,
+    );
+    const el = h.asElement();
+    if (!el) throw new Error(`not found in shadow root: ${selector} ${pattern ?? ''}`);
+    return el;
+  };
+  const click = async (selector, pattern, by) => {
+    const el = await find(selector, pattern, by);
+    try {
+      await el.click();
+    } finally {
+      await el.dispose().catch(() => {}); // 點擊可能已經讓元素 / 頁面消失
+    }
+  };
+  return { shadow, ui, exists, count, textOf, text, waitFor, waitGone, find, click };
 }
 
 // ---- 分頁 --------------------------------------------------------------------------------------

@@ -8,11 +8,19 @@
   --agg-sky-a: #bfe7ff;
   --agg-sky-b: #fff1fb;
   --agg-sky-c: #e9f9e6;
-  --agg-card: #ffffff;
+  --agg-card: #fffdf7;
   --agg-card-ink: #2b2140;
+  --agg-card-muted: #6f6590;
   --agg-muted: #6f6590;
+  --agg-line: color-mix(in srgb, var(--agg-card-ink) 9%, transparent);
+  --agg-row-h: 44px;
+  --agg-top-pad: 10px;
+  --agg-graph-w: 120px;
+  --agg-sbw: 0px;
 
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -33,6 +41,9 @@
   --agg-sky-b: #3a2d7c;
   --agg-sky-c: #55338f;
   --agg-muted: #cfc7f5;
+  --agg-card: #2d2759;
+  --agg-card-ink: #f4efff;
+  --agg-card-muted: #b9afe6;
 }
 
 .agg-root *,
@@ -49,24 +60,22 @@
     linear-gradient(160deg, var(--agg-sky-a) 0%, var(--agg-sky-c) 100%);
 }
 
-.agg-canvas {
-  position: absolute;
-  inset: 0;
+/* header / toolbar / body 都在 flow 裡（天空在最底層），讓內容區可以用 flex 吃滿剩餘高度 */
+.agg-top,
+.agg-subbar,
+.agg-toolbar,
+.agg-body {
+  position: relative;
+  z-index: 1;
 }
 
-/* ── floating bars ─────────────────────────────── */
-
 .agg-top {
-  position: absolute;
-  z-index: 3;
-  top: 14px;
-  left: 14px;
-  right: 14px;
   display: flex;
+  flex: none;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
-  pointer-events: none;
+  padding: 12px 14px 0;
 }
 
 .agg-pill {
@@ -90,7 +99,8 @@
 }
 
 .agg-title {
-  max-width: calc(100% - 200px);
+  flex: 0 1 auto;
+  max-width: calc(100% - 60px);
 }
 
 .agg-title-text {
@@ -102,24 +112,63 @@
   min-width: 0;
 }
 
-.agg-chips {
+/* 統計 chips 永遠一行（放不下就橫向捲動）：搜尋 / 聚焦時多出的「顯示 N / M」不會讓整個列表往下跳 */
+.agg-stats {
   display: flex;
+  /* 寬度基準不看內容：要不要換到下一行只取決於工具列寬度，多出「顯示 N / M」時不會跳行 */
+  flex: 1 1 720px;
+  flex-wrap: nowrap;
+  align-items: center;
   gap: 6px;
-  flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
+  padding-bottom: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.agg-stats::-webkit-scrollbar {
+  display: none;
+}
+
+.agg-stats .agg-chip {
+  flex: none;
 }
 
 .agg-chip {
   padding: 1px 9px;
   font-size: 12px;
   font-weight: 800;
-  background: #e7defc;
+  color: var(--agg-ink);
+  background: #fff;
   border: 2px solid var(--agg-ink);
   border-radius: 999px;
   white-space: nowrap;
 }
 
-.agg-chip:nth-child(2) {
+.agg-chip--commits {
+  background: #e7defc;
+}
+
+.agg-chip--branches {
   background: #ffe6a8;
+}
+
+.agg-chip--soft {
+  background: transparent;
+  border-style: dashed;
+  color: var(--agg-ink);
+}
+
+.agg-root[data-theme='night'] .agg-chip--soft {
+  color: #fff;
+  border-color: #cfc7f5;
+}
+
+.agg-chip--filter {
+  background: var(--agg-pop);
 }
 
 .agg-btn {
@@ -166,56 +215,200 @@
 
 /* 標題列下方的額外控制項（由使用端提供內容） */
 .agg-subbar {
-  position: absolute;
-  z-index: 3;
-  top: 74px;
-  left: 14px;
-  right: 14px;
   display: flex;
+  flex: none;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  pointer-events: none;
+  padding: 10px 14px 0;
 }
 
-.agg-subbar > * {
-  pointer-events: auto;
-}
+/* ── toolbar：搜尋 / 統計 / branch 篩選 ─────────────────────── */
 
-/* ── legend / hint ─────────────────────────────── */
-
-.agg-legend {
-  position: absolute;
-  z-index: 3;
-  left: 14px;
-  bottom: 14px;
-  right: 14px;
+.agg-toolbar {
   display: flex;
+  flex: none;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  max-width: 70%;
-  pointer-events: none;
+  gap: 8px 12px;
+  padding: 10px 14px 0;
+}
+
+.agg-search {
+  display: flex;
+  flex: 1 1 260px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 460px;
+  padding: 3px 8px 3px 12px;
+  color: var(--agg-ink);
+  background: #fff;
+  border: 3px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+}
+
+.agg-search:focus-within {
+  outline: 3px solid #5b8cff;
+  outline-offset: 2px;
+}
+
+.agg-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 0;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--agg-ink);
+  background: transparent;
+  border: 0;
+  outline: none;
+  user-select: text;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.agg-search input::placeholder {
+  color: #6f6590;
+  font-weight: 700;
+}
+
+.agg-search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.agg-search-count {
+  flex: none;
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--agg-muted);
+  white-space: nowrap;
+}
+
+.agg-root[data-theme='night'] .agg-search-count {
+  color: #6f6590;
+}
+
+.agg-mini-icon {
+  appearance: none;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin: 0;
+  color: var(--agg-ink);
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.agg-mini-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.agg-mini-icon:hover:not(:disabled) {
+  background: var(--agg-pop);
+}
+
+.agg-mini-icon:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.agg-mini-icon:focus-visible,
+.agg-mini-btn:focus-visible,
+.agg-link:focus-visible,
+.agg-sha:focus-visible,
+.agg-scroll:focus-visible {
+  outline: 3px solid #5b8cff;
+  outline-offset: 1px;
+}
+
+/* 列表被卡片的 overflow:hidden 包住，外側的 outline 會被裁掉：焦點框畫在裡面 */
+.agg-scroll:focus-visible {
+  outline-offset: -3px;
+}
+
+.agg-root:focus {
+  outline: none;
+}
+
+.agg-branches {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  gap: 6px;
+  /* 剛好兩行 chip（字高 1.35em + 上下 padding 2 + 邊框 6），多的捲動，不會露出半截第三行；
+     font-size 與 .agg-branch 相同，em 才算得準 */
+  font-size: 12.5px;
+  max-height: calc(2 * (1.35em + 8px) + 12px);
+  padding: 2px 2px 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@media (pointer: coarse) {
+  .agg-branches {
+    max-height: calc(2 * 36px + 12px);
+  }
 }
 
 .agg-branch {
   appearance: none;
-  pointer-events: auto;
-  max-width: 220px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 240px;
   margin: 0;
-  padding: 3px 12px;
+  padding: 1px 11px;
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 900;
   color: var(--agg-ink);
   border: 3px solid var(--agg-ink);
   border-radius: 999px;
   box-shadow: 0 3px 0 var(--agg-ink);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   cursor: pointer;
   transition: transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.agg-branch svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+
+.agg-branch-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agg-branch small {
+  flex: none;
+  padding: 0 5px;
+  font-size: 10.5px;
+  font-weight: 900;
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 999px;
+}
+
+.agg-branch[data-remote] {
+  border-style: dashed;
+}
+
+.agg-branch[aria-pressed='true'] {
+  outline: 3px solid var(--agg-pop);
+  outline-offset: 1px;
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 var(--agg-ink);
 }
 
 .agg-branch:hover {
@@ -227,38 +420,942 @@
   box-shadow: 0 0 0 var(--agg-ink);
 }
 
-.agg-note {
-  padding: 2px 10px;
-  font-size: 12px;
-  color: var(--agg-muted);
-  background: color-mix(in srgb, var(--agg-paper) 70%, transparent);
-  border-radius: 999px;
-  pointer-events: none;
+/* ── 內容區：列表（卡片）+ 詳情 ──────────────────────────────── */
+
+.agg-body {
+  display: flex;
+  flex: 1;
+  gap: 12px;
+  min-height: 0;
+  padding: 12px var(--agg-body-pad, 14px) var(--agg-body-pad, 14px);
 }
 
-.agg-hint {
+.agg-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--agg-card-ink);
+  background: var(--agg-card);
+  border: 3px solid var(--agg-ink);
+  border-radius: 18px;
+  box-shadow: 0 4px 0 var(--agg-ink);
+}
+
+.agg-banner--error {
+  background: #ffd9de;
+}
+
+.agg-banner {
+  flex: none;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--agg-ink);
+  background: #fff1c9;
+  border-bottom: 2px solid var(--agg-ink);
+}
+
+/*
+ * 欄位：線圖 / 說明 / 作者 / 日期 / commit。放哪幾欄由 JS 依「列表實際可用寬度」決定（data-cols，見 geometry.ts 的
+ * computeMetrics），欄寬是 --agg-col-*；標題列與每一列共用同一組變數，所以一定對得齊。
+ */
+.agg-colhead,
+.agg-commit {
+  display: grid;
+  grid-template-columns:
+    var(--agg-graph-w) minmax(0, 1fr) var(--agg-col-author, 150px) var(--agg-col-date, 160px)
+    var(--agg-col-sha, 96px);
+  align-items: center;
+  column-gap: 10px;
+  padding-right: 12px;
+}
+
+.agg-colhead-wrap {
+  flex: none;
+  padding-right: var(--agg-sbw);
+  border-bottom: 2px solid var(--agg-line);
+}
+
+.agg-colhead {
+  height: 30px;
+  font-size: 11.5px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  color: var(--agg-card-muted);
+  text-transform: uppercase;
+}
+
+.agg-colhead > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-colhead .agg-c-g {
+  padding-left: 12px;
+}
+
+.agg-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  outline: none;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--agg-card-ink) 35%, transparent) transparent;
+}
+
+.agg-log {
+  position: relative;
+  padding-top: var(--agg-top-pad);
+}
+
+.agg-canvas {
   position: absolute;
+  top: 0;
+  left: 0;
   z-index: 2;
-  right: 16px;
-  bottom: 16px;
-  padding: 3px 12px;
-  font-size: 12px;
-  color: var(--agg-muted);
-  background: color-mix(in srgb, var(--agg-paper) 55%, transparent);
-  border-radius: 999px;
   pointer-events: none;
 }
 
-.agg-root[data-theme='night'] .agg-hint,
-.agg-root[data-theme='night'] .agg-note {
-  background: rgba(20, 16, 60, 0.55);
+.agg-commit {
+  position: relative;
+  z-index: 1;
+  height: var(--agg-row-h);
+  font-size: 14px;
+  border-bottom: 1px solid var(--agg-line);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    opacity 0.2s;
+}
+
+.agg-commit:hover {
+  background: color-mix(in srgb, var(--agg-pop) 16%, transparent);
+}
+
+.agg-commit[data-selected] {
+  background: color-mix(in srgb, var(--agg-pop) 34%, transparent);
+  box-shadow: inset 4px 0 0 var(--agg-ink);
+}
+
+.agg-root[data-theme='night'] .agg-commit[data-selected] {
+  background: color-mix(in srgb, #fff 13%, transparent);
+  box-shadow: inset 4px 0 0 var(--agg-pop);
+}
+
+.agg-commit[data-dim] {
+  opacity: 0.46;
+}
+
+.agg-commit[data-dim]:hover {
+  opacity: 0.7;
+}
+
+.agg-c-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.agg-subject {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-type {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 18px;
+  color: var(--agg-ink);
+  background: #e6e3ee;
+  border-radius: 7px;
+  vertical-align: 1px;
+}
+
+.agg-type--feat {
+  background: #bdf0d6;
+}
+.agg-type--fix {
+  background: #ffcfd6;
+}
+.agg-type--docs {
+  background: #cfe6ff;
+}
+.agg-type--refactor {
+  background: #e1d2ff;
+}
+.agg-type--perf {
+  background: #ffe2b3;
+}
+.agg-type--test {
+  background: #d8f0bf;
+}
+.agg-type--revert {
+  background: #ffb9c3;
+}
+
+.agg-scope {
+  margin-right: 6px;
+  font-size: 12px;
+  color: var(--agg-card-muted);
+}
+
+.agg-scope::before {
+  content: '(';
+}
+.agg-scope::after {
+  content: ')';
+}
+
+.agg-merge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  padding: 0 7px 0 5px;
+  font-size: 11px;
+  font-weight: 900;
+  color: var(--agg-card-muted);
+  border: 2px solid var(--agg-line);
+  border-radius: 999px;
+}
+
+.agg-merge svg {
+  width: 12px;
+  height: 12px;
+}
+
+.agg-c-author {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agg-author-name {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-c-date {
+  overflow: hidden;
+  font-size: 12.5px;
+  color: var(--agg-card-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-date-rel {
+  display: none;
+}
+
+.agg-c-sha {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.agg-sha {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 1px 7px;
+  font: inherit;
+  color: var(--agg-card-ink);
+  background: transparent;
+  border: 2px solid var(--agg-line);
+  border-radius: 999px;
+  cursor: copy;
+}
+
+.agg-sha code {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.agg-sha svg {
+  width: 12px;
+  height: 12px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.agg-commit:hover .agg-sha svg,
+.agg-sha:focus-visible svg,
+.agg-sha[data-state] svg {
+  opacity: 0.8;
+}
+
+.agg-sha[data-state='ok'] {
+  background: #bdf0d6;
+  border-color: var(--agg-ink);
+  color: var(--agg-ink);
+}
+
+.agg-sha[data-state='fail'] {
+  background: #ffcfd6;
+  border-color: var(--agg-ink);
+  color: var(--agg-ink);
+}
+
+.agg-footer {
+  display: flex;
+  align-items: center;
+  height: var(--agg-row-h);
+  padding-left: calc(var(--agg-graph-w) + 10px);
+  font-size: 12px;
+  color: var(--agg-card-muted);
+}
+
+/* ── ref 標籤（branch / remote / tag） ───────────────────────── */
+
+.agg-refs {
+  display: inline-flex;
+  flex: 0 1 auto;
+  gap: 4px;
+  min-width: 0;
+  max-width: 52%;
+  /* 目前 branch 的外圈光暈（box-shadow）不被裁掉 */
+  padding: 2px;
+  margin: -2px;
+}
+
+.agg-ref {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  align-items: center;
+  gap: 3px;
+  max-width: 170px;
+  height: 20px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  font-weight: 900;
+  color: var(--agg-ink);
+  background: var(--agg-ref-color, #e7defc);
+  border: 2px solid var(--agg-ink);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.agg-ref svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+
+.agg-ref-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agg-ref--remote {
+  color: var(--agg-card-ink);
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--agg-ref-color, var(--agg-ink));
+}
+
+.agg-ref--tag {
+  background: #ffe27a;
+  color: var(--agg-ink);
+}
+
+.agg-ref--current {
+  box-shadow: 0 0 0 2px var(--agg-pop);
+}
+
+.agg-ref-head {
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+
+.agg-ref--more {
+  flex: none;
+  max-width: none;
+  color: var(--agg-card-muted);
+  background: transparent;
+  border-color: var(--agg-line);
+}
+
+/* ── 詳情 ──────────────────────────────────────────────────── */
+
+.agg-root[data-size] .agg-detail .agg-refs {
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  max-width: none;
+  overflow: visible;
+}
+
+.agg-detail {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: var(--agg-detail-w, 380px);
+  min-height: 0;
+  overflow: hidden;
+  color: var(--agg-card-ink);
+  background: var(--agg-card);
+  border: 3px solid var(--agg-ink);
+  border-radius: 18px;
+  box-shadow: 0 4px 0 var(--agg-ink);
+  animation: agg-slide-in 0.2s cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+
+@keyframes agg-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+}
+
+.agg-detail-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--agg-line);
+}
+
+.agg-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 10px;
+  font-size: 12px;
+  font-weight: 900;
+  color: var(--agg-ink);
+  border: 2px solid var(--agg-ink);
+  border-radius: 999px;
+}
+
+.agg-kind svg {
+  width: 13px;
+  height: 13px;
+}
+
+.agg-detail-nav {
+  display: flex;
+  gap: 6px;
+}
+
+.agg-btn--sm {
+  width: 28px;
+  height: 28px;
+  border-width: 2px;
+  box-shadow: 0 2px 0 var(--agg-ink);
+}
+
+.agg-btn--sm svg {
+  width: 14px;
+  height: 14px;
+}
+
+.agg-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+  pointer-events: none;
+}
+
+.agg-detail-body {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 14px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  user-select: text;
+}
+
+.agg-detail-subject {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 900;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.agg-detail-message {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--agg-line);
+  border-radius: 10px;
+}
+
+.agg-facts {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 10px 10px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.agg-facts dt {
+  padding-top: 3px;
+  font-size: 12px;
+  font-weight: 900;
+  color: var(--agg-card-muted);
+}
+
+.agg-facts dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  font-weight: 800;
+}
+
+.agg-stack {
+  flex-direction: column;
+  align-items: flex-start !important;
+  gap: 2px !important;
+}
+
+.agg-dim {
+  font-weight: 700;
+  color: var(--agg-card-muted);
+}
+
+.agg-sha-full {
+  flex: 1 1 100%;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 800;
+  word-break: break-all;
+}
+
+.agg-link {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0;
+  padding: 2px 4px;
+  font: inherit;
+  font-weight: 800;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.agg-link:hover {
+  background: var(--agg-line);
+}
+
+.agg-link code {
+  flex: none;
+  padding: 0 6px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--agg-ink);
+  border: 2px solid var(--agg-ink);
+  border-radius: 999px;
+}
+
+.agg-link span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-link--off {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.agg-link--plain {
+  padding: 0 2px;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+
+.agg-mini-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 1px 9px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  color: var(--agg-ink);
+  background: #fff;
+  border: 2px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 2px 0 var(--agg-ink);
+  cursor: pointer;
+}
+
+.agg-mini-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.agg-mini-btn[data-state='ok'] {
+  background: #bdf0d6;
+}
+
+.agg-mini-btn[data-state='fail'] {
+  background: #ffcfd6;
+}
+
+.agg-mini-btn:active {
+  transform: translateY(2px);
+  box-shadow: none;
+}
+
+.agg-detail-foot {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px 12px;
+  border-top: 2px solid var(--agg-line);
+}
+
+.agg-detail-foot:empty {
+  display: none;
+}
+
+.agg-cta--sm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  font-size: 13px;
+  border-width: 2px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+}
+
+.agg-cta--sm svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ── RWD ───────────────────────────────────────────────────── */
+
+/* compact：作者只留頭像、日期改相對時間（標題列的作者格保留寬度，DATE / COMMIT 才不會跑位） */
+.agg-root[data-cols='compact'] .agg-author-name {
+  display: none;
+}
+
+.agg-root[data-cols='compact'] .agg-colhead .agg-c-author {
+  visibility: hidden;
+}
+
+.agg-root[data-cols='compact'] .agg-date-abs,
+.agg-root[data-cols='min'] .agg-date-abs {
+  display: none;
+}
+
+.agg-root[data-cols='compact'] .agg-date-rel {
+  display: inline;
+}
+
+/* min：只剩 sha */
+.agg-root[data-cols='min'] .agg-colhead,
+.agg-root[data-cols='min'] .agg-commit {
+  grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) var(--agg-col-sha, 92px);
+}
+
+.agg-root[data-cols='min'] .agg-c-author,
+.agg-root[data-cols='min'] .agg-c-date {
+  display: none;
+}
+
+/* 中等寬度：詳情改成浮在右側的抽屜，不擠壓列表 */
+.agg-root[data-size='medium'] .agg-detail {
+  position: absolute;
+  z-index: 5;
+  top: 12px;
+  right: 14px;
+  bottom: 14px;
+  width: min(400px, calc(100% - 28px));
+  box-shadow:
+    0 4px 0 var(--agg-ink),
+    -12px 0 28px rgba(43, 33, 64, 0.25);
+}
+
+/* 窄螢幕：兩行式的列、詳情變成底部面板、工具列可橫向捲動 */
+.agg-root[data-size='narrow'] {
+  font-size: 13px;
+}
+
+.agg-root[data-size='narrow'] .agg-top {
+  padding: 8px 8px 0;
+}
+
+.agg-root[data-size='narrow'] .agg-subbar {
+  padding: 8px 8px 0;
+}
+
+.agg-root[data-size='narrow'] .agg-toolbar {
+  gap: 6px;
+  padding: 8px 8px 0;
+}
+
+.agg-root[data-size='narrow'] .agg-search {
+  flex: 1 1 100%;
+  max-width: none;
+}
+
+.agg-root[data-size='narrow'] .agg-stats,
+.agg-root[data-size='narrow'] .agg-branches {
+  flex: 1 1 100%;
+  flex-wrap: nowrap;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  padding-bottom: 5px;
+}
+
+.agg-root[data-size='narrow'] .agg-stats::-webkit-scrollbar,
+.agg-root[data-size='narrow'] .agg-branches::-webkit-scrollbar {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-branch {
+  flex: none;
+}
+
+.agg-root[data-size='narrow'] .agg-body {
+  padding: 8px 8px 8px;
+}
+
+.agg-root[data-size='narrow'] .agg-main {
+  border-width: 2px;
+  border-radius: 14px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+}
+
+.agg-root[data-size='narrow'] .agg-colhead-wrap {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-commit {
+  grid-template-columns: var(--agg-graph-w) minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    'g main main main'
+    'g author date sha';
+  row-gap: 3px;
+  align-content: center;
+  padding-right: 8px;
+}
+
+.agg-root[data-size='narrow'] .agg-c-g {
+  grid-area: g;
+}
+
+.agg-root[data-size='narrow'] .agg-c-main {
+  grid-area: main;
+}
+
+.agg-root[data-size='narrow'] .agg-c-author {
+  display: flex;
+  grid-area: author;
+  gap: 5px;
+}
+
+.agg-root[data-size='narrow'] .agg-author-name {
+  display: inline;
+  max-width: 34vw;
+  font-size: 12px;
+  color: var(--agg-card-muted);
+}
+
+.agg-root[data-size='narrow'] .agg-c-date {
+  display: block;
+  grid-area: date;
+  font-size: 12px;
+  text-align: right;
+}
+
+.agg-root[data-size='narrow'] .agg-date-abs {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-date-rel {
+  display: inline;
+}
+
+.agg-root[data-size='narrow'] .agg-c-sha {
+  grid-area: sha;
+}
+
+.agg-root[data-size='narrow'] .agg-sha svg {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-commit .agg-ref {
+  max-width: 120px;
+}
+
+.agg-root[data-size='narrow'] .agg-commit .agg-refs {
+  max-width: 48%;
+}
+
+/* 窄螢幕：有標籤的列把空間讓給說明文字（類型小標籤與 scope 省略） */
+.agg-root[data-size='narrow'] .agg-refs ~ .agg-subject .agg-type,
+.agg-root[data-size='narrow'] .agg-refs ~ .agg-subject .agg-scope {
+  display: none;
+}
+
+.agg-root[data-size='narrow'] .agg-body {
+  flex-direction: column;
+}
+
+/* 底部面板在 flex 流程裡：列表的可視高度會縮小，被選取的那一列與最後幾列不會被面板蓋住 */
+.agg-root[data-size='narrow'] .agg-detail {
+  position: relative;
+  flex: 0 1 auto;
+  width: auto;
+  max-height: 50%;
+  border-radius: 18px 18px 14px 14px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+  animation-name: agg-sheet-in;
+}
+
+@keyframes agg-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+}
+
+.agg-root[data-size='narrow'] .agg-facts {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+}
+
+.agg-root[data-size='narrow'] .agg-facts dt {
+  padding-top: 8px;
+}
+
+.agg-root[data-size='narrow'] .agg-top {
+  flex-wrap: wrap;
+}
+
+.agg-root[data-size='narrow'] .agg-title {
+  flex: 1 1 140px;
+  max-width: none;
+}
+
+@media (hover: none) {
+  .agg-sha svg {
+    opacity: 0.7;
+  }
+}
+
+/* 觸控 / 粗指標：點擊目標至少 ~36–44px；輸入框 16px 才不會讓 iOS Safari 在聚焦時放大頁面 */
+@media (pointer: coarse) {
+  .agg-btn {
+    width: 42px;
+    height: 42px;
+  }
+  .agg-btn--sm,
+  .agg-mini-icon {
+    width: 40px;
+    height: 40px;
+  }
+  /* 搜尋框裡的小按鈕：點擊範圍變大，但不撐高搜尋框（否則一打字列表就往下跳） */
+  .agg-search .agg-mini-icon {
+    margin-block: -8px;
+  }
+  .agg-sha {
+    min-height: 34px;
+    padding: 4px 10px;
+  }
+  .agg-branch {
+    min-height: 36px;
+  }
+  .agg-link {
+    min-height: 34px;
+  }
+  .agg-mini-btn {
+    min-height: 34px;
+  }
+  .agg-search input {
+    font-size: 16px;
+  }
+}
+
+/* 矮視窗（橫放的手機）：把工具列壓扁，詳情打開時整個讓給列表與面板 */
+@media (max-height: 520px) {
+  .agg-root .agg-top,
+  .agg-root .agg-subbar,
+  .agg-root .agg-toolbar {
+    padding-top: 6px;
+  }
+  .agg-root .agg-stats {
+    display: none;
+  }
+  .agg-root .agg-branches {
+    flex-wrap: nowrap;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .agg-root .agg-branch {
+    flex: none;
+  }
+  .agg-root .agg-body {
+    padding-top: 8px;
+  }
+  .agg-root[data-detail] .agg-subbar,
+  .agg-root[data-detail] .agg-branches {
+    display: none;
+  }
+  .agg-root[data-size] .agg-detail {
+    top: 8px;
+    bottom: 8px;
+    max-height: none;
+  }
+  .agg-root[data-size='narrow'] .agg-detail {
+    top: auto;
+    bottom: auto;
+    max-height: 60%;
+  }
 }
 
 /* ── states ─────────────────────────────────────── */
 
 .agg-center {
   position: absolute;
-  z-index: 2;
+  z-index: 6;
   inset: 0;
   display: flex;
   flex-direction: column;
@@ -373,56 +1470,14 @@
   }
 }
 
-/* ── tooltip ────────────────────────────────────── */
-
-.agg-tip {
-  position: absolute;
-  z-index: 4;
-  padding: 10px 12px;
-  color: var(--agg-card-ink);
-  background: var(--agg-card);
-  border: 3px solid var(--agg-ink);
-  border-radius: 16px;
-  box-shadow: 0 5px 0 var(--agg-ink);
-  pointer-events: none;
-  animation: agg-pop-in 0.16s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-@keyframes agg-pop-in {
-  from {
-    transform: scale(0.85);
-    opacity: 0;
-  }
-}
-
-.agg-tip-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--agg-muted);
-}
-
-.agg-root[data-theme='night'] .agg-tip-head {
-  color: #6f6590;
-}
-
-.agg-tip-author {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--agg-ink);
-  font-weight: 900;
-}
-
 .agg-avatar {
-  width: 28px;
-  height: 28px;
+  flex: none;
+  width: 22px;
+  height: 22px;
   border: 2px solid var(--agg-ink);
   border-radius: 50%;
   background: #e7defc;
+  color: var(--agg-ink);
   object-fit: cover;
 }
 
@@ -430,66 +1485,24 @@
   display: grid;
   place-items: center;
   font-weight: 900;
-  font-size: 13px;
 }
 
-.agg-tip-subject {
-  margin: 6px 0 8px;
-  font-size: 14px;
-  font-weight: 800;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.agg-tip-foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--agg-muted);
-}
-
-.agg-root[data-theme='night'] .agg-tip-foot {
-  color: #6f6590;
-}
-
-.agg-tip-foot code {
-  padding: 0 8px;
-  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  font-size: 12px;
-  font-weight: 800;
-  color: var(--agg-ink);
-  border: 2px solid var(--agg-ink);
-  border-radius: 999px;
-}
-
-.agg-tip-open {
-  margin-left: auto;
-  font-weight: 900;
-}
-
-@media (max-width: 640px) {
-  .agg-chips {
-    display: none;
+@keyframes agg-spin {
+  to {
+    transform: rotate(360deg);
   }
-  .agg-title {
-    max-width: calc(100% - 170px);
-  }
-  .agg-hint {
-    display: none;
-  }
+}
+
+.agg-btn--busy svg {
+  animation: agg-spin 0.9s linear infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .agg-btn--busy svg,
   .agg-bounce,
   .agg-shadow,
   .agg-wobble,
-  .agg-tip {
+  .agg-detail {
     animation: none;
   }
 }

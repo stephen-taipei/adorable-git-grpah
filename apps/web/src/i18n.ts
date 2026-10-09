@@ -17,7 +17,6 @@ const zh = {
   save: '儲存',
   clear: '清除',
   cancel: '取消',
-  copied: (sha: string) => `已複製 ${sha}`,
   localHint: '正在讀取本機 git 歷史；有新 commit 時畫面會自己更新。',
 };
 
@@ -38,7 +37,6 @@ const en: typeof zh = {
   save: 'Save',
   clear: 'Clear',
   cancel: 'Cancel',
-  copied: (sha) => `Copied ${sha}`,
   localHint: 'Reading your local git history; the view updates when you commit.',
 };
 

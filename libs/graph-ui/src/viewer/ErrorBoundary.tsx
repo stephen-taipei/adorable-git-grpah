@@ -48,7 +48,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
     const t = getMessages(detectLocale());
     return (
-      <div className="agg-root" data-theme="day" style={{ minHeight: 320 }}>
+      <div className="agg-root" data-theme="day" tabIndex={-1} style={{ minHeight: 320 }}>
         <div className="agg-sky" />
         <div className="agg-center" role="alert">
           <Mascot size={92} mood="sad" color="#ff7a8a" className="agg-wobble" />

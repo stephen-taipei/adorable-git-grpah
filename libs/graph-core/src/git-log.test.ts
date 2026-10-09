@@ -93,6 +93,24 @@ describe('selectRefs', () => {
     expect(s.logRefs[0]).toBe('refs/heads/main');
   });
 
+  it('marks remote-tracking branches with their remote (not the stripped remote-only default)', () => {
+    const s = selectRefs(all, { currentBranch: 'feat/x' });
+    expect(s.refs.map((r) => [r.name, r.remote])).toEqual([
+      ['main', undefined],
+      ['feat/x', undefined],
+      ['origin/diverged', 'origin'],
+      ['diverged', undefined],
+      ['origin/only-remote', 'origin'],
+    ]);
+    const onlyRemote = parseForEachRef(`refs/remotes/origin/main\t${sha(1)}\t`);
+    expect(selectRefs(onlyRemote, {}).refs[0]).toEqual({
+      name: 'main',
+      sha: sha(1),
+      kind: 'branch',
+      isDefault: true,
+    });
+  });
+
   it('uses a remote-only default branch under its bare name', () => {
     const onlyRemote = parseForEachRef(
       [`refs/heads/work\t${sha(2)}\t`, `refs/remotes/origin/main\t${sha(1)}\t`].join('\n'),
@@ -214,6 +232,24 @@ describe('parseGitLog / buildGitGraphData', () => {
     const layout = buildLayout(data);
     expect(layout.nodes).toHaveLength(4);
     expect(layout.nodes.find((n) => n.isHead)!.sha).toBe(sha(3));
+    expect(data.repo.currentBranch).toBeUndefined();
+  });
+
+  it('carries the checked-out branch through to the layout (HEAD marker)', () => {
+    const allRefs = parseForEachRef(
+      [`refs/heads/main\t${sha(3)}\t`, `refs/heads/work\t${sha(2)}\t`].join('\n'),
+    );
+    const data = buildGitGraphData({
+      logText: log,
+      selected: selectRefs(allRefs, { currentBranch: 'work' }),
+      allRefs,
+      fallbackName: 'folder',
+      currentBranch: 'work',
+    });
+    expect(data.repo.currentBranch).toBe('work');
+    const layout = buildLayout(data);
+    expect(layout.nodes.find((n) => n.isCurrent)!.sha).toBe(sha(2));
+    expect(layout.branches.find((b) => b.isCurrent)!.name).toBe('work');
   });
 
   it('falls back to the folder name and flags truncated history without a GitHub remote', () => {

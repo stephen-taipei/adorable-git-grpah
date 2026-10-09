@@ -15,35 +15,47 @@ type Fetched =
 export function useGraph(repo: RepoRef): { state: ViewerState; refresh: () => void } {
   const [fetched, setFetched] = useState<Fetched>({ kind: 'loading' });
   const [nonce, setNonce] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<{ code: string; message?: string } | null>(null);
+  const fetchedRef = useRef(fetched);
+  fetchedRef.current = fetched;
   const hintRef = useRef(repo.branchHint);
   hintRef.current = repo.branchHint;
   const force = useRef(false);
 
   useEffect(() => {
     let alive = true;
-    setFetched({ kind: 'loading' });
+    // 使用者按「重新整理」且已經有這個 repo 的圖：留著舊圖（捲動位置、選取、詳情都不動），背景重抓；
+    // 換 repo 或第一次載入才回到 loading（絕不顯示別的 repo 的舊圖）。
+    const forced = force.current;
+    force.current = false;
+    setFetched((prev) => (forced && prev.kind === 'ready' ? prev : { kind: 'loading' }));
+    setRefreshing(forced);
+    setRefreshError(null);
+    // 背景重新抓取失敗時保留原本的圖，只回報錯誤（不要讓使用者的捲動位置與選取跟著消失）
+    const fail = (err: { code: string; message?: string; resetAt?: number }) => {
+      if (forced && fetchedRef.current.kind === 'ready') setRefreshError(err);
+      else setFetched({ kind: 'error', ...err });
+    };
     sendToBackground<FetchGraphResponse>({
       type: 'fetch-graph',
       owner: repo.owner,
       repo: repo.repo,
       branchHint: hintRef.current,
-      force: force.current,
+      force: forced,
     })
       .then((res) => {
         if (!alive) return;
+        setRefreshing(false);
         if (res?.ok) setFetched({ kind: 'ready', graph: res.data.graph });
-        else setFetched({ kind: 'error', ...(res?.error ?? { code: 'unknown' }) });
+        else fail(res?.error ?? { code: 'unknown' });
       })
       .catch((err: unknown) => {
         if (!alive) return;
+        setRefreshing(false);
         // 例如 extension 剛更新、舊 content script 失去 background 連線
-        setFetched({
-          kind: 'error',
-          code: 'unknown',
-          message: err instanceof Error ? err.message : String(err),
-        });
+        fail({ code: 'unknown', message: err instanceof Error ? err.message : String(err) });
       });
-    force.current = false;
     return () => {
       alive = false;
     };
@@ -55,7 +67,7 @@ export function useGraph(repo: RepoRef): { state: ViewerState; refresh: () => vo
   );
 
   const state: ViewerState = layout
-    ? { kind: 'ready', layout }
+    ? { kind: 'ready', layout, refreshing, refreshError: refreshError ?? undefined }
     : fetched.kind === 'ready'
       ? { kind: 'loading' }
       : fetched;

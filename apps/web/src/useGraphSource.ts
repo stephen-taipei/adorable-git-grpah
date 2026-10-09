@@ -91,23 +91,37 @@ function writeGhCache(key: string, graph: GraphData, authed: boolean) {
 function useGitHubGraph(source: Source, token: string) {
   const [remote, setRemote] = useState<Remote>({ kind: 'loading' });
   const [nonce, setNonce] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<{ code: string; message?: string } | null>(null);
+  const remoteRef = useRef(remote);
+  remoteRef.current = remote;
   const force = useRef(false);
 
   const key = source.kind === 'github' ? `${source.owner}/${source.repo}`.toLowerCase() : '';
 
   useEffect(() => {
     if (source.kind !== 'github') return;
-    if (!force.current) {
+    const forced = force.current;
+    force.current = false;
+    if (!forced) {
       const hit = readGhCache(key, Boolean(token));
       if (hit) {
+        setRefreshing(false);
         setRemote({ kind: 'ready', graph: hit });
         return;
       }
     }
-    force.current = false;
 
     const ctrl = new AbortController();
-    setRemote({ kind: 'loading' });
+    // 重新整理時留著舊圖（捲動位置與選取不動）；換 repo / token 才回到 loading
+    setRemote((prev) => (forced && prev.kind === 'ready' ? prev : { kind: 'loading' }));
+    setRefreshing(forced);
+    setRefreshError(null);
+    // 重新整理失敗時保留原本的圖，只回報錯誤
+    const fail = (err: { code: string; message?: string; resetAt?: number }) => {
+      if (forced && remoteRef.current.kind === 'ready') setRefreshError(err);
+      else setRemote({ kind: 'error', ...err });
+    };
     fetchGitHubGraph(source.owner, source.repo, {
       token: token || undefined,
       apiBase: API_BASE,
@@ -115,18 +129,16 @@ function useGitHubGraph(source: Source, token: string) {
     }).then(
       (graph) => {
         writeGhCache(key, graph, Boolean(token));
+        setRefreshing(false);
         setRemote({ kind: 'ready', graph });
       },
       (err: unknown) => {
         if (ctrl.signal.aborted) return;
+        setRefreshing(false);
         if (err instanceof GitHubError) {
-          setRemote({ kind: 'error', code: err.code, message: err.message, resetAt: err.resetAt });
+          fail({ code: err.code, message: err.message, resetAt: err.resetAt });
         } else {
-          setRemote({
-            kind: 'error',
-            code: 'unknown',
-            message: err instanceof Error ? err.message : String(err),
-          });
+          fail({ code: 'unknown', message: err instanceof Error ? err.message : String(err) });
         }
       },
     );
@@ -139,7 +151,7 @@ function useGitHubGraph(source: Source, token: string) {
     setNonce((n) => n + 1);
   }, []);
 
-  return { remote, refresh };
+  return { remote, refresh, refreshing, refreshError };
 }
 
 export interface GraphSource {
@@ -168,7 +180,12 @@ export function useGraphSource(source: Source, token: string): GraphSource {
 
   let state: ViewerState;
   if (layout) {
-    state = { kind: 'ready', layout };
+    state = {
+      kind: 'ready',
+      layout,
+      refreshing: source.kind === 'github' && gh.refreshing,
+      refreshError: (source.kind === 'github' && gh.refreshError) || undefined,
+    };
   } else if (source.kind === 'local') {
     // 'local_git' 不在 i18n 錯誤表內，viewer 會直接顯示 message
     state = {
