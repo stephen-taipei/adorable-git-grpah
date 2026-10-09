@@ -1,4 +1,5 @@
-export * from './scene/GitGraphScene';
+export * from './scene/LogGraphScene';
+export * from './scene/geometry';
 export * from './viewer/GitGraphCanvas';
 export * from './viewer/GitGraphViewer';
 export * from './viewer/ErrorBoundary';

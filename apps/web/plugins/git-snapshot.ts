@@ -156,7 +156,14 @@ export async function readGitSnapshot(
       }
     }
 
-    const graph = buildGitGraphData({ logText, selected, allRefs, remoteUrl, fallbackName: name });
+    const graph = buildGitGraphData({
+      logText,
+      selected,
+      allRefs,
+      remoteUrl,
+      fallbackName: name,
+      currentBranch,
+    });
     // shallow clone 的邊界 commit 看起來像 root：至少要讓畫面標示「更早的歷史已省略」
     if (shallow === 'true') graph.truncated = true;
     return { graph, generatedAt };

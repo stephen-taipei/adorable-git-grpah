@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { GitGraphViewer } from '@adorable/graph-ui';
-import type { GraphNode } from '@adorable/graph-core';
 import { SourceBar, isThemeSetting } from './SourceBar';
 import { TokenDialog } from './TokenDialog';
 import { searchFromSource, sourceFromSearch } from './source';
@@ -32,7 +31,6 @@ export function App() {
   const [theme, setTheme] = useStored('agg.theme', 'auto', isThemeSetting);
   const [token, setToken] = useState(() => readStored(TOKEN_KEY) ?? '');
   const [tokenOpen, setTokenOpen] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
   const { state, refresh, repoName } = useGraphSource(source, token);
 
   const title = repoName
@@ -48,24 +46,6 @@ export function App() {
     document.documentElement.lang = locale;
   }, [title]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const id = setTimeout(() => setToast(null), 2200);
-    return () => clearTimeout(id);
-  }, [toast]);
-
-  const select = useCallback((node: GraphNode) => {
-    if (node.url) {
-      window.open(node.url, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    // 沒有 GitHub remote 的本機 repo：複製完整 sha
-    void navigator.clipboard?.writeText(node.sha).then(
-      () => setToast(t.copied(node.shortSha)),
-      () => undefined,
-    );
-  }, []);
-
   return (
     <div className="web-root">
       <GitGraphViewer
@@ -76,7 +56,6 @@ export function App() {
         sourceKey={source.kind === 'github' ? `github:${source.owner}/${source.repo}` : 'local'}
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
-        onSelectNode={select}
         headerExtra={
           <SourceBar source={source} onNavigate={navigate} theme={theme} onThemeChange={setTheme} />
         }
@@ -92,11 +71,6 @@ export function App() {
             setTokenOpen(false);
           }}
         />
-      )}
-      {toast && (
-        <div className="web-toast" role="status">
-          {toast}
-        </div>
       )}
     </div>
   );

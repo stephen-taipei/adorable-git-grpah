@@ -159,6 +159,8 @@ export function selectRefs(all: readonly ParsedRef[], opts: SelectRefsOptions = 
       sha: b.sha,
       kind: 'branch' as const,
       isDefault,
+      // 前綴被去掉的 default 已經當成一般 branch 顯示，不再標成 remote
+      ...(b.remote && !stripped ? { remote: b.remote } : {}),
     };
   });
   return {
@@ -207,6 +209,8 @@ export interface BuildGitGraphInput {
   remoteUrl?: string;
   /** remote 不是 GitHub 時顯示用的名稱（通常是資料夾名）。 */
   fallbackName: string;
+  /** `git branch --show-current`（detached HEAD 時省略）。 */
+  currentBranch?: string;
 }
 
 export function buildGitGraphData(input: BuildGitGraphInput): GraphData {
@@ -235,6 +239,7 @@ export function buildGitGraphData(input: BuildGitGraphInput): GraphData {
       name: remote?.repo ?? input.fallbackName,
       defaultBranch: input.selected.defaultBranch ?? 'main',
       url: base,
+      ...(input.currentBranch ? { currentBranch: input.currentBranch } : {}),
     },
     commits,
     refs,

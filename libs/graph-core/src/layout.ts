@@ -13,16 +13,9 @@ import type {
 } from './types.ts';
 
 const DEFAULT_MAX_COMMITS = 400;
-/** 換 lane 時，S 型曲線佔用的 x 長度（grid unit）。 */
+/** 換 lane 時，S 型曲線佔用的列數（grid unit）。 */
 const CURVE_LEN = 1;
 const CURVE_SAMPLES = 10;
-
-/** lane 序號 → y。0 在中線，奇數往上、偶數往下，交替展開。 */
-export function laneY(lane: number): number {
-  if (lane === 0) return 0;
-  const step = Math.ceil(lane / 2);
-  return lane % 2 === 1 ? step : -step;
-}
 
 export function classifyCommit(message: string, parentCount: number): CommitKind {
   if (parentCount === 0) return 'root';
@@ -89,44 +82,51 @@ function topoOrder(commits: Map<string, CommitInput>): string[] {
   return order;
 }
 
+/** (lane0,row0) → (lane1,row1) 的 S 型三次貝茲曲線（垂直切線）；取樣點不含起點。 */
 function bezier(
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
+  lane0: number,
+  row0: number,
+  lane1: number,
+  row1: number,
   out: Array<[number, number]>,
 ): void {
-  const dx = (x1 - x0) * 0.5;
+  const dr = (row1 - row0) * 0.5;
   for (let i = 1; i <= CURVE_SAMPLES; i++) {
     const t = i / CURVE_SAMPLES;
     const u = 1 - t;
-    // cubic bezier, 水平切線 → S 型
-    const px =
-      u * u * u * x0 + 3 * u * u * t * (x0 + dx) + 3 * u * t * t * (x1 - dx) + t * t * t * x1;
-    const py = u * u * u * y0 + 3 * u * u * t * y0 + 3 * u * t * t * y1 + t * t * t * y1;
-    out.push([px, py]);
+    const pl =
+      u * u * u * lane0 + 3 * u * u * t * lane0 + 3 * u * t * t * lane1 + t * t * t * lane1;
+    const pr =
+      u * u * u * row0 +
+      3 * u * u * t * (row0 + dr) +
+      3 * u * t * t * (row1 - dr) +
+      t * t * t * row1;
+    out.push([pl, pr]);
   }
 }
 
-/** parent(舊, 左) → child(新, 右) 的折線；換 lane 的 S 曲線只佔兩端 CURVE_LEN。 */
+/**
+ * child（上）→ parent（下）的折線，座標 [lane, row]。換 lane 的 S 曲線只佔兩端各 CURVE_LEN 列，
+ * 中間沿 `viaLane` 垂直走（和 `git log --graph` 一樣：先垂直、到 parent 附近才轉進它的 lane）。
+ */
 export function routeEdge(
-  parent: { x: number; y: number },
-  child: { x: number; y: number },
-  viaY: number,
+  child: { lane: number; row: number },
+  parent: { lane: number; row: number },
+  viaLane: number,
 ): Array<[number, number]> {
-  const raw: Array<[number, number]> = [[parent.x, parent.y]];
-  const dx = child.x - parent.x;
-  const needStart = Math.abs(parent.y - viaY) > 1e-9;
-  const needEnd = Math.abs(viaY - child.y) > 1e-9;
+  const raw: Array<[number, number]> = [[child.lane, child.row]];
+  const dr = parent.row - child.row;
+  const needStart = Math.abs(child.lane - viaLane) > 1e-9;
+  const needEnd = Math.abs(viaLane - parent.lane) > 1e-9;
   const curves = (needStart ? 1 : 0) + (needEnd ? 1 : 0);
-  const len = curves === 0 ? 0 : Math.min(CURVE_LEN, dx / curves);
+  const len = curves === 0 ? 0 : Math.min(CURVE_LEN, dr / curves);
 
-  if (needStart) bezier(parent.x, parent.y, parent.x + len, viaY, raw);
+  if (needStart) bezier(child.lane, child.row, viaLane, child.row + len, raw);
   if (needEnd) {
-    raw.push([child.x - len, viaY]);
-    bezier(child.x - len, viaY, child.x, child.y, raw);
+    raw.push([viaLane, parent.row - len]);
+    bezier(viaLane, parent.row - len, parent.lane, parent.row, raw);
   } else {
-    raw.push([child.x, child.y]);
+    raw.push([parent.lane, parent.row]);
   }
 
   // 去除重複點（零長度線段會讓 ribbon 法線退化）
@@ -237,7 +237,7 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
     // 第一個 parent 不在範圍內 → lane 結束
   }
 
-  // 3. 節點
+  // 3. 節點（order 已是 children-first ＝ 由新到舊，row 就是它的索引）
   const refsBySha = new Map<string, RefInput[]>();
   for (const r of data.refs) {
     if (!commits.has(r.sha)) continue;
@@ -245,10 +245,25 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
     arr.push(r);
     refsBySha.set(r.sha, arr);
   }
+  const currentBranch = data.repo.currentBranch;
+  const currentRef = currentBranch
+    ? data.refs.find((r) => r.kind === 'branch' && !r.remote && r.name === currentBranch)
+    : undefined;
+  const currentTip = currentRef && commits.has(currentRef.sha) ? currentRef.sha : undefined;
+
+  const childrenOf = new Map<string, string[]>();
+  for (const sha of order) {
+    for (const p of new Set(commits.get(sha)!.parents)) {
+      if (!placed.has(p)) continue;
+      const arr = childrenOf.get(p) ?? [];
+      arr.push(sha);
+      childrenOf.set(p, arr);
+    }
+  }
 
   const nodes: GraphNode[] = [];
   const nodeBySha = new Map<string, GraphNode>();
-  order.forEach((sha, i) => {
+  order.forEach((sha, row) => {
     const c = commits.get(sha)!;
     const lane = nodeLane.get(sha)!;
     const colorIndex = nodeColorIndex.get(sha)!;
@@ -257,9 +272,8 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
     const node: GraphNode = {
       sha,
       shortSha: sha.slice(0, 7),
-      x: n - 1 - i,
+      row,
       lane,
-      y: laneY(lane),
       colorIndex,
       color: colorAt(colorIndex),
       kind: classifyCommit(c.message, parentCount),
@@ -272,13 +286,14 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
       url: c.url,
       refs: refsBySha.get(sha) ?? [],
       parents: c.parents,
+      children: childrenOf.get(sha) ?? [],
       isHead: sha === defaultHead,
+      isCurrent: sha === currentTip,
       hasHiddenParents: hidden.has(sha),
     };
     nodes.push(node);
     nodeBySha.set(sha, node);
   });
-  nodes.reverse(); // 由舊到新
 
   // 4. 邊
   const edges: GraphEdge[] = pending.map((e) => {
@@ -292,7 +307,7 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
       kind,
       colorIndex: e.colorIndex,
       color: colorAt(e.colorIndex),
-      points: routeEdge(parent, child, laneY(e.viaLane)),
+      points: routeEdge(child, parent, e.viaLane),
     };
   });
 
@@ -304,22 +319,21 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
       sha: r.sha,
       color: nodeBySha.get(r.sha)!.color,
       isDefault: Boolean(r.isDefault),
+      ...(r.remote ? { remote: r.remote } : {}),
+      isCurrent: !r.remote && r.name === currentBranch,
     }))
-    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name));
+    .sort(
+      (a, b) =>
+        Number(b.isDefault) - Number(a.isDefault) ||
+        Number(b.isCurrent) - Number(a.isCurrent) ||
+        Number(Boolean(a.remote)) - Number(Boolean(b.remote)) ||
+        a.name.localeCompare(b.name),
+    );
 
-  let minY = 0;
-  let maxY = 0;
   let laneCount = 0;
-  for (const node of nodes) {
-    minY = Math.min(minY, node.y);
-    maxY = Math.max(maxY, node.y);
-    laneCount = Math.max(laneCount, node.lane + 1);
-  }
+  for (const node of nodes) laneCount = Math.max(laneCount, node.lane + 1);
   for (const e of edges) {
-    for (const [, y] of e.points) {
-      minY = Math.min(minY, y);
-      maxY = Math.max(maxY, y);
-    }
+    for (const [lane] of e.points) laneCount = Math.max(laneCount, Math.ceil(lane) + 1);
   }
 
   return {
@@ -327,10 +341,7 @@ export function buildLayout(data: GraphData, options: LayoutOptions = {}): Graph
     nodes,
     edges,
     branches,
-    maxX: Math.max(0, n - 1),
     laneCount,
-    minY,
-    maxY,
     truncated: Boolean(data.truncated) || clipped || hidden.size > 0,
   };
 }

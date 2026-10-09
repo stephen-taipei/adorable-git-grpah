@@ -149,7 +149,7 @@ body {
   outline-offset: 2px;
 }
 
-/* ── token dialog / toast ── */
+/* ── token dialog ── */
 
 .web-backdrop {
   position: fixed;
@@ -213,39 +213,4 @@ body {
 
 .web-cta--ghost {
   background: #fff;
-}
-
-.web-toast {
-  position: fixed;
-  z-index: 11;
-  left: 50%;
-  bottom: 64px;
-  transform: translateX(-50%);
-  padding: 8px 18px;
-  color: #2b2140;
-  background: #fffaf0;
-  border: 3px solid #2b2140;
-  border-radius: 999px;
-  box-shadow: 0 4px 0 #2b2140;
-  font:
-    900 14px/1.2 ui-rounded,
-    'SF Pro Rounded',
-    'Nunito',
-    'PingFang TC',
-    system-ui,
-    sans-serif;
-  animation: web-pop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-@keyframes web-pop {
-  from {
-    transform: translateX(-50%) scale(0.8);
-    opacity: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .web-toast {
-    animation: none;
-  }
 }

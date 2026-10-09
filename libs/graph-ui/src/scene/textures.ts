@@ -1,27 +1,7 @@
 import * as THREE from 'three';
 import { OUTLINE_COLOR } from '@adorable/graph-core';
 
-export const FONT_STACK =
-  '"Nunito","Baloo 2",ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Chalkboard SE","Comic Neue","PingFang TC","Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif';
-
-/** label 貼圖每個 world unit 對應的 px 數 */
-export const LABEL_PX_PER_UNIT = 72;
-
 export type Mouth = 'smile' | 'grin' | 'oh' | 'worry';
-
-export interface LabelStyle {
-  fill: string;
-  text: string;
-  tail?: boolean;
-  maxChars?: number;
-}
-
-export interface LabelTexture {
-  texture: THREE.CanvasTexture;
-  /** world unit */
-  width: number;
-  height: number;
-}
 
 type Draw = (ctx: CanvasRenderingContext2D, w: number, h: number) => void;
 
@@ -41,27 +21,9 @@ function toTexture(c: HTMLCanvasElement): THREE.CanvasTexture {
   return t;
 }
 
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
-) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
 /** 管理 scene 內所有 canvas 產生的貼圖，統一 dispose。 */
 export class TextureKit {
   private readonly all: THREE.Texture[] = [];
-  private readonly labels = new Map<string, LabelTexture>();
 
   readonly toonGradient: THREE.DataTexture;
   readonly eyes: THREE.CanvasTexture;
@@ -72,8 +34,6 @@ export class TextureKit {
   readonly sparkle: THREE.CanvasTexture;
   readonly sweat: THREE.CanvasTexture;
   readonly gloss: THREE.CanvasTexture;
-  readonly cloud: THREE.CanvasTexture;
-  readonly star: THREE.CanvasTexture;
   readonly dots: THREE.CanvasTexture;
 
   constructor() {
@@ -301,37 +261,6 @@ export class TextureKit {
       }),
     );
 
-    this.cloud = this.add(
-      makeCanvas(256, 128, (ctx) => {
-        ctx.fillStyle = '#ffffff';
-        for (const [x, y, r] of [
-          [64, 84, 40],
-          [112, 64, 50],
-          [166, 76, 44],
-          [204, 90, 32],
-          [128, 96, 44],
-        ] as const) {
-          ctx.beginPath();
-          ctx.arc(x, y, r, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }),
-    );
-
-    this.star = this.add(
-      makeCanvas(64, 64, (ctx) => {
-        ctx.fillStyle = '#fff6c9';
-        ctx.beginPath();
-        for (let i = 0; i < 10; i++) {
-          const r = i % 2 === 0 ? 28 : 11;
-          const a = (Math.PI / 5) * i - Math.PI / 2;
-          ctx.lineTo(32 + Math.cos(a) * r, 32 + Math.sin(a) * r);
-        }
-        ctx.closePath();
-        ctx.fill();
-      }),
-    );
-
     this.dots = this.add(
       makeCanvas(192, 64, (ctx) => {
         ctx.fillStyle = OUTLINE_COLOR;
@@ -350,68 +279,8 @@ export class TextureKit {
     return t;
   }
 
-  /** 圓角氣泡文字貼圖（branch / tag / ... 標籤）。同樣參數會重複使用。 */
-  label(text: string, style: LabelStyle): LabelTexture {
-    const max = style.maxChars ?? 22;
-    const shown = text.length > max ? `${text.slice(0, max - 1)}…` : text;
-    const key = `${shown}|${style.fill}|${style.text}|${style.tail ? 1 : 0}`;
-    const hit = this.labels.get(key);
-    if (hit) return hit;
-
-    const fontPx = 30;
-    const font = `800 ${fontPx}px ${FONT_STACK}`;
-    const probe = document.createElement('canvas').getContext('2d');
-    let textW = shown.length * fontPx * 0.6;
-    if (probe) {
-      probe.font = font;
-      textW = probe.measureText(shown).width;
-    }
-    const padX = 20;
-    const bodyH = fontPx + 24;
-    const tail = style.tail ? 16 : 0;
-    const border = 5;
-    const w = Math.ceil(textW + padX * 2 + border * 2);
-    const h = Math.ceil(bodyH + tail + border * 2);
-    const canvas = makeCanvas(w, h, (ctx) => {
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = border;
-      ctx.strokeStyle = OUTLINE_COLOR;
-      ctx.fillStyle = style.fill;
-      roundRect(ctx, border / 2, border / 2, w - border, bodyH, bodyH / 2);
-      ctx.fill();
-      ctx.stroke();
-      if (style.tail) {
-        ctx.beginPath();
-        ctx.moveTo(w / 2 - 12, bodyH + border / 2 - 1);
-        ctx.lineTo(w / 2, bodyH + tail + border / 2);
-        ctx.lineTo(w / 2 + 12, bodyH + border / 2 - 1);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        // 蓋掉氣泡與尾巴交界的描邊
-        ctx.fillStyle = style.fill;
-        ctx.fillRect(w / 2 - 10, bodyH - 2, 20, border + 3);
-      }
-      ctx.font = font;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = style.text;
-      ctx.fillText(shown, w / 2, border + bodyH / 2 + 1);
-    });
-    const texture = this.add(canvas);
-    texture.anisotropy = 8;
-    const out: LabelTexture = {
-      texture,
-      width: w / LABEL_PX_PER_UNIT,
-      height: h / LABEL_PX_PER_UNIT,
-    };
-    this.labels.set(key, out);
-    return out;
-  }
-
   dispose() {
     for (const t of this.all) t.dispose();
     this.all.length = 0;
-    this.labels.clear();
   }
 }

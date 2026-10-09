@@ -27,11 +27,11 @@ function mount() {
   const app = document.createElement('div');
   shadow.append(app);
 
-  // 避免 GitHub 的全域快捷鍵（g / t / s …）在 overlay 內被觸發
+  // 避免 GitHub 的全域快捷鍵（g / t / s / `/` …）在 overlay 內被觸發：事件在 shadow host 就擋下來，
+  // 不會冒泡到頁面的 document / window（overlay 內的搜尋框與列表快捷鍵都靠這個才不會誤觸 GitHub）。
+  // Esc 也一樣擋：由 overlay 自己處理（見 Overlay.tsx）。
   for (const type of ['keydown', 'keyup', 'keypress'] as const) {
-    host.addEventListener(type, (e) => {
-      if ((e as KeyboardEvent).key !== 'Escape') e.stopPropagation();
-    });
+    host.addEventListener(type, (e) => e.stopPropagation());
   }
 
   document.documentElement.append(host);

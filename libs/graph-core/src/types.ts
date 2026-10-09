@@ -17,6 +17,8 @@ export interface RefInput {
   sha: string;
   kind: 'branch' | 'tag';
   isDefault?: boolean;
+  /** remote-tracking branch 才有：remote 名稱（例如 `origin`；此時 `name` 為 `origin/feat/x`）。 */
+  remote?: string;
 }
 
 export interface RepoInfo {
@@ -24,6 +26,8 @@ export interface RepoInfo {
   name: string;
   defaultBranch: string;
   url?: string;
+  /** 本機目前 checkout 的 branch（只有本機 git 來源知道；GitHub API 沒有這個概念）。 */
+  currentBranch?: string;
 }
 
 export interface GraphData {
@@ -41,11 +45,10 @@ export type CommitKind = 'root' | 'merge' | 'feat' | 'fix' | 'revert' | 'docs' |
 export interface GraphNode {
   sha: string;
   shortSha: string;
-  /** 由舊到新的欄位索引（0 = 最舊）。 */
-  x: number;
+  /** 由新到舊的列索引（0 = 最新，畫在最上面）。`layout.nodes[i].row === i`。 */
+  row: number;
+  /** 欄位（lane）索引：0 = default branch，往右依序展開。 */
   lane: number;
-  /** lane 的垂直座標（grid unit，main lane = 0）。 */
-  y: number;
   colorIndex: number;
   color: string;
   kind: CommitKind;
@@ -58,8 +61,12 @@ export interface GraphNode {
   url?: string;
   refs: RefInput[];
   parents: string[];
+  /** 在已載入範圍內，以此 commit 為 parent 的 commit（新→舊）。 */
+  children: string[];
   /** 是否為 default branch 的最新 commit。 */
   isHead: boolean;
+  /** 是否為「目前 checkout 的 branch」的最新 commit（只有本機來源）。 */
+  isCurrent: boolean;
   /** 有 parent 落在已載入範圍之外（歷史被截斷）。 */
   hasHiddenParents: boolean;
 }
@@ -67,14 +74,14 @@ export interface GraphNode {
 export type EdgeKind = 'main' | 'fork' | 'merge';
 
 export interface GraphEdge {
-  /** older commit sha */
+  /** older commit sha（parent） */
   from: string;
-  /** newer commit sha */
+  /** newer commit sha（child） */
   to: string;
   kind: EdgeKind;
   colorIndex: number;
   color: string;
-  /** 由 parent 指向 child 的取樣折線（grid unit）。 */
+  /** 由 child（上）指向 parent（下）的取樣折線，座標為 [lane, row]（皆為 grid unit，row 向下遞增）。 */
   points: Array<[number, number]>;
 }
 
@@ -83,18 +90,20 @@ export interface GraphBranch {
   sha: string;
   color: string;
   isDefault: boolean;
+  /** remote-tracking branch 的 remote 名稱。 */
+  remote?: string;
+  /** 是否為目前 checkout 的 branch。 */
+  isCurrent: boolean;
 }
 
 export interface GraphLayout {
   repo: RepoInfo;
+  /** 由新到舊（列順序）。 */
   nodes: GraphNode[];
   edges: GraphEdge[];
   branches: GraphBranch[];
-  /** 最大 x index */
-  maxX: number;
+  /** 使用到的欄位數（最大 lane + 1）。 */
   laneCount: number;
-  minY: number;
-  maxY: number;
   truncated: boolean;
 }
 

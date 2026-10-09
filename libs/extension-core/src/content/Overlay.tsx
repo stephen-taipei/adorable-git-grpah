@@ -16,24 +16,20 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
   const backdropRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    // overlay 開著時，滾輪不該捲動後面的 GitHub 頁面（canvas 自己處理縮放）
+    // overlay 開著時，滾輪不該捲動後面的 GitHub 頁面：捲動區自己處理（overscroll-behavior: contain），
+    // 其餘地方（標題列、背景）的滾輪直接吃掉。
     const el = backdropRef.current;
-    const stop = (e: WheelEvent) => e.preventDefault();
+    const stop = (e: WheelEvent) => {
+      if (!(e.target as Element | null)?.closest?.('.agg-scroll, .agg-detail-body, .agg-branches'))
+        e.preventDefault();
+    };
     el?.addEventListener('wheel', stop, { passive: false });
     return () => el?.removeEventListener('wheel', stop);
   }, []);
 
   useEffect(() => {
     panelRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose]);
+  }, []);
 
   return (
     <div
@@ -47,6 +43,13 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
         className="agg-panel"
         ref={panelRef}
         tabIndex={-1}
+        // Esc 由 viewer 先處理（關詳情 → 清搜尋 → 清 branch 聚焦），都沒有東西可收時才會冒泡到這裡關閉 overlay
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            e.stopPropagation();
+            onClose();
+          }
+        }}
         role="dialog"
         aria-modal="true"
         aria-label={`Git graph · ${repo.owner}/${repo.repo}`}

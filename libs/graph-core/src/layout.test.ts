@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildLayout, classifyCommit, laneY, routeEdge } from './layout.ts';
+import { buildLayout, classifyCommit, routeEdge } from './layout.ts';
 import { createDemoData } from './demo.ts';
 import type { CommitInput, GraphData } from './types.ts';
 
@@ -17,12 +17,6 @@ const data = (commits: CommitInput[], head: string): GraphData => ({
   refs: [{ name: 'main', sha: head, kind: 'branch', isDefault: true }],
 });
 
-describe('laneY', () => {
-  it('alternates around the center', () => {
-    expect([0, 1, 2, 3, 4].map(laneY)).toEqual([0, 1, -1, 2, -2]);
-  });
-});
-
 describe('classifyCommit', () => {
   it.each([
     ['feat: a', 1, 'feat'],
@@ -37,20 +31,22 @@ describe('classifyCommit', () => {
 });
 
 describe('buildLayout', () => {
-  it('puts a linear history on lane 0, oldest on the left', () => {
+  it('puts a linear history on lane 0, newest on the first row', () => {
     const l = buildLayout(
       data([commit('c', ['b'], 3), commit('b', ['a'], 2), commit('a', [], 1)], 'c'),
     );
-    expect(l.nodes.map((n) => [n.sha, n.x, n.lane])).toEqual([
-      ['a', 0, 0],
+    expect(l.nodes.map((n) => [n.sha, n.row, n.lane])).toEqual([
+      ['c', 0, 0],
       ['b', 1, 0],
-      ['c', 2, 0],
+      ['a', 2, 0],
     ]);
     expect(l.edges.every((e) => e.kind === 'main')).toBe(true);
     expect(l.edges.every((e) => e.points.length === 2)).toBe(true);
     expect(l.truncated).toBe(false);
-    expect(l.nodes[0]!.kind).toBe('root');
-    expect(l.nodes[2]!.isHead).toBe(true);
+    expect(l.laneCount).toBe(1);
+    expect(l.nodes[2]!.kind).toBe('root');
+    expect(l.nodes[0]!.isHead).toBe(true);
+    expect(l.nodes.map((n) => n.children)).toEqual([[], ['c'], ['b']]);
   });
 
   it('keeps the default branch on lane 0 and moves side branches off it', () => {
@@ -82,32 +78,61 @@ describe('buildLayout', () => {
     expect(kinds['a>b']).toBe('main');
   });
 
-  it('never places two nodes on the same lane+x and orders parents before children', () => {
+  it('gives every node its own row (row === index) and lists children before parents', () => {
     const l = buildLayout(createDemoData());
-    const seen = new Set<string>();
-    for (const n of l.nodes) {
-      const k = `${n.x}:${n.lane}`;
-      expect(seen.has(k)).toBe(false);
-      seen.add(k);
-    }
-    const x = new Map(l.nodes.map((n) => [n.sha, n.x]));
-    for (const e of l.edges) expect(x.get(e.from)!).toBeLessThan(x.get(e.to)!);
+    l.nodes.forEach((n, i) => expect(n.row).toBe(i));
+    const row = new Map(l.nodes.map((n) => [n.sha, n.row]));
+    for (const e of l.edges) expect(row.get(e.to)!).toBeLessThan(row.get(e.from)!);
     expect(l.nodes).toHaveLength(createDemoData().commits.length);
+    expect(l.laneCount).toBe(Math.max(...l.nodes.map((n) => n.lane)) + 1);
   });
 
-  it('edge polylines start at the parent and end at the child, left → right', () => {
+  it('edge polylines start at the child (top) and end at the parent (bottom), top → bottom', () => {
     const l = buildLayout(createDemoData());
     const by = new Map(l.nodes.map((n) => [n.sha, n]));
     for (const e of l.edges) {
       const first = e.points[0]!;
       const last = e.points[e.points.length - 1]!;
-      expect(first).toEqual([by.get(e.from)!.x, by.get(e.from)!.y]);
-      expect(last[0]).toBeCloseTo(by.get(e.to)!.x);
-      expect(last[1]).toBeCloseTo(by.get(e.to)!.y);
+      expect(first).toEqual([by.get(e.to)!.lane, by.get(e.to)!.row]);
+      expect(last[0]).toBeCloseTo(by.get(e.from)!.lane);
+      expect(last[1]).toBeCloseTo(by.get(e.from)!.row);
       for (let i = 1; i < e.points.length; i++) {
-        expect(e.points[i]![0]).toBeGreaterThanOrEqual(e.points[i - 1]![0] - 1e-9);
+        expect(e.points[i]![1]).toBeGreaterThanOrEqual(e.points[i - 1]![1] - 1e-9);
       }
     }
+  });
+
+  it('records children and the checked-out branch tip (local sources)', () => {
+    //  a - b - m(merge, main)
+    //   \     /
+    //    f1 - f2   (current branch: feat)
+    const cs = [
+      commit('m', ['b', 'f2'], 6),
+      commit('f2', ['f1'], 5),
+      commit('b', ['a'], 4),
+      commit('f1', ['a'], 3),
+      commit('a', [], 1),
+    ];
+    const l = buildLayout({
+      repo: { owner: 'o', name: 'r', defaultBranch: 'main', currentBranch: 'feat' },
+      commits: cs,
+      refs: [
+        { name: 'main', sha: 'm', kind: 'branch', isDefault: true },
+        { name: 'feat', sha: 'f2', kind: 'branch' },
+        { name: 'origin/feat', sha: 'f1', kind: 'branch', remote: 'origin' },
+      ],
+    });
+    const by = Object.fromEntries(l.nodes.map((n) => [n.sha, n]));
+    expect(by.a!.children.sort()).toEqual(['b', 'f1']);
+    expect(by.m!.isCurrent).toBe(false);
+    expect(by.f2!.isCurrent).toBe(true);
+    expect(by.f2!.isHead).toBe(false);
+    // 圖例：default → 目前 → 其他本機 → remote
+    expect(l.branches.map((b) => [b.name, b.isCurrent, b.remote])).toEqual([
+      ['main', false, undefined],
+      ['feat', true, undefined],
+      ['origin/feat', false, 'origin'],
+    ]);
   });
 
   it('flags truncated history when parents are outside the loaded range', () => {
@@ -141,7 +166,7 @@ describe('buildLayout', () => {
   it('clips to the newest maxCommits', () => {
     const cs = Array.from({ length: 10 }, (_, i) => commit(`c${i}`, i ? [`c${i - 1}`] : [], i));
     const l = buildLayout(data(cs, 'c9'), { maxCommits: 4 });
-    expect(l.nodes.map((n) => n.sha)).toEqual(['c6', 'c7', 'c8', 'c9']);
+    expect(l.nodes.map((n) => n.sha)).toEqual(['c9', 'c8', 'c7', 'c6']);
     expect(l.truncated).toBe(true);
   });
 
@@ -162,16 +187,36 @@ describe('buildLayout', () => {
 
 describe('routeEdge', () => {
   it('returns a straight segment on the same lane', () => {
-    expect(routeEdge({ x: 0, y: 0 }, { x: 5, y: 0 }, 0)).toEqual([
+    expect(routeEdge({ lane: 0, row: 0 }, { lane: 0, row: 5 }, 0)).toEqual([
       [0, 0],
-      [5, 0],
+      [0, 5],
     ]);
   });
-  it('shrinks the curve when parent and child are adjacent', () => {
-    const pts = routeEdge({ x: 0, y: 0 }, { x: 1, y: 2 }, 2);
+  it('runs vertically on the via lane and only bends near the end', () => {
+    const pts = routeEdge({ lane: 2, row: 0 }, { lane: 0, row: 6 }, 2);
+    expect(pts[0]).toEqual([2, 0]);
+    expect(pts[1]).toEqual([2, 5]);
+    const last = pts[pts.length - 1]!;
+    expect(last[0]).toBeCloseTo(0);
+    expect(last[1]).toBeCloseTo(6);
+    for (const [lane] of pts) expect(lane).toBeLessThanOrEqual(2 + 1e-9);
+  });
+  it('shrinks the curve when parent and child are on adjacent rows', () => {
+    const pts = routeEdge({ lane: 0, row: 0 }, { lane: 2, row: 1 }, 0);
     expect(pts[0]).toEqual([0, 0]);
     const last = pts[pts.length - 1]!;
-    expect(last[0]).toBeCloseTo(1);
-    expect(last[1]).toBeCloseTo(2);
+    expect(last[0]).toBeCloseTo(2);
+    expect(last[1]).toBeCloseTo(1);
+    for (const [, row] of pts) {
+      expect(row).toBeGreaterThanOrEqual(-1e-9);
+      expect(row).toBeLessThanOrEqual(1 + 1e-9);
+    }
+  });
+  it('bends at both ends when the via lane differs from both', () => {
+    const pts = routeEdge({ lane: 0, row: 0 }, { lane: 1, row: 10 }, 3);
+    const lanes = pts.map(([l]) => l);
+    expect(Math.max(...lanes)).toBeCloseTo(3);
+    expect(lanes[0]).toBe(0);
+    expect(lanes[lanes.length - 1]).toBeCloseTo(1);
   });
 });
