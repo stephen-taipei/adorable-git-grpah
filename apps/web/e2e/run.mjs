@@ -2529,6 +2529,15 @@ try {
   await step(
     'token dialog: stored locally, sent only as a Bearer header, never in URL or DOM',
     async () => {
+      // 換 token 會重新抓取（中間經過 loading 畫面、列表重新掛載）：回來時要停在原本看的那一列，選取也還在
+      await page.locator('.agg-scroll').evaluate((el) => el.scrollTo(0, 200));
+      await sleep(400);
+      const beforeTop = await scrollTopNow();
+      assert.ok(beforeTop >= 150, `scrolled before the token change (${beforeTop})`);
+      await page.locator('.agg-commit').nth(8).click();
+      const picked = await selectedSha();
+      assert.ok(picked, 'a row is selected before the token change');
+
       seen.auth.length = 0;
       await page.getByRole('button', { name: /^(設定|Settings)$/ }).click();
       await page.locator('.web-dialog').waitFor();
@@ -2545,6 +2554,13 @@ try {
         10_000,
         'graph with token',
       );
+      await waitUntil(
+        async () => Math.abs((await scrollTopNow()) - beforeTop) <= 3,
+        10_000,
+        'the scroll position restored after the token reload',
+      );
+      assert.equal(await selectedSha(), picked, 'the selection survives the token reload');
+      await page.keyboard.press('Escape');
       // DOM（含所有 shadow tree）、輸入框的值、cookie、sessionStorage 都不能有 token
       const exposed = await page.evaluate(() => {
         const found = [];

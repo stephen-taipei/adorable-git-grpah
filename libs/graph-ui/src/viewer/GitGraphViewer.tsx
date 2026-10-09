@@ -185,6 +185,15 @@ export function GitGraphViewer({
   const anchor = useRef<{ sha?: string; frac: number }>({ frac: 0 });
   const lastRepo = useRef<string | null>(null);
   const lastScroller = useRef<HTMLElement | null>(null);
+  // 來源 / repo 的識別：中間就算只經過 loading 或錯誤畫面（沒有列表）也要記得「換過了」，
+  // 回來時才會從頭看，而不是恢復成上一次看這個 repo 的位置
+  const identity = `${sourceKey ?? ''}|${title}`;
+  const lastIdentity = useRef(identity);
+  useLayoutEffect(() => {
+    if (lastIdentity.current === identity) return;
+    lastIdentity.current = identity;
+    lastRepo.current = null;
+  }, [identity]);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
   const metricsRef = useRef(metrics);
