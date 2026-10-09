@@ -2320,7 +2320,8 @@ try {
       // 抓取期間：loading 面板（role=status）取代列表；API 拖慢一點才看得到
       const slowApi = async (route) => {
         await sleep(400);
-        await route.continue();
+        // unroute 之後才醒來的請求已經由 Playwright 接手（"Route is already handled"），不是錯誤
+        await route.continue().catch(() => {});
       };
       await page.route(`${apiBase}/**`, slowApi);
       await input.fill('https://github.com/demo/adorable-git-graph/tree/main');
@@ -2427,7 +2428,7 @@ try {
   );
 
   await step(
-    'GitHub refresh: the list stays mounted (same scroller, scroll, selection) and only the button spins; a failed refresh shows the error panel, Try again recovers',
+    'GitHub refresh: the list stays mounted (same scroller, scroll, selection) and only the button spins; a failed refresh keeps the graph and shows an error line; the next refresh clears it',
     async () => {
       await replayDone();
       await resetView();
@@ -2442,7 +2443,8 @@ try {
       // 把 API 回應拖慢，讓「轉圈」的狀態可以被觀察
       const slow = async (route) => {
         await sleep(900);
-        await route.continue();
+        // unroute 之後才醒來的請求已經由 Playwright 接手（"Route is already handled"），不是錯誤
+        await route.continue().catch(() => {});
       };
       await page.route(`${apiBase}/**`, slow);
       await page.evaluate(() => {
@@ -2496,26 +2498,23 @@ try {
       assert.equal(await page.locator('.agg-detail').count(), 1);
       assert.equal((await domRows()).length, SPECS.length);
 
-      // 失敗的重新整理：錯誤面板取代列表（網路錯誤），按「再試一次」復原
+      // 失敗的重新整理：保留原本的圖（同一個捲動容器、捲動位置、選取），只多一行錯誤；再按一次成功就消失
       await page.route(`${apiBase}/**`, (r) => r.abort());
       await page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click();
-      await page.locator('.agg-center[role="alert"]').waitFor({ timeout: 15_000 * SCALE });
-      assert.match(
-        await page.locator('.agg-center[role="alert"]').innerText(),
-        /Network error|網路錯誤/,
-      );
-      assert.equal(await page.locator('.agg-scroll').count(), 0, 'the error replaces the list');
-      assert.equal(await page.locator('.agg-detail').count(), 0);
+      const banner = page.locator('.agg-banner--error[role="alert"]');
+      await banner.waitFor({ timeout: 15_000 * SCALE });
+      assert.match(await banner.innerText(), /Network error|網路錯誤/);
+      assert.match(await banner.innerText(), /previous data|上一次的資料/);
+      assert.equal(await page.locator('.agg-center').count(), 0, 'no error panel replaces the list');
+      assert.equal(await scrollerTag(), 'same-element', 'the list survives a failed refresh');
+      assert.ok(Math.abs((await scrollTopNow()) - before) <= 3, 'scrollTop is kept after a failure');
+      assert.equal(await selectedSha(), pick.sha, 'selection is kept after a failure');
+      assert.equal((await domRows()).length, SPECS.length);
       await page.unroute(`${apiBase}/**`);
-      await page.locator('.agg-center .agg-cta', { hasText: /Try again|再試一次/ }).click();
-      await page.locator('.agg-scroll').waitFor({ timeout: 15_000 * SCALE });
-      await waitUntil(
-        async () => (await domRows()).length === SPECS.length,
-        10_000,
-        'graph back after Try again',
-      );
-      assert.equal(await page.locator('.agg-center').count(), 0);
-      assert.equal(await scrollTopNow(), 0, 'a fresh list starts at the top');
+      await page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click();
+      await banner.waitFor({ state: 'detached', timeout: 15_000 * SCALE });
+      assert.equal(await scrollerTag(), 'same-element');
+      assert.equal(await selectedSha(), pick.sha);
       await replayDone();
     },
   );

@@ -146,7 +146,7 @@ pnpm e2e              # 真實瀏覽器：web app + Chrome extension + Firefox e
 
 **Firefox extension**（`apps/extension-firefox/e2e`）：用 puppeteer-core 經 WebDriver BiDi 驅動**真正的 Firefox**，載入打包後的 add-on（等同「載入暫時性附加元件」），
 頁面由本機假的 github 伺服器提供（e2e 版 manifest 額外比對 `http://127.0.0.1/*`，所以跑的不是正式 manifest；正式 manifest 由單元測試、`web-ext lint` 與 `release` 的產物檢查把關）。
-涵蓋 14 個步驟：FAB、真實 WebGL 繪圖、hover、點擊開 commit 分頁、滾輪放大（畫面像素有變）與拖曳**不會**誤開分頁、快取與強制重抓、夜間主題、SPA 換頁的錯誤畫面、
+除了三套共同的檢查，還包含：頁面在 overlay 後面不能捲動也被設為 inert（Tab 進不去，GitHub 換掉 `<body>` 後也一樣）、按鍵不洩漏到頁面、點背景關閉、快取與強制重抓、夜間主題、SPA 換頁的錯誤畫面、
 **真的按下工具列按鈕**（`action.onClicked` → `tabs.sendMessage`）、沒有 content script 的頁面顯示 `!` 徽章、從設定按鈕開 `moz-extension://…/options.html` 並驗證 token 只以 Bearer header 送出、
 以及 **event page 被終止後**（直接呼叫 Firefox 內部的 `terminateBackground()`，確認狀態為 `stopped`）下一個請求能喚醒它並正常回應。
 另外，結尾會檢查 content script、event page、options 頁都沒有未捕捉的 console 錯誤，token 也不得出現在頁面（含 shadow DOM）或任何 URL。

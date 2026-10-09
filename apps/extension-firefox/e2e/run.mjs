@@ -13,8 +13,8 @@
 //   - 鍵盤（j/k/方向鍵/Home/End、/）、搜尋（淡化、計數、Enter 逐筆跳、IME 不觸發）、branch 聚焦
 //   - 詳情面板（內容、上一個 / 下一個 / parent 連結、在 GitHub 開啟的新分頁、複製 SHA（真的讀剪貼簿）、關閉後鍵盤焦點）
 //   - RWD：wide / medium / narrow（無橫向溢位、窄螢幕底部面板不蓋住選取列、寬螢幕詳情不壓到列表、欄位標題對齊）
-//   - 重新整理會保留捲動 / 選取（同一個 scroller 不被重建）、Esc 一次收一層、overlay 開著時背後頁面不能捲動、
-//     鍵盤事件不會漏給 GitHub 頁面（shadow host 擋下）、點背景關閉
+//   - 重新整理會保留捲動 / 選取（同一個 scroller 不被重建）、Esc 一次收一層、overlay 開著時背後頁面不能捲動（捲軸位置保留、
+//     頁面 inert、Tab 走不進去、換掉 <body> 後仍然 inert）、鍵盤事件不會漏給 GitHub 頁面（shadow host 擋下）、點背景關閉
 //   - Firefox 專屬：真正的工具列按鈕（action.onClicked → tabs.sendMessage）開關 overlay、沒有 content script 的分頁顯示 "!" 徽章、
 //     設定頁（特權的 moz-extension:// 頁面）與 token、event page 被終止後由下一個請求喚醒、extension 自己的 console 錯誤
 //
@@ -1846,6 +1846,100 @@ try {
         document.documentElement.style.overflow = '';
         window.scrollTo(0, 0);
       });
+    },
+  );
+
+  await step(
+    'extension: the page behind is inert (Tab cannot reach it, also after <body> is replaced); no gutter without a scrollbar',
+    async () => {
+      await closeOverlay();
+      const pageInfo = () =>
+        page.evaluate(() => ({
+          bodyInert: document.body.inert,
+          gutter: document.documentElement.style.scrollbarGutter,
+          overflow: document.documentElement.style.overflow,
+          scrollbar: window.innerWidth - document.documentElement.clientWidth,
+          mainLeft: document.querySelector('main')?.getBoundingClientRect().left ?? null,
+          active: document.activeElement?.id ?? document.activeElement?.tagName,
+        }));
+      // 一個真的能拿到焦點的頁面元素（假頁面本來沒有任何可聚焦的東西）
+      await page.evaluate(() => {
+        const b = document.createElement('button');
+        b.id = 'agg-e2e-page-button';
+        b.textContent = 'page button';
+        document.body.prepend(b);
+      });
+      const closed = await pageInfo();
+      assert.equal(closed.scrollbar, 0, 'the short fake page has no scrollbar');
+      assert.equal(closed.bodyInert, false);
+      // 對照組：overlay 沒開時，從 FAB 按 Shift+Tab 會走到它前面的頁面按鈕，而且頁面按鈕能直接拿到焦點
+      await shadow((sr) => sr.querySelector('.agg-fab').focus());
+      await chord(page, ['Shift'], 'Tab');
+      await eventually(
+        async () => (await pageInfo()).active,
+        'agg-e2e-page-button',
+        'Shift+Tab reaches the page button while the overlay is closed',
+      );
+      await page.evaluate(() => document.activeElement.blur());
+
+      await click('.agg-fab');
+      await waitFor('.agg-panel');
+      await waitFor('.agg-commit', 30_000);
+      await panelSettled();
+      const open = await pageInfo();
+      assert.equal(open.overflow, 'hidden');
+      assert.equal(open.bodyInert, true, '<body> is inert while the overlay is open');
+      // 頁面沒有捲軸時不要加 scrollbar-gutter（加了反而讓版面位移）
+      assert.equal(open.gutter, '', 'no scrollbar-gutter on a page without a scrollbar');
+      assert.ok(
+        Math.abs(open.mainLeft - closed.mainLeft) < 0.5,
+        `the page behind shifted ${open.mainLeft - closed.mainLeft}px`,
+      );
+      // 直接 focus() 也拿不到焦點；一路 Tab / Shift+Tab 下去（比 overlay 裡可聚焦的元素多很多次）：
+      // 焦點不能落到頁面上的按鈕、也不能把頁面捲動
+      assert.equal(
+        await page.evaluate(() => {
+          document.getElementById('agg-e2e-page-button').focus();
+          return document.activeElement?.id;
+        }),
+        'adorable-git-graph-host',
+        'an inert page button cannot be focused',
+      );
+      for (const mods of [[], ['Shift']]) {
+        for (let i = 0; i < 30; i++) {
+          await chord(page, mods, 'Tab');
+          const info = await page.evaluate(() => ({
+            id: document.activeElement?.id,
+            y: window.scrollY,
+          }));
+          assert.notEqual(
+            info.id,
+            'agg-e2e-page-button',
+            `${mods.join('+') || 'Tab'} #${i + 1} reached the page behind`,
+          );
+          assert.equal(info.y, 0, 'the page must not scroll while tabbing');
+        }
+      }
+      assert.equal(await count('.agg-panel'), 1, 'tabbing does not close the overlay');
+
+      // GitHub（Turbo）換頁會換掉整個 <body>：新的 <body> 也要是 inert
+      await page.evaluate(() => {
+        const nb = document.createElement('body');
+        nb.innerHTML = '<button id="agg-e2e-page-button-2">new page button</button>';
+        document.documentElement.replaceChild(nb, document.body);
+      });
+      await eventually(
+        async () => (await pageInfo()).bodyInert,
+        true,
+        'a replacement <body> is made inert as well',
+      );
+      await closeOverlay();
+      const after = await pageInfo();
+      assert.equal(after.bodyInert, false, 'inert is released on close');
+      assert.equal(after.overflow, '');
+      assert.equal(after.gutter, '');
+      // 還原假頁面
+      await page.evaluate(() => document.getElementById('agg-e2e-page-button-2')?.remove());
     },
   );
 
