@@ -184,6 +184,7 @@ export function GitGraphViewer({
   // ── 捲動：保持使用者的位置、跳到某一列 ───────────────────────────────────
   const anchor = useRef<{ sha?: string; frac: number }>({ frac: 0 });
   const lastRepo = useRef<string | null>(null);
+  const lastScroller = useRef<HTMLElement | null>(null);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
   const metricsRef = useRef(metrics);
@@ -205,6 +206,9 @@ export function GitGraphViewer({
     if (!sc || !layout) return;
     const repo = `${sourceKey ?? ''}|${layout.repo.owner}/${layout.repo.name}`;
     const { rowH, topPad } = metrics;
+    // 列表被重新掛載（例如換 token 時中間經過 loading 畫面）：新的捲動容器從 0 開始，要回到使用者原本看的那一列
+    const remounted = lastScroller.current !== sc;
+    lastScroller.current = sc;
     if (lastRepo.current !== repo) {
       // 換了 repo / 來源：從頭看
       lastRepo.current = repo;
@@ -216,14 +220,18 @@ export function GitGraphViewer({
       setCursor(-1);
     } else {
       const rowOf = new Map(layout.nodes.map((n) => [n.sha, n.row]));
-      const next = anchoredScrollTop({
-        scrollTop: sc.scrollTop,
-        rowH,
-        topPad,
-        anchorSha: anchor.current.sha,
-        anchorOffset: anchor.current.frac * rowH,
-        rowOf: (sha) => rowOf.get(sha),
-      });
+      const anchorRow = anchor.current.sha ? rowOf.get(anchor.current.sha) : undefined;
+      const next =
+        remounted && anchorRow !== undefined
+          ? Math.max(0, topPad + (anchorRow + anchor.current.frac) * rowH)
+          : anchoredScrollTop({
+              scrollTop: sc.scrollTop,
+              rowH,
+              topPad,
+              anchorSha: anchor.current.sha,
+              anchorOffset: anchor.current.frac * rowH,
+              rowOf: (sha) => rowOf.get(sha),
+            });
       if (Math.abs(next - sc.scrollTop) > 0.5) sc.scrollTop = next;
     }
     metricsRef.current = metrics;
@@ -311,7 +319,8 @@ export function GitGraphViewer({
       let row: number;
       if (delta === 'first') row = 0;
       else if (delta === 'last') row = n - 1;
-      else if (cur < 0) row = visibleRows(sc.scrollTop, sc.clientHeight, metrics.rowH, n).first;
+      else if (cur < 0)
+        row = visibleRows(sc.scrollTop, sc.clientHeight, metrics.rowH, n, metrics.topPad).first;
       else row = clamp(cur + delta, 0, n - 1);
       select(L.nodes[row]!.sha, 'nearest');
     },

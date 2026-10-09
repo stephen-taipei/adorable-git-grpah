@@ -2505,9 +2505,16 @@ try {
       await banner.waitFor({ timeout: 15_000 * SCALE });
       assert.match(await banner.innerText(), /Network error|網路錯誤/);
       assert.match(await banner.innerText(), /previous data|上一次的資料/);
-      assert.equal(await page.locator('.agg-center').count(), 0, 'no error panel replaces the list');
+      assert.equal(
+        await page.locator('.agg-center').count(),
+        0,
+        'no error panel replaces the list',
+      );
       assert.equal(await scrollerTag(), 'same-element', 'the list survives a failed refresh');
-      assert.ok(Math.abs((await scrollTopNow()) - before) <= 3, 'scrollTop is kept after a failure');
+      assert.ok(
+        Math.abs((await scrollTopNow()) - before) <= 3,
+        'scrollTop is kept after a failure',
+      );
       assert.equal(await selectedSha(), pick.sha, 'selection is kept after a failure');
       assert.equal((await domRows()).length, SPECS.length);
       await page.unroute(`${apiBase}/**`);
