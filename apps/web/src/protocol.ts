@@ -37,10 +37,13 @@ export interface ReposResponse {
   truncated: boolean;
 }
 
-/** HMR 推送：哪個 repo 有了新快照。 */
+/**
+ * HMR 推送：哪個 repo 有了新快照。HMR 會廣播給所有連線（`vite --host` 時含區網裡的裝置），
+ * 所以只有預設 repo（內容本來就在 bundle 裡）帶 snapshot；其他 repo 只通知，畫面再向只回應本機的 endpoint 拿。
+ */
 export interface SnapshotEvent {
   repo: string;
-  snapshot: GitSnapshot;
+  snapshot?: GitSnapshot;
 }
 
 /** 比較用：忽略每次讀取都會變的時間戳，只看內容有沒有變。 */

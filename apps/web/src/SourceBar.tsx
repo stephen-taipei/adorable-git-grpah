@@ -4,7 +4,7 @@ import { localSource, parseRepoInput } from './source';
 import type { Source } from './source';
 import { DEFAULT_REPO } from './protocol';
 import type { ReposResponse } from './protocol';
-import { addLocalRepo, fetchLocalRepos } from './localRepos';
+import { LOCAL_ONLY, addLocalRepo, fetchLocalRepos } from './localRepos';
 import { t } from './i18n';
 
 export type ThemeSetting = 'auto' | 'day' | 'night';
@@ -127,7 +127,7 @@ const CURRENT = '__current';
 /** 本機 repo 選單：dev server 掃描到的 repo + 手動輸入路徑。瀏覽器只送出 repo id（和使用者自己輸入的路徑）。 */
 function LocalPicker({ current, onPick }: { current: string; onPick: (id: string) => void }) {
   const [list, setList] = useState<ReposResponse | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState<false | 'offline' | typeof LOCAL_ONLY>(false);
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -137,8 +137,8 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
 
   const reload = useCallback(async () => {
     const next = await fetchLocalRepos();
-    if (next) setList(next);
-    setFailed(!next);
+    if (next && next !== LOCAL_ONLY) setList(next);
+    setFailed(next === LOCAL_ONLY ? LOCAL_ONLY : next ? false : 'offline');
   }, []);
 
   useEffect(() => {
@@ -211,10 +211,10 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
         )}
         {failed && !list && (
           <option value="" disabled>
-            {t.reposFailed}
+            {failed === LOCAL_ONLY ? t.localOnly : t.reposFailed}
           </option>
         )}
-        <option value={ADD}>{t.addPath}</option>
+        {failed !== LOCAL_ONLY && <option value={ADD}>{t.addPath}</option>}
       </select>
 
       {adding && (

@@ -6,12 +6,15 @@ import type { ViewerState } from '@adorable/graph-ui';
 import { DEFAULT_REPO, HMR_EVENT, isRepoId, snapshotKey } from './protocol';
 import type { GitSnapshot, SnapshotEvent } from './protocol';
 import type { Source } from './source';
-import { fetchLocalSnapshot } from './localRepos';
+import { LOCAL_ONLY, fetchLocalSnapshot } from './localRepos';
 import { t } from './i18n';
 
 const GH_CACHE_MS = 10 * 60_000;
 const GH_CACHE_PREFIX = 'agg:gh:';
 const API_BASE: string | undefined = import.meta.env['VITE_GITHUB_API_BASE'];
+const KEEPALIVE_MS = 2 * 60_000;
+
+type Missing = 'unknown' | 'offline' | typeof LOCAL_ONLY;
 
 /**
  * 本機：預設 repo 是啟動 / 建置當下的快照；dev 時可以切到 dev server 清單裡的其他 repo，
@@ -22,8 +25,10 @@ function useLocalSnapshot(id: string) {
   const [snaps, setSnaps] = useState<Record<string, GitSnapshot>>(() => ({
     [DEFAULT_REPO]: snapshot,
   }));
-  /** 'unknown'：dev server 不認得這個 id；'offline'：連不上 */
-  const [missing, setMissing] = useState<Record<string, 'unknown' | 'offline'>>({});
+  /** 'unknown'：dev server 不認得這個 id；'offline'：連不上；LOCAL_ONLY：不是從這台電腦開的畫面 */
+  const [missing, setMissing] = useState<Record<string, Missing>>({});
+  const current = useRef(id);
+  current.current = id;
 
   const forget = useCallback((repo: string) => {
     setMissing((prev) => {
@@ -46,33 +51,45 @@ function useLocalSnapshot(id: string) {
     [forget],
   );
 
-  useEffect(() => {
-    const hot = import.meta.hot;
-    if (!hot) return;
-    const onEvent = (e: SnapshotEvent | undefined) => {
-      if (e && typeof e.repo === 'string' && isRepoId(e.repo) && e.snapshot) {
-        accept(e.repo, e.snapshot);
-      }
-    };
-    hot.on(HMR_EVENT, onEvent);
-    return () => hot.off(HMR_EVENT, onEvent);
-  }, [accept]);
-
   const load = useCallback(
     async (repo: string) => {
       const result = await fetchLocalSnapshot(repo);
-      if (result === 'unknown') setMissing((prev) => ({ ...prev, [repo]: 'unknown' }));
-      else if (result === null) setMissing((prev) => ({ ...prev, [repo]: 'offline' }));
+      if (result === 'unknown' || result === LOCAL_ONLY) {
+        setMissing((prev) => ({ ...prev, [repo]: result }));
+      } else if (result === null) setMissing((prev) => ({ ...prev, [repo]: 'offline' }));
       else accept(repo, result);
     },
     [accept],
   );
 
-  // 非預設 repo：每次選到（包含切回來）都向 dev server 要最新快照——它也會因此（重新）開始監看這個 repo
+  useEffect(() => {
+    const hot = import.meta.hot;
+    if (!hot) return;
+    const onEvent = (e: SnapshotEvent | undefined) => {
+      if (!e || typeof e.repo !== 'string' || !isRepoId(e.repo)) return;
+      // 預設 repo 直接帶著快照；其他 repo 只通知有變，正在看的才去拿（其他的切回來時本來就會重抓）
+      if (e.snapshot) accept(e.repo, e.snapshot);
+      else if (e.repo === current.current && e.repo !== DEFAULT_REPO) void load(e.repo);
+    };
+    hot.on(HMR_EVENT, onEvent);
+    return () => hot.off(HMR_EVENT, onEvent);
+  }, [accept, load]);
+
+  // 非預設 repo：每次選到（包含切回來）都向 dev server 要最新快照——它也會因此（重新）開始監看這個 repo。
+  // 顯示期間每 2 分鐘、以及分頁回到前景時再抓一次：dev server 會停掉 10 分鐘沒人要的 repo，這也是漏掉通知時的安全網。
   useEffect(() => {
     if (!import.meta.env.DEV || id === DEFAULT_REPO) return;
     forget(id);
     void load(id);
+    const again = () => {
+      if (!document.hidden) void load(id);
+    };
+    const timer = setInterval(again, KEEPALIVE_MS);
+    document.addEventListener('visibilitychange', again);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', again);
+    };
   }, [id, load, forget]);
 
   const refresh = useCallback(() => load(id), [id, load]);
@@ -205,8 +222,9 @@ export function useGraphSource(source: Source, token: string): GraphSource {
     import.meta.env.DEV && source.kind === 'local' ? (source.id ?? DEFAULT_REPO) : DEFAULT_REPO;
   const local = useLocalSnapshot(localId);
   const gh = useGitHubGraph(source, token);
-  // dev server 說不認得這個 repo 時，不要繼續顯示快取的舊圖（它不會再更新了）
-  const localSnap = local.missing === 'unknown' ? undefined : local.snap;
+  // dev server 說不認得 / 不給看這個 repo 時，不要繼續顯示快取的舊圖（它不會再更新了）
+  const localSnap =
+    local.missing === 'unknown' || local.missing === LOCAL_ONLY ? undefined : local.snap;
 
   const graph: GraphData | null =
     source.kind === 'local'
@@ -233,11 +251,13 @@ export function useGraphSource(source: Source, token: string): GraphSource {
     const message =
       local.missing === 'unknown'
         ? t.localUnknown
-        : localSnap
-          ? (localSnap.error ?? t.localFailed)
-          : local.missing === 'offline'
-            ? t.localOffline
-            : undefined;
+        : local.missing === LOCAL_ONLY
+          ? t.localOnly
+          : localSnap
+            ? (localSnap.error ?? t.localFailed)
+            : local.missing === 'offline'
+              ? t.localOffline
+              : undefined;
     state = message ? { kind: 'error', code: 'local_git', message } : { kind: 'loading' };
   } else if (gh.remote.kind === 'error') {
     state = gh.remote;

@@ -37,6 +37,7 @@ const zh = {
     'dev server 找不到這個本機 repository（可能已移動、刪除，或 dev server 重新啟動後不在掃描範圍內）。請從上方選單重新選擇。',
   localOffline: '連不到 dev server，無法讀取這個本機 repository。',
   localFailed: '無法讀取本機的 git 歷史。',
+  localOnly: '只有在執行 dev server 的這台電腦上，才能選擇與讀取其他本機 repository。',
 };
 
 const en: typeof zh = {
@@ -76,6 +77,8 @@ const en: typeof zh = {
     'The dev server does not know this local repository (it may have moved, been deleted, or fallen outside the scanned folders after a restart). Pick one from the menu above.',
   localOffline: 'Cannot reach the dev server to read this local repository.',
   localFailed: 'Could not read the local git history.',
+  localOnly:
+    'Other local repositories can only be chosen and read on the computer running the dev server.',
 };
 
 export const locale: Locale = detectLocale();

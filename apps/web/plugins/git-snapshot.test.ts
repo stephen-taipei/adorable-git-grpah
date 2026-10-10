@@ -1,20 +1,23 @@
 import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildLayout } from '@adorable/graph-core';
 import {
   discoverRepos,
+  findGit,
   gitSnapshot,
   isSameOrigin,
   readGitSnapshot,
@@ -437,7 +440,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
   interface Sent {
     type: string;
     event: string;
-    data: { repo: string; snapshot: { graph: { commits: unknown[] } | null } };
+    data: { repo: string; snapshot?: { graph: { commits: unknown[] } | null } };
   }
   interface Req {
     path?: string;
@@ -446,14 +449,21 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     /** connect 會把掛載路徑拿掉，handler 看到的是剩下的部分（例如 `/?repo=abc`） */
     url?: string;
     body?: string;
+    /** 連線的來源位址（預設是本機） */
+    remote?: string;
   }
 
   async function startPlugin(
     repoDir: string,
     pollMs = 300,
-    extra: { repoRoots?: string[]; scanDepth?: number } = {},
+    extra: {
+      repoRoots?: string[];
+      scanDepth?: number;
+      stateFile?: string | false;
+      idleMs?: number;
+    } = {},
   ) {
-    const plugin = gitSnapshot({ repoDir, pollMs, ...extra }) as unknown as {
+    const plugin = gitSnapshot({ repoDir, pollMs, stateFile: false, ...extra }) as unknown as {
       configResolved(c: unknown): void;
       configureServer(s: unknown): Promise<void>;
       load(id: string): Promise<string | undefined>;
@@ -485,6 +495,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       method = 'GET',
       url = '/',
       body,
+      remote = '127.0.0.1',
     }: Req = {}) =>
       new Promise<{ status: number; body: string; json: () => any }>((resolve) => {
         const res = {
@@ -498,6 +509,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
           method,
           headers: { host: 'localhost:4200', ...headers },
           url,
+          socket: { remoteAddress: remote },
         });
         handlers.get(path)!(req, res);
       });
@@ -541,7 +553,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       for (let i = 2; i <= 5; i++) {
         commit(dir, `c${i}`);
         await waitFor(() => p.sent.length >= i - 1, 8000);
-        expect(p.sent.at(-1)!.data.snapshot.graph!.commits).toHaveLength(i);
+        expect(p.sent.at(-1)!.data.snapshot!.graph!.commits).toHaveLength(i);
       }
       expect(p.invalidated()).toBeGreaterThanOrEqual(4); // 重新整理頁面時要拿到新的 module，而不是舊快取
     } finally {
@@ -557,7 +569,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     try {
       commit(dir, 'two');
       await waitFor(() => p.sent.length >= 1, 8000);
-      expect(p.sent.at(-1)!.data.snapshot.graph!.commits).toHaveLength(2);
+      expect(p.sent.at(-1)!.data.snapshot!.graph!.commits).toHaveLength(2);
     } finally {
       await p.close();
     }
@@ -615,7 +627,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       expect(body.graph).toBeNull();
       expect(body.error).toMatch(/not inside a git repository/);
       expect(body.error).not.toContain(tmpdir());
-      await waitFor(() => p.sent.some((m) => m.data.snapshot.graph === null), 4000); // 也會推送給畫面
+      await waitFor(() => p.sent.some((m) => m.data.snapshot?.graph === null), 4000); // 也會推送給畫面
     } finally {
       await p.close();
     }
@@ -693,8 +705,10 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       expect((await p.snapshotOf(id)).status).toBe(200);
       commit(r.beta, 'b4');
       await waitFor(() => p.sent.some((m) => m.data.repo === id), 8000);
+      // HMR 會廣播給所有連線（含 `vite --host` 時的區網裝置）：非預設 repo 只通知、不帶內容
       const last = p.sent.filter((m) => m.data.repo === id).at(-1)!;
-      expect(last.data.snapshot.graph!.commits).toHaveLength(4);
+      expect(last.data.snapshot).toBeUndefined();
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(4);
       // 預設 repo 的 virtual module 不受影響
       expect(p.sent.every((m) => m.data.repo === id)).toBe(true);
     } finally {
@@ -795,6 +809,98 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     }
   });
 
+  it('only answers this machine: LAN clients (vite --host) see the default repo but cannot list, add or read others', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const lan = '192.168.1.23';
+      const id = repoIdFor(r.beta);
+      expect((await p.call({ path: '/__agg/repos', remote: lan })).json().error).toBe('local_only');
+      expect((await p.call({ path: '/__agg/repos', remote: lan })).status).toBe(403);
+      const post = await p.call({
+        path: '/__agg/repos',
+        method: 'POST',
+        remote: lan,
+        headers: { origin: 'http://localhost:4200', 'content-type': 'application/json' },
+        body: JSON.stringify({ path: r.beta }),
+      });
+      expect(post.status).toBe(403);
+      expect((await p.call({ url: `/?repo=${id}`, remote: lan })).status).toBe(403);
+      expect((await p.call({ url: '/?repo=default', remote: lan })).status).toBe(200);
+      for (const local of ['127.0.0.1', '127.1.2.3', '::1', '::ffff:127.0.0.1']) {
+        expect((await p.call({ url: `/?repo=${id}`, remote: local })).status, local).toBe(200);
+      }
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('remembers typed paths in the state file across dev server restarts (not in the browser)', async () => {
+    const r = makeRoot();
+    const elsewhere = realpathSync(tmp('agg-state-'));
+    const delta = join(elsewhere, 'delta');
+    mkdirSync(delta);
+    git(delta, 'init', '-q', '-b', 'main');
+    commit(delta, 'd1');
+    const stateFile = join(elsewhere, 'cache', 'local-repos.json');
+    const first = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      expect((await first.addPath(delta)).status).toBe(200);
+      await waitFor(() => existsSync(stateFile));
+    } finally {
+      await first.close();
+    }
+    expect(JSON.parse(readFileSync(stateFile, 'utf8'))).toEqual({ paths: [delta] });
+    const second = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      const ids = (await second.repos()).json().repos.map((x: { id: string }) => x.id);
+      expect(ids).toContain(repoIdFor(delta));
+      expect((await second.snapshotOf(repoIdFor(delta))).json().graph.commits).toHaveLength(1);
+    } finally {
+      await second.close();
+    }
+    // 壞掉的檔案 / 不存在的路徑 / 相對路徑：略過，不影響啟動
+    writeFileSync(stateFile, JSON.stringify({ paths: ['relative', join(elsewhere, 'gone'), 7] }));
+    const third = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      expect((await third.repos()).json().repos.map((x: { name: string }) => x.name)).toEqual([
+        'alpha',
+        'beta',
+        'gamma',
+      ]);
+    } finally {
+      await third.close();
+    }
+  });
+
+  it('rejects UNC / device paths (realpath would reach out to a network host on Windows)', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      for (const unc of ['//attacker/share', '\\\\attacker\\share', '\\\\?\\C:\\x']) {
+        expect((await p.addPath(unc)).status, unc).toBe(400);
+      }
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('stops watching a non-default repo nobody asked for in a while, and picks it up again when asked', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0, { idleMs: 300 });
+    try {
+      const id = repoIdFor(r.beta);
+      expect((await p.snapshotOf(id)).status).toBe(200);
+      await sleep(1200); // 掃過一次以上：已經停止監看
+      commit(r.beta, 'b4');
+      await sleep(800);
+      expect(p.sent.some((m) => m.data.repo === id)).toBe(false);
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(4);
+    } finally {
+      await p.close();
+    }
+  });
+
   it('scans the configured roots (repoRoots) instead of the default repo siblings', async () => {
     const r = makeRoot();
     const other = realpathSync(tmp('agg-other-root-'));
@@ -869,5 +975,34 @@ describe('isSameOrigin', () => {
     expect(isSameOrigin(req({ origin: 'null' }), true)).toBe(false);
     expect(isSameOrigin(req({}), true)).toBe(true);
     expect(isSameOrigin(req({}), false)).toBe(false);
+  });
+});
+
+describe('findGit', () => {
+  it('only uses absolute PATH entries, so a git binary planted in the selected repo is never executed', async () => {
+    const saved = process.env['PATH'];
+    const real = findGit();
+    expect(real && isAbsolute(real)).toBe(true);
+    const repo = realpathSync(tmp('agg-planted-'));
+    git(repo, 'init', '-q', '-b', 'main');
+    commit(repo, 'one');
+    const marker = join(repo, 'PWNED');
+    writeFileSync(join(repo, 'git'), `#!/bin/sh\ntouch '${marker}'\n`);
+    chmodSync(join(repo, 'git'), 0o755);
+    try {
+      // 空字串與 `.` 在 POSIX 都代表 cwd（也就是被選到的 repo）
+      process.env['PATH'] = ['', '.', 'relative/bin', dirname(real!)].join(delimiter);
+      expect(findGit()).toBe(real);
+      expect((await readGitSnapshot(repo)).graph!.commits).toHaveLength(1);
+      expect(existsSync(marker)).toBe(false);
+      process.env['PATH'] = ['', '.'].join(delimiter);
+      expect(findGit()).toBeNull();
+      const snap = await readGitSnapshot(repo);
+      expect(snap.error).toBe('git is not installed');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      process.env['PATH'] = saved;
+    }
+    expect(findGit()).toBe(real);
   });
 });
