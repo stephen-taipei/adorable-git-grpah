@@ -7,6 +7,7 @@ import type { Source } from './source';
 import { readStored, useStored, writeStored } from './storage';
 import { locale, t } from './i18n';
 import { clearGitHubCache, useGraphSource } from './useGraphSource';
+import { DEFAULT_REPO } from './protocol';
 
 const TOKEN_KEY = 'agg.github-token';
 
@@ -53,7 +54,11 @@ export function App() {
         state={state}
         theme={theme === 'auto' ? 'auto' : theme}
         locale={locale}
-        sourceKey={source.kind === 'github' ? `github:${source.owner}/${source.repo}` : 'local'}
+        sourceKey={
+          source.kind === 'github'
+            ? `github:${source.owner}/${source.repo}`
+            : `local:${source.id ?? DEFAULT_REPO}`
+        }
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
         headerExtra={

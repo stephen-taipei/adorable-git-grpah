@@ -11,7 +11,37 @@ export interface GitSnapshot {
 }
 
 export const HMR_EVENT = 'agg:git-snapshot';
+/** `GET ?repo=<id>`：某個本機 repo 的快照（省略 repo = 預設 repo）。只有 dev server 有。 */
 export const SNAPSHOT_ENDPOINT = '/__agg/git-snapshot';
+/** `GET`：dev server 掃描到、可以選擇的本機 repo 清單。只有 dev server 有。 */
+export const REPOS_ENDPOINT = '/__agg/repos';
+
+/** 啟動時指定的 repo（AGG_REPO_DIR，否則是執行 vite 的目錄）。 */
+export const DEFAULT_REPO = 'default';
+
+/** 其他 repo 的 id 是 dev server 對其路徑算出的短雜湊：瀏覽器只能從清單裡挑，永遠不會送出路徑。 */
+export const isRepoId = (s: string): boolean => s === DEFAULT_REPO || /^[0-9a-f]{12}$/.test(s);
+
+export interface LocalRepo {
+  id: string;
+  /** 資料夾名稱 */
+  name: string;
+  /** 顯示用的位置（家目錄縮寫成 ~） */
+  label: string;
+  isDefault: boolean;
+}
+
+export interface ReposResponse {
+  repos: LocalRepo[];
+  /** 掃描到上限而停止（清單不完整） */
+  truncated: boolean;
+}
+
+/** HMR 推送：哪個 repo 有了新快照。 */
+export interface SnapshotEvent {
+  repo: string;
+  snapshot: GitSnapshot;
+}
 
 /** 比較用：忽略每次讀取都會變的時間戳，只看內容有沒有變。 */
 export const snapshotKey = (s: GitSnapshot): string =>

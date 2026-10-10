@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseRepoInput, searchFromSource, sourceFromSearch } from './source';
+import { localSource, parseRepoInput, searchFromSource, sourceFromSearch } from './source';
 
 describe('parseRepoInput', () => {
   it.each([
@@ -49,5 +49,25 @@ describe('source <-> url search', () => {
       owner: 'a-b',
       repo: 'c_d.e',
     });
+  });
+});
+
+describe('local repo ids in the url', () => {
+  it('round-trips `?local=<id>` and only accepts server-style ids (never paths)', () => {
+    expect(sourceFromSearch('?local=0123456789ab')).toEqual({ kind: 'local', id: '0123456789ab' });
+    expect(searchFromSource({ kind: 'local', id: '0123456789ab' })).toBe('?local=0123456789ab');
+    expect(sourceFromSearch(searchFromSource({ kind: 'local', id: 'abcdefabcdef' }))).toEqual({
+      kind: 'local',
+      id: 'abcdefabcdef',
+    });
+    for (const bad of ['/etc', '..%2F..', 'ABCDEF012345', '0123456789abc', '~/code', 'default']) {
+      expect(sourceFromSearch(`?local=${bad}`), bad).toEqual({ kind: 'local' });
+    }
+    // 預設 repo 不帶參數；GitHub 參數優先
+    expect(searchFromSource({ kind: 'local', id: 'default' })).toBe('');
+    expect(sourceFromSearch('?repo=octo/cat&local=0123456789ab')).toMatchObject({ kind: 'github' });
+    expect(localSource('default')).toEqual({ kind: 'local' });
+    expect(localSource(undefined)).toEqual({ kind: 'local' });
+    expect(localSource('0123456789ab')).toEqual({ kind: 'local', id: '0123456789ab' });
   });
 });

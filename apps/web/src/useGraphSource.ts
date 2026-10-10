@@ -3,43 +3,80 @@ import snapshot from 'virtual:git-snapshot';
 import { GitHubError, buildLayout, fetchGitHubGraph } from '@adorable/graph-core';
 import type { GraphData } from '@adorable/graph-core';
 import type { ViewerState } from '@adorable/graph-ui';
-import { HMR_EVENT, SNAPSHOT_ENDPOINT, snapshotKey } from './protocol';
-import type { GitSnapshot } from './protocol';
+import { DEFAULT_REPO, HMR_EVENT, isRepoId, snapshotKey } from './protocol';
+import type { GitSnapshot, SnapshotEvent } from './protocol';
 import type { Source } from './source';
+import { fetchLocalSnapshot } from './localRepos';
+import { t } from './i18n';
 
 const GH_CACHE_MS = 10 * 60_000;
 const GH_CACHE_PREFIX = 'agg:gh:';
 const API_BASE: string | undefined = import.meta.env['VITE_GITHUB_API_BASE'];
 
 /**
- * 本機：啟動 / 建置當下的快照 + dev 時由 HMR 推送的更新。
- * 監聽器一律註冊（不隨目前顯示的來源開關）：切到 GitHub 期間發生的 commit，回到 Local 時才不會是舊圖。
+ * 本機：預設 repo 是啟動 / 建置當下的快照；dev 時可以切到 dev server 清單裡的其他 repo，
+ * 每個 repo 的更新都由 HMR 推送（payload 帶 repo id）。
+ * 監聽器一律註冊（不隨目前顯示的來源開關）：切到別處期間發生的 commit，切回來時才不會是舊圖。
  */
-function useLocalSnapshot() {
-  const [snap, setSnap] = useState<GitSnapshot>(snapshot);
+function useLocalSnapshot(id: string) {
+  const [snaps, setSnaps] = useState<Record<string, GitSnapshot>>(() => ({
+    [DEFAULT_REPO]: snapshot,
+  }));
+  /** 'unknown'：dev server 不認得這個 id；'offline'：連不上 */
+  const [missing, setMissing] = useState<Record<string, 'unknown' | 'offline'>>({});
 
-  // 內容沒變就保留舊物件：不重算 layout，場景也就不會被重播、鏡頭不會被重設
-  const accept = useCallback((next: GitSnapshot) => {
-    setSnap((prev) => (snapshotKey(prev) === snapshotKey(next) ? prev : next));
+  const forget = useCallback((repo: string) => {
+    setMissing((prev) => {
+      if (!(repo in prev)) return prev;
+      const next = { ...prev };
+      delete next[repo];
+      return next;
+    });
   }, []);
+
+  // 內容沒變就保留舊物件：不重算 layout，場景也就不會被重播、捲動位置不會被重設
+  const accept = useCallback(
+    (repo: string, next: GitSnapshot) => {
+      setSnaps((prev) => {
+        const cur = prev[repo];
+        return cur && snapshotKey(cur) === snapshotKey(next) ? prev : { ...prev, [repo]: next };
+      });
+      forget(repo);
+    },
+    [forget],
+  );
 
   useEffect(() => {
     const hot = import.meta.hot;
     if (!hot) return;
-    hot.on(HMR_EVENT, accept);
-    return () => hot.off(HMR_EVENT, accept);
+    const onEvent = (e: SnapshotEvent | undefined) => {
+      if (e && typeof e.repo === 'string' && isRepoId(e.repo) && e.snapshot) {
+        accept(e.repo, e.snapshot);
+      }
+    };
+    hot.on(HMR_EVENT, onEvent);
+    return () => hot.off(HMR_EVENT, onEvent);
   }, [accept]);
 
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch(SNAPSHOT_ENDPOINT, { cache: 'no-store' });
-      if (res.ok) accept((await res.json()) as GitSnapshot);
-    } catch {
-      /* dev server 暫時連不上時保留現有畫面 */
-    }
-  }, [accept]);
+  const load = useCallback(
+    async (repo: string) => {
+      const result = await fetchLocalSnapshot(repo);
+      if (result === 'unknown') setMissing((prev) => ({ ...prev, [repo]: 'unknown' }));
+      else if (result === null) setMissing((prev) => ({ ...prev, [repo]: 'offline' }));
+      else accept(repo, result);
+    },
+    [accept],
+  );
 
-  return { snap, refresh };
+  // 非預設 repo：每次選到（包含切回來）都向 dev server 要最新快照——它也會因此（重新）開始監看這個 repo
+  useEffect(() => {
+    if (!import.meta.env.DEV || id === DEFAULT_REPO) return;
+    forget(id);
+    void load(id);
+  }, [id, load, forget]);
+
+  const refresh = useCallback(() => load(id), [id, load]);
+  return { snap: snaps[id], missing: missing[id], refresh };
 }
 
 type Remote =
@@ -163,12 +200,17 @@ export interface GraphSource {
 }
 
 export function useGraphSource(source: Source, token: string): GraphSource {
-  const local = useLocalSnapshot();
+  // 靜態建置只有預設 repo 的快照（沒有 dev server 可以問）
+  const localId =
+    import.meta.env.DEV && source.kind === 'local' ? (source.id ?? DEFAULT_REPO) : DEFAULT_REPO;
+  const local = useLocalSnapshot(localId);
   const gh = useGitHubGraph(source, token);
+  // dev server 說不認得這個 repo 時，不要繼續顯示快取的舊圖（它不會再更新了）
+  const localSnap = local.missing === 'unknown' ? undefined : local.snap;
 
   const graph: GraphData | null =
     source.kind === 'local'
-      ? local.snap.graph
+      ? (localSnap?.graph ?? null)
       : gh.remote.kind === 'ready'
         ? gh.remote.graph
         : null;
@@ -188,11 +230,15 @@ export function useGraphSource(source: Source, token: string): GraphSource {
     };
   } else if (source.kind === 'local') {
     // 'local_git' 不在 i18n 錯誤表內，viewer 會直接顯示 message
-    state = {
-      kind: 'error',
-      code: 'local_git',
-      message: local.snap.error ?? 'Could not read the local git history.',
-    };
+    const message =
+      local.missing === 'unknown'
+        ? t.localUnknown
+        : localSnap
+          ? (localSnap.error ?? t.localFailed)
+          : local.missing === 'offline'
+            ? t.localOffline
+            : undefined;
+    state = message ? { kind: 'error', code: 'local_git', message } : { kind: 'loading' };
   } else if (gh.remote.kind === 'error') {
     state = gh.remote;
   } else {

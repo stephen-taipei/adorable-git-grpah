@@ -1,9 +1,13 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, statSync, watch } from 'node:fs';
-import type { FSWatcher } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import type { Dirent, FSWatcher } from 'node:fs';
+import { readdir, realpath, stat } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
+import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import type { Plugin } from 'vite';
+import type { Plugin, ViteDevServer } from 'vite';
 import {
   GIT_LOG_FORMAT,
   GIT_REF_FORMAT,
@@ -11,8 +15,15 @@ import {
   parseForEachRef,
   selectRefs,
 } from '@adorable/graph-core';
-import { HMR_EVENT, SNAPSHOT_ENDPOINT, snapshotKey } from '../src/protocol.ts';
-import type { GitSnapshot } from '../src/protocol.ts';
+import {
+  DEFAULT_REPO,
+  HMR_EVENT,
+  REPOS_ENDPOINT,
+  SNAPSHOT_ENDPOINT,
+  isRepoId,
+  snapshotKey,
+} from '../src/protocol.ts';
+import type { GitSnapshot, LocalRepo, ReposResponse, SnapshotEvent } from '../src/protocol.ts';
 
 export type { GitSnapshot };
 export { snapshotKey };
@@ -32,6 +43,13 @@ export interface SnapshotOptions {
   pollMs?: number;
   /** 細節（可能含本機路徑）只往這裡送，絕不放進快照。 */
   onWarn?: (message: string) => void;
+  /**
+   * dev 時畫面上「選擇本機 repo」清單要掃描的資料夾。
+   * 預設：環境變數 AGG_REPO_ROOTS（以 `path.delimiter` 分隔，可用 `~`），否則為預設 repo 的上一層（也就是它的兄弟資料夾）。
+   */
+  repoRoots?: string[];
+  /** 從每個根目錄往下找幾層。預設 3（環境變數 AGG_REPO_SCAN_DEPTH）。 */
+  scanDepth?: number;
 }
 
 const intFromEnv = (name: string): number | undefined => {
@@ -264,32 +282,327 @@ export function watchGitRefs(gitDirs: string[], onChange: () => void): () => voi
   };
 }
 
+// ───────────────────────── 本機 repo 清單（dev server 的 repo 選擇器） ─────────────────────────
+
+/** 不往裡面找的資料夾：套件 / 建置產物 / 系統目錄（另外所有 `.` 開頭的資料夾也都略過）。 */
+const SKIP_DIRS = new Set([
+  'node_modules',
+  'bower_components',
+  'vendor',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'coverage',
+  '__pycache__',
+  'venv',
+  'tmp',
+  'temp',
+  'Library',
+  'AppData',
+  'Applications',
+  'System',
+  'Windows',
+  'proc',
+  'sys',
+  'dev',
+  'snap',
+]);
+
+export interface DiscoverOptions {
+  /** 從根目錄往下找幾層（根目錄本身是第 0 層）。預設 3。 */
+  maxDepth?: number;
+  /** 最多讀幾個資料夾。預設 5000。 */
+  maxDirs?: number;
+  /** 最多回報幾個 repo。預設 300。 */
+  maxRepos?: number;
+  /** 掃描的時間上限（毫秒）。預設 3000。 */
+  timeBudgetMs?: number;
+}
+
+const isBareRepo = (entries: Dirent[]) => {
+  const has = (name: string, dir: boolean) =>
+    entries.some((e) => e.name === name && (dir ? e.isDirectory() : e.isFile()));
+  return has('HEAD', false) && has('objects', true) && has('refs', true);
+};
+
+/**
+ * 找出 roots 底下的 git repository（一般 repo、worktree、`*.git` 的 bare repo）。
+ * 只看資料夾裡有沒有 `.git`：不執行 git（不會碰到陌生 repo 的設定）、不跟隨 symlink、不往 repo 裡面找（submodule 等）。
+ * 回傳排序過的 realpath；碰到上限就停下並標記 truncated。
+ */
+export async function discoverRepos(
+  roots: string[],
+  opts: DiscoverOptions = {},
+): Promise<{ repos: string[]; truncated: boolean }> {
+  const maxDepth = opts.maxDepth ?? 3;
+  const maxDirs = opts.maxDirs ?? 5000;
+  const maxRepos = opts.maxRepos ?? 300;
+  const deadline = Date.now() + (opts.timeBudgetMs ?? 3000);
+  const queue: Array<{ dir: string; depth: number }> = [];
+  for (const root of roots) {
+    try {
+      const dir = await realpath(root);
+      // 整個磁碟（/、C:\）沒有意義又慢
+      if (parse(dir).root !== dir) queue.push({ dir, depth: 0 });
+    } catch {
+      /* 不存在 */
+    }
+  }
+  const found = new Set<string>();
+  const seen = new Set<string>();
+  let truncated = false;
+  for (let i = 0; i < queue.length; i++) {
+    if (seen.size >= maxDirs || found.size >= maxRepos || Date.now() > deadline) {
+      truncated = true;
+      break;
+    }
+    const { dir, depth } = queue[i]!;
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    if (entries.some((e) => e.name === '.git') || (dir.endsWith('.git') && isBareRepo(entries))) {
+      found.add(dir);
+      continue;
+    }
+    if (depth >= maxDepth) continue;
+    for (const e of entries) {
+      // Dirent.isDirectory() 對 symlink 是 false：不會被連結帶到範圍外或繞圈
+      if (e.isDirectory() && !e.name.startsWith('.') && !SKIP_DIRS.has(e.name)) {
+        queue.push({ dir: join(dir, e.name), depth: depth + 1 });
+      }
+    }
+  }
+  return { repos: [...found].sort(), truncated };
+}
+
+/** 瀏覽器只拿得到這個 id（realpath 的短雜湊）：選 repo 時只送 id，永遠不會把路徑送回 server。 */
+export const repoIdFor = (realDir: string): string =>
+  createHash('sha256').update(realDir).digest('hex').slice(0, 12);
+
+const expandHome = (p: string): string =>
+  p === '~' ? homedir() : /^~[/\\]/.test(p) ? join(homedir(), p.slice(2)) : p;
+
+/** 顯示用：家目錄縮寫成 `~`。 */
+const labelFor = (dir: string): string => {
+  const home = homedir();
+  return dir === home ? '~' : dir.startsWith(home + sep) ? `~${dir.slice(home.length)}` : dir;
+};
+
+const rootsFromEnv = (): string[] | undefined => {
+  const raw = process.env['AGG_REPO_ROOTS']?.trim();
+  return raw
+    ? raw
+        .split(delimiter)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : undefined;
+};
+
+interface SessionHooks {
+  options: SnapshotOptions;
+  warn: (message: string) => void;
+  /** 內容有變（新 commit / checkout / fetch…）時呼叫。第一次讀取不算。 */
+  onUpdate: (snap: GitSnapshot) => void;
+}
+
+/** 一個 repo 的快照與監看：讀取 → 比較 → 有變才通知。 */
+class RepoSession {
+  last: GitSnapshot | undefined;
+  private key: string | undefined;
+  private staleWarned = false;
+  private inflight: Promise<void> | undefined;
+  private again = false;
+  private stopped = false;
+  private teardown: () => void = () => {};
+  readonly dir: string;
+  private readonly hooks: SessionHooks;
+
+  constructor(dir: string, hooks: SessionHooks) {
+    this.dir = dir;
+    this.hooks = hooks;
+  }
+
+  async read(): Promise<GitSnapshot> {
+    const snap = await readGitSnapshot(this.dir, {
+      ...this.hooks.options,
+      onWarn: this.hooks.warn,
+    });
+    if (snap.graph) this.staleWarned = false;
+    // 暫時性的 git 錯誤（例如 gc / fetch 進行中）不要把好好的畫面換成錯誤頁；
+    // 目錄不見、不是 repo 這類確定的失敗則如實顯示（否則畫面會永遠停在舊圖，使用者還看不出來）。
+    if (!snap.graph && snap.transient && this.last?.graph) {
+      if (!this.staleWarned)
+        this.hooks.warn('keeping the last good snapshot until git can be read again');
+      this.staleWarned = true;
+      return this.last;
+    }
+    this.last = snap;
+    return snap;
+  }
+
+  /** 一次只跑一個；執行中又來要求就在結束後再跑一輪（不漏）。 */
+  sync(): Promise<void> {
+    if (this.inflight) {
+      this.again = true;
+      return this.inflight;
+    }
+    this.inflight = (async () => {
+      try {
+        do {
+          this.again = false;
+          const snap = await this.read();
+          const next = snapshotKey(snap);
+          if (next === this.key) continue;
+          const first = this.key === undefined;
+          this.key = next;
+          if (!first && !this.stopped) this.hooks.onUpdate(snap);
+        } while (this.again);
+      } catch (err) {
+        this.hooks.warn(`refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        this.inflight = undefined;
+      }
+    })();
+    return this.inflight;
+  }
+
+  /** 監看 .git（HEAD、packed-refs、refs/**），外加輪詢 ref 簽章的安全網。 */
+  async start(): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    let poll: NodeJS.Timeout | undefined;
+    let stopWatching = () => {};
+    this.teardown = () => {
+      clearTimeout(timer);
+      clearInterval(poll);
+      stopWatching();
+    };
+    const onChange = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => void this.sync(), 250);
+    };
+    try {
+      const dirs = [
+        ...new Set(
+          (
+            await Promise.all([
+              git(this.dir, ['rev-parse', '--absolute-git-dir']),
+              git(this.dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+            ])
+          ).map((s) => s.trim()),
+        ),
+      ];
+      if (this.stopped) return;
+      stopWatching = watchGitRefs(dirs, onChange);
+
+      // 安全網：檔案監看可能漏事件（網路磁碟、inotify 上限…），偶爾比對一次 ref 簽章
+      const pollMs = this.hooks.options.pollMs ?? 2000;
+      if (pollMs > 0) {
+        let sig = await refsSignature(this.dir);
+        if (this.stopped) return;
+        poll = setInterval(() => {
+          void refsSignature(this.dir).then((next) => {
+            if (next === sig) return;
+            sig = next;
+            void this.sync();
+          });
+        }, pollMs);
+        poll.unref();
+      }
+    } catch {
+      // 不是 git repo：沒東西可監看，endpoint 仍可手動重抓
+    }
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.teardown();
+  }
+}
+
+interface RepoEntry extends LocalRepo {
+  dir: string;
+}
+
+const toPublic = ({ id, name, label, isDefault }: RepoEntry): LocalRepo => ({
+  id,
+  name,
+  label,
+  isDefault,
+});
+
+const sendJson = (res: ServerResponse, status: number, body: unknown) => {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json');
+  res.setHeader('cache-control', 'no-store');
+  res.end(JSON.stringify(body ?? null));
+};
+
+/**
+ * 只回應同源頁面；`direct` 時也允許沒有 fetch metadata 的直接請求（網址列、curl）。
+ * 其他 localhost 埠上的頁面不能偷看本機 commit、未推送的 branch 與資料夾位置。
+ * 偽造的 Host（DNS rebinding）在進到這裡之前就會被 Vite 自己的 host 檢查擋掉。
+ */
+export function isSameOrigin(req: IncomingMessage, direct: boolean): boolean {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || (direct && site === 'none');
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      return new URL(origin).host === req.headers.host;
+    } catch {
+      return false;
+    }
+  }
+  return direct;
+}
+
+const readBody = (req: IncomingMessage, limit: number) =>
+  new Promise<string>((ok, fail) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        fail(new Error('request body too large'));
+        req.destroy();
+      } else chunks.push(chunk);
+    });
+    req.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', fail);
+  });
+
+/** 同時監看幾個「非預設」repo；超過就停掉最久沒用的那個（之後再選到時會重新開始監看）。 */
+const MAX_SESSIONS = 4;
+/** 使用者手動加入的路徑最多記幾個。 */
+const MAX_ADDED = 50;
+const SCAN_TTL_MS = 5000;
+
 const VIRTUAL_ID = 'virtual:git-snapshot';
 const RESOLVED_ID = `\0${VIRTUAL_ID}`;
 
 /**
- * 提供 `virtual:git-snapshot`（建置 / 啟動當下的 git 歷史），
- * dev 時監看 .git，有新 commit / checkout / fetch 就透過 HMR 即時推送新快照。
+ * 提供 `virtual:git-snapshot`（建置 / 啟動當下預設 repo 的 git 歷史），
+ * dev 時監看 .git，有新 commit / checkout / fetch 就透過 HMR 即時推送新快照；
+ * 另外提供本機 repo 清單與任一 repo 的快照，讓畫面可以切換要看哪個本機 repo。
  */
 export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
   let repoDir = options.repoDir ?? process.env['AGG_REPO_DIR'] ?? process.cwd();
-  let last: GitSnapshot | undefined;
   let warn: (m: string) => void = options.onWarn ?? ((m) => console.warn(`[git-snapshot] ${m}`));
-
-  let staleWarned = false;
-  const read = async (): Promise<GitSnapshot> => {
-    const snap = await readGitSnapshot(repoDir, { ...options, onWarn: warn });
-    if (snap.graph) staleWarned = false;
-    // 暫時性的 git 錯誤（例如 gc / fetch 進行中）不要把好好的畫面換成錯誤頁；
-    // 目錄不見、不是 repo 這類確定的失敗則如實顯示（否則畫面會永遠停在舊圖，使用者還看不出來）。
-    if (!snap.graph && snap.transient && last?.graph) {
-      if (!staleWarned) warn('keeping the last good snapshot until git can be read again');
-      staleWarned = true;
-      return last;
-    }
-    last = snap;
-    return snap;
-  };
+  let push: (repo: string, snap: GitSnapshot) => void = () => {};
+  let main: RepoSession | undefined;
+  // 建置時（沒有 dev server）也要能讀，所以 lazily 建立；dev 時 configureServer 再讓它開始監看
+  const mainSession = () =>
+    (main ??= new RepoSession(repoDir, {
+      options,
+      warn: (m) => warn(m),
+      onUpdate: (snap) => push(DEFAULT_REPO, snap),
+    }));
 
   return {
     name: 'adorable-git-snapshot',
@@ -302,109 +615,240 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
     },
     async load(id) {
       if (id !== RESOLVED_ID) return undefined;
-      const snap = last ?? (await read());
+      const session = mainSession();
+      const snap = session.last ?? (await session.read());
       return `export default ${JSON.stringify(snap)};`;
     },
     async configureServer(server) {
       // vitest 只是借用 Vite 的轉換管線，不需要讀 git 也不需要監看
       if (process.env['VITEST']) return;
-
-      let key = snapshotKey(await read());
-
-      // 讀取 → 比較 → 有變才更新 Vite module 並推送。一次只跑一個；執行中又來要求就在結束後再跑一輪（不漏）。
-      let inflight: Promise<void> | undefined;
-      let again = false;
-      const sync = (): Promise<void> => {
-        if (inflight) {
-          again = true;
-          return inflight;
-        }
-        inflight = (async () => {
-          try {
-            do {
-              again = false;
-              const snap = await read();
-              const next = snapshotKey(snap);
-              if (next === key) continue;
-              key = next;
-              const mod = server.moduleGraph.getModuleById(RESOLVED_ID);
-              if (mod) server.moduleGraph.invalidateModule(mod);
-              server.ws.send({ type: 'custom', event: HMR_EVENT, data: snap });
-            } while (again);
-          } catch (err) {
-            warn(`refresh failed: ${err instanceof Error ? err.message : String(err)}`);
-          } finally {
-            inflight = undefined;
-          }
-        })();
-        return inflight;
-      };
-
-      server.middlewares.use(SNAPSHOT_ENDPOINT, (req, res) => {
-        // 只允許同源頁面讀取：其他 localhost 埠上的頁面不能偷看本機 commit 與未推送的 branch
-        const site = req.headers['sec-fetch-site'];
-        if (req.method !== 'GET' || (site && site !== 'same-origin' && site !== 'none')) {
-          res.statusCode = req.method !== 'GET' ? 405 : 403;
-          res.end();
-          return;
-        }
-        void sync().then(() => {
-          res.setHeader('content-type', 'application/json');
-          res.setHeader('cache-control', 'no-store');
-          res.end(JSON.stringify(last));
-        });
-      });
-
-      let timer: NodeJS.Timeout | undefined;
-      const onChange = () => {
-        clearTimeout(timer);
-        timer = setTimeout(() => void sync(), 250);
-      };
-
-      let stopWatching = () => {};
-      let poll: NodeJS.Timeout | undefined;
-      try {
-        const dirs = [
-          ...new Set(
-            (
-              await Promise.all([
-                git(repoDir, ['rev-parse', '--absolute-git-dir']),
-                git(repoDir, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
-              ])
-            ).map((s) => s.trim()),
-          ),
-        ];
-        stopWatching = watchGitRefs(dirs, onChange);
-
-        // 安全網：檔案監看可能漏事件（網路磁碟、inotify 上限…），偶爾比對一次 ref 簽章
-        const pollMs = options.pollMs ?? 2000;
-        if (pollMs > 0) {
-          let sig = await refsSignature(repoDir);
-          poll = setInterval(() => {
-            void refsSignature(repoDir).then((next) => {
-              if (next === sig) return;
-              sig = next;
-              void sync();
-            });
-          }, pollMs);
-          poll.unref();
-        }
-      } catch {
-        // 不是 git repo：沒東西可監看，/__agg/git-snapshot 仍可手動重抓
-      }
-
-      // dev server（含 vitest 的無 httpServer 模式）關閉時一定要放掉 watcher / timer，否則行程無法結束
-      const cleanup = () => {
-        clearTimeout(timer);
-        clearInterval(poll);
-        stopWatching();
-      };
-      const close = server.close.bind(server);
-      server.close = async () => {
-        cleanup();
-        await close();
-      };
-      server.httpServer?.once('close', cleanup);
+      await serveLocalRepos(server);
     },
   };
+
+  async function serveLocalRepos(server: ViteDevServer) {
+    push = (repo, snapshot) => {
+      // 預設 repo 也是 virtual module：重新整理頁面時要拿到新的 module，而不是舊快取
+      if (repo === DEFAULT_REPO) {
+        const mod = server.moduleGraph.getModuleById(RESOLVED_ID);
+        if (mod) server.moduleGraph.invalidateModule(mod);
+      }
+      const data: SnapshotEvent = { repo, snapshot };
+      server.ws.send({ type: 'custom', event: HMR_EVENT, data });
+    };
+
+    const def = mainSession();
+    await def.sync();
+    await def.start();
+
+    // 預設 repo 的實際位置：清單去重用，也是預設的掃描根目錄（它的上一層）
+    const resolved = await resolveRepo(repoDir).catch(() => ({
+      dir: repoDir,
+      name: basename(resolve(repoDir)),
+    }));
+    const defaultDir = await realpath(resolved.dir).catch(() => resolve(resolved.dir));
+    const defaultEntry: RepoEntry = {
+      id: DEFAULT_REPO,
+      dir: defaultDir,
+      name: resolved.name,
+      label: labelFor(defaultDir),
+      isDefault: true,
+    };
+    const roots = (options.repoRoots ?? rootsFromEnv() ?? [dirname(defaultDir)]).map((p) =>
+      resolve(expandHome(p)),
+    );
+    const scanDepth = options.scanDepth ?? intFromEnv('AGG_REPO_SCAN_DEPTH') ?? 3;
+
+    // ── 清單：掃描結果（短暫快取）+ 使用者手動加入的路徑 ──
+    const added = new Map<string, RepoEntry>();
+    let discovered = new Map<string, RepoEntry>();
+    let truncated = false;
+    let scannedAt = -Infinity;
+    let scanning: Promise<void> | undefined;
+    const rescan = (maxAgeMs: number): Promise<void> => {
+      if (scanning) return scanning;
+      if (Date.now() - scannedAt < maxAgeMs) return Promise.resolve();
+      scanning = discoverRepos(roots, { maxDepth: scanDepth })
+        .then((result) => {
+          const next = new Map<string, RepoEntry>();
+          for (const dir of result.repos) {
+            if (dir === defaultDir) continue;
+            const id = repoIdFor(dir);
+            const name = basename(dir).replace(/\.git$/, '') || basename(dir);
+            next.set(id, { id, dir, name, label: labelFor(dir), isDefault: false });
+          }
+          discovered = next;
+          truncated = result.truncated;
+          scannedAt = Date.now();
+        })
+        .catch((err: unknown) => warn(`could not scan for repositories: ${String(err)}`))
+        .finally(() => {
+          scanning = undefined;
+        });
+      return scanning;
+    };
+
+    const list = (): ReposResponse => {
+      const others = [...new Map([...discovered, ...added]).values()].sort(
+        (a, b) =>
+          a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) ||
+          a.label.localeCompare(b.label),
+      );
+      return { repos: [defaultEntry, ...others].map(toPublic), truncated };
+    };
+
+    // ── 每個 repo 一個 session（快照 + 監看）；非預設的最多留 MAX_SESSIONS 個 ──
+    let closed = false;
+    const sessions = new Map<string, { entry: RepoEntry; session: RepoSession }>();
+    const opening = new Map<string, Promise<RepoSession | undefined>>();
+
+    const findEntry = async (id: string): Promise<RepoEntry | undefined> => {
+      const hit = () => sessions.get(id)?.entry ?? added.get(id) ?? discovered.get(id);
+      if (hit()) return hit();
+      // 例如 dev server 重新啟動後直接打開 `?local=<id>` 的網址：清單還沒掃過
+      await rescan(2000);
+      return hit();
+    };
+
+    const sessionFor = (id: string): Promise<RepoSession | undefined> => {
+      if (id === DEFAULT_REPO) return Promise.resolve(def);
+      const open = sessions.get(id);
+      if (open) {
+        // LRU：移到最後
+        sessions.delete(id);
+        sessions.set(id, open);
+        return Promise.resolve(open.session);
+      }
+      let pending = opening.get(id);
+      if (!pending) {
+        pending = (async () => {
+          const entry = await findEntry(id);
+          if (!entry || closed) return undefined;
+          const session = new RepoSession(entry.dir, {
+            options,
+            warn: (m) => warn(`${entry.name}: ${m}`),
+            onUpdate: (snap) => push(id, snap),
+          });
+          sessions.set(id, { entry, session });
+          for (const [oldId, old] of sessions) {
+            if (sessions.size <= MAX_SESSIONS) break;
+            old.session.stop();
+            sessions.delete(oldId);
+          }
+          await session.start();
+          return session;
+        })().finally(() => opening.delete(id));
+        opening.set(id, pending);
+      }
+      return pending;
+    };
+
+    /** 使用者輸入的路徑：必須是絕對路徑（可用 ~）、存在、而且在 git repo 裡。回傳的 repo 之後一樣只用 id 存取。 */
+    const addRepo = async (input: unknown): Promise<{ status: number; body: unknown }> => {
+      if (
+        typeof input !== 'string' ||
+        !input.trim() ||
+        input.length > 4096 ||
+        input.includes('\0')
+      ) {
+        return { status: 400, body: { error: 'invalid_path' } };
+      }
+      const wanted = expandHome(input.trim());
+      if (!isAbsolute(wanted)) return { status: 400, body: { error: 'not_absolute' } };
+      let dir: string;
+      try {
+        dir = await realpath(wanted);
+        if (!(await stat(dir)).isDirectory()) throw new Error('not a directory');
+      } catch {
+        return { status: 404, body: { error: 'not_found' } };
+      }
+      let top: string;
+      let name: string;
+      try {
+        const repo = await resolveRepo(dir);
+        top = await realpath(repo.dir);
+        name = repo.name;
+      } catch {
+        return { status: 422, body: { error: 'not_git' } };
+      }
+      if (top === defaultDir) return { status: 200, body: { repo: toPublic(defaultEntry) } };
+      const id = repoIdFor(top);
+      const entry = discovered.get(id) ??
+        added.get(id) ?? { id, dir: top, name, label: labelFor(top), isDefault: false };
+      added.delete(id);
+      added.set(id, entry);
+      for (const oldId of added.keys()) {
+        if (added.size <= MAX_ADDED) break;
+        added.delete(oldId);
+      }
+      return { status: 200, body: { repo: toPublic(entry) } };
+    };
+
+    server.middlewares.use(SNAPSHOT_ENDPOINT, (req, res) => {
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' });
+      if (!isSameOrigin(req, true)) return sendJson(res, 403, { error: 'forbidden' });
+      let id: string;
+      try {
+        id = new URL(req.url ?? '/', 'http://localhost').searchParams.get('repo') ?? DEFAULT_REPO;
+      } catch {
+        id = '';
+      }
+      if (!isRepoId(id)) return sendJson(res, 400, { error: 'invalid_repo' });
+      void sessionFor(id)
+        .then(async (session) => {
+          if (!session) return sendJson(res, 404, { error: 'unknown_repo' });
+          await session.sync();
+          sendJson(res, 200, session.last);
+        })
+        .catch((err: unknown) => {
+          warn(`snapshot request failed: ${String(err)}`);
+          sendJson(res, 500, { error: 'internal' });
+        });
+    });
+
+    server.middlewares.use(REPOS_ENDPOINT, (req, res) => {
+      if (req.method === 'GET') {
+        if (!isSameOrigin(req, true)) return sendJson(res, 403, { error: 'forbidden' });
+        void rescan(SCAN_TTL_MS).then(() => sendJson(res, 200, list()));
+        return;
+      }
+      if (req.method === 'POST') {
+        // 這會讓 server 去讀使用者輸入的路徑：只接受同源頁面送來的 JSON
+        // （跨站的 form / no-cors 請求送不出 application/json，fetch 則會先被 CORS preflight 擋下）
+        if (!isSameOrigin(req, false)) return sendJson(res, 403, { error: 'forbidden' });
+        if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) {
+          return sendJson(res, 415, { error: 'unsupported_media_type' });
+        }
+        void readBody(req, 8192).then(
+          async (raw) => {
+            let path: unknown;
+            try {
+              path = (JSON.parse(raw) as { path?: unknown } | null)?.path;
+            } catch {
+              path = undefined;
+            }
+            const result = await addRepo(path);
+            sendJson(res, result.status, result.body);
+          },
+          () => sendJson(res, 413, { error: 'too_large' }),
+        );
+        return;
+      }
+      sendJson(res, 405, { error: 'method_not_allowed' });
+    });
+
+    // dev server（含 vitest 的無 httpServer 模式）關閉時一定要放掉 watcher / timer，否則行程無法結束
+    const cleanup = () => {
+      closed = true;
+      def.stop();
+      for (const { session } of sessions.values()) session.stop();
+      sessions.clear();
+    };
+    const close = server.close.bind(server);
+    server.close = async () => {
+      cleanup();
+      await close();
+    };
+    server.httpServer?.once('close', cleanup);
+  }
 }
