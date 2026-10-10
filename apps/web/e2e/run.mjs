@@ -13,11 +13,15 @@
 //   · GitHub 來源（輸入驗證、404、rate limit、loading、深連結與快取、token 只以 Bearer header 送出且不進 DOM / URL / 快取）
 //   · 安全性（cross-origin 讀不到 dev endpoint、快照與 bundle 沒有 commit 本文 / email）→ 主題記憶 → zh-TW
 //   · 本機 repo 選擇器（AGG_REPO_ROOTS 指向專用的暫時資料夾：清單內容 / 略過的資料夾 / 不跟隨 symlink、切換與上一頁 / 下一頁、
+//     鍵盤在關著的選單上瀏覽（↑ ↓ 只改顯示，停 ~700ms 才切換一次：一筆歷史、只讀最後那個 repo；Enter 馬上切換）、
 //     深連結、非預設 repo 的即時更新（HMR 只通知 { repo: id }，畫面再向 endpoint 拿）、不認得的 id、
-//     輸入路徑（錯誤訊息 / Esc / 由 dev server 記在 AGG_LOCAL_REPOS_FILE（e2e 一律指到暫時檔案）、瀏覽器什麼都不記；
-//     同一個檔案重新啟動後仍打得開、換一個空的檔案就不認得）、跨來源讀不到也加不進 repo、偽造 Host 被 Vite 擋下、
-//     `vite --host` 時非 loopback 的連線只拿得到預設 repo（403 local_only，頁面說明原因；沒有非 loopback 介面就略過這一步）、
-//     手機寬度沒有橫向溢位、與 GitHub 來源來回切換）
+//     選單旁的 ＋（開啟其他路徑…）輸入路徑（錯誤訊息 / Esc / ✕ / 焦點：成功回到選單、失敗留在輸入框；
+//     ✕ 在深色系統配色下仍是 --agg-ink；<repo>/.git 打開的是 repo 本身、不會多一筆；
+//     由 dev server 記在 AGG_LOCAL_REPOS_FILE（e2e 一律指到暫時檔案）、瀏覽器什麼都不記；
+//     同一個檔案重新啟動後仍打得開、換一個空的檔案就不認得，在「不認得」的畫面上用 ＋ 加入同一個路徑就直接顯示、不用重新整理）、
+//     跨來源讀不到也加不進 repo、太大的 POST 拿到 413、偽造 Host 被 Vite 擋下、
+//     `vite --host` 時非 loopback 的連線只拿得到預設 repo（403 local_only，頁面說明原因、沒有 ＋；沒有非 loopback 介面就略過這一步）、
+//     手機寬度沒有橫向溢位、與 GitHub 來源來回切換（GitHub → 本機 回到最後看的本機 repo，不是預設 repo））
 //   → 其他本機 repo（沒有 remote / 空的 / 不是 git）→ 本機 build + preview。
 // 軟體 WebGL（SwiftShader）在 CPU 吃緊時很慢：一律等「狀態」（data-replay、定位器、輪詢），不用固定 sleep 當判斷依據；
 // 像素判斷失敗時會重截幾次才判定；逾時乘上 E2E_TIMEOUT_SCALE（預設 2）。截圖輸出到 e2e/.artifacts。
@@ -140,7 +144,7 @@ function makeRepo() {
  *   roots/.hidden/repo/         `.` 開頭的資料夾裡的 repo：不能出現在清單裡
  *   roots/linked → outside/far-away   指到範圍外的 symlink：不跟隨，不能出現在清單裡
  *   roots/plain/                不是 git repo 的資料夾
- *   outside/far-away/           範圍外的 repo：只能用「開啟其他路徑…」輸入絕對路徑打開
+ *   outside/far-away/           範圍外的 repo：只能用選單旁的 ＋（開啟其他路徑…）輸入絕對路徑打開
  *   outside/sneaky/             跨來源的 POST 想偷偷加進清單的 repo
  */
 function makeRepoRoots() {
@@ -2922,7 +2926,13 @@ try {
   };
   const PICK_LABEL = 'Choose a local repository';
   const PATH_LABEL = 'Path to a git repository';
-  const picker = (pg = page) => pg.locator(`select.web-select[aria-label="${PICK_LABEL}"]`);
+  const ADD_LABEL = 'Open another path…';
+  /** --agg-ink（#2b2140）：白天 / 夜間主題都一樣 */
+  const INK = 'rgb(43, 33, 64)';
+  const PICK_SEL = `select.web-select[aria-label="${PICK_LABEL}"]`;
+  const picker = (pg = page) => pg.locator(PICK_SEL);
+  /** 選單旁的 ＋：「開啟其他路徑…」是獨立的按鈕（不是選單裡的選項） */
+  const addBtn = (pg = page) => pg.getByRole('button', { name: ADD_LABEL, exact: true });
   const pathInput = (pg = page) => pg.locator(`input.web-input[aria-label="${PATH_LABEL}"]`);
   const pathError = (pg = page) => pg.locator('.web-error[role="alert"]');
   const ghInput = (pg = page) => pg.locator(`input.web-input:not([aria-label="${PATH_LABEL}"])`);
@@ -2944,6 +2954,16 @@ try {
       15_000,
       `the local repo menu to list ${id}`,
     );
+  /** 等選單的選項（值、順序）剛好是 `want`；逾時就以實際的清單判定失敗。 */
+  const waitPickerValues = async (want, what, pg = page) => {
+    const values = async () => (await pickerOptions(pg).catch(() => [])).map((o) => o.value);
+    await waitUntil(
+      async () => JSON.stringify(await values()) === JSON.stringify(want),
+      15_000,
+      what,
+    ).catch(() => {});
+    assert.deepEqual(await values(), want, what);
+  };
   /** 清單載入後選單才會選到目前的 repo（之前顯示的是「目前的 repo」占位選項）。 */
   const waitPickerValue = (id, pg = page) =>
     waitUntil(
@@ -3030,7 +3050,7 @@ try {
   };
 
   await step(
-    'LOCAL PICKER: the menu lists the default repo (★) first, then beta and group/gamma; node_modules / dot / symlinked / outside repos are not listed; option values are ids, never paths',
+    'LOCAL PICKER: the menu lists the default repo (★) first, then beta and group/gamma; node_modules / dot / symlinked / outside repos are not listed; option values are ids, never paths; "Open another path…" is a separate ＋ button, not an option',
     async () => {
       await page.goto(base); // 也讓 websocket 監聽從這裡開始
       await titleIs('octo/cat');
@@ -3039,8 +3059,8 @@ try {
       const opts = await pickerOptions();
       assert.deepEqual(
         opts.map((o) => o.value),
-        ['default', ids.beta, ids.gamma, '__add'],
-        'menu: the default repo, the scanned repos by name, then "open another path"',
+        ['default', ids.beta, ids.gamma],
+        'menu: the default repo, then the scanned repos by name (and nothing else)',
       );
       assert.deepEqual(
         opts.map((o) => o.text),
@@ -3048,8 +3068,24 @@ try {
           `★ ${dirBase(repoDir)} — ${repoLabelOf(repoDir)}`,
           `beta — ${repoLabelOf(fx.beta)}`,
           `gamma — ${repoLabelOf(fx.gamma)}`,
-          '+ Open another path…',
         ],
+      );
+      // 「開啟其他路徑…」：選單旁邊獨立的 ＋ 按鈕（鍵盤在選單上瀏覽時不會經過它）
+      assert.equal(await addBtn().count(), 1, 'one "Open another path…" button');
+      assert.deepEqual(
+        await addBtn().evaluate((b) => ({
+          cls: b.className,
+          text: b.textContent,
+          title: b.title,
+          type: b.type,
+          afterMenu: b.previousElementSibling?.matches('select.web-select') ?? false,
+        })),
+        { cls: 'web-icon web-add', text: '＋', title: ADD_LABEL, type: 'button', afterMenu: true },
+        'the ＋ button sits right after the menu',
+      );
+      assert.ok(
+        !opts.some((o) => o.value === '__add' || o.text.includes(ADD_LABEL)),
+        'no "open another path" option inside the menu',
       );
       assert.equal(await pickerValue(), 'default', 'the default repo is selected');
       assert.deepEqual(
@@ -3062,7 +3098,7 @@ try {
         'the menu tooltip is the location of the selected repo',
       );
       for (const o of opts) {
-        assert.match(o.value, /^(default|[0-9a-f]{12}|__add)$/, `option value "${o.value}"`);
+        assert.match(o.value, /^(default|[0-9a-f]{12})$/, `option value "${o.value}"`);
         assert.ok(!o.value.includes('/'), 'option values never carry a path');
       }
       const texts = opts.map((o) => o.text).join('\n');
@@ -3168,6 +3204,179 @@ try {
       await page.goForward();
       await titleIs('octo/cat');
       await waitShowsRepo(repoDir, 'the default repo after Forward again');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER keyboard: ↓ ↓ on the closed menu only move the menu (URL, title and history stay put); ~700 ms after the last key it switches ONCE (one history entry, only the final repo is fetched); ↑ + Enter switches right away',
+    async () => {
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo');
+      await waitPickerValue('default');
+      await replayDone();
+      assert.deepEqual(
+        (await pickerOptions()).map((o) => o.value),
+        ['default', ids.beta, ids.gamma],
+        'sanity: ★ → beta → gamma, top to bottom',
+      );
+      // 頁面這邊的紀錄（performance.now）：每一次 pushState、每一個按鍵、標題的每一次變化
+      await page.evaluate(() => {
+        window.__nav = [];
+        window.__keys = [];
+        window.__titleLog = [document.querySelector('.agg-title-text')?.textContent ?? ''];
+        if (window.__kbdProbe) return;
+        window.__kbdProbe = true;
+        const push = history.pushState.bind(history);
+        history.pushState = (...args) => {
+          window.__nav.push({ url: String(args[2]), t: performance.now() });
+          return push(...args);
+        };
+        document.addEventListener(
+          'keydown',
+          (e) => window.__keys.push({ key: e.key, t: performance.now() }),
+          true,
+        );
+        new MutationObserver(() => {
+          const t = document.querySelector('.agg-title-text')?.textContent;
+          if (t && window.__titleLog[window.__titleLog.length - 1] !== t) window.__titleLog.push(t);
+        }).observe(document, { subtree: true, childList: true, characterData: true });
+      });
+      const probe = () =>
+        page.evaluate(() => ({
+          nav: window.__nav.slice(),
+          keys: window.__keys.slice(),
+          titles: window.__titleLog.slice(),
+        }));
+      const resetProbe = () =>
+        page.evaluate(() => {
+          window.__nav = [];
+          window.__keys = [];
+          window.__titleLog = [document.querySelector('.agg-title-text')?.textContent ?? ''];
+        });
+      /** 這一刻的網址 / 標題 / 選單顯示的值 / 歷史筆數（一次讀完，彼此一致） */
+      const now = () =>
+        page.evaluate(
+          (sel) => ({
+            search: location.search,
+            title: document.querySelector('.agg-title-text')?.textContent ?? '',
+            menu: document.querySelector(sel)?.value ?? null,
+            history: history.length,
+          }),
+          PICK_SEL,
+        );
+      // 向 dev server 要了哪些 repo 的快照
+      const fetched = [];
+      const onRequest = (r) => {
+        if (r.url().startsWith(`${base}/__agg/git-snapshot`))
+          fetched.push(new URL(r.url()).searchParams.get('repo') ?? 'default');
+      };
+      page.on('request', onRequest);
+      try {
+        const historyBefore = await page.evaluate(() => history.length);
+        await page.focus(PICK_SEL);
+        assert.equal(await activeLabel(), PICK_LABEL, 'the closed menu has the keyboard focus');
+
+        // ↓ ↓（很快地連按）：每一下只改選單顯示的值，網址、標題、歷史都不動
+        await page.keyboard.press('ArrowDown');
+        assert.deepEqual(
+          await now(),
+          { search: '', title: 'octo/cat', menu: ids.beta, history: historyBefore },
+          'after ↓: the menu shows beta, nothing else changed yet',
+        );
+        await page.keyboard.press('ArrowDown');
+        assert.deepEqual(
+          await now(),
+          { search: '', title: 'octo/cat', menu: ids.gamma, history: historyBefore },
+          'after ↓ ↓: the menu shows gamma, still no switch (beta was only passed by)',
+        );
+        let log = await probe();
+        const arrows = log.keys.filter((k) => k.key === 'ArrowDown');
+        assert.equal(arrows.length, 2, 'sanity: two ArrowDown keys reached the page');
+        assert.ok(
+          arrows[1].t - arrows[0].t < 700,
+          `sanity: the two keys came ${Math.round(arrows[1].t - arrows[0].t)} ms apart (the test needs < 700 ms)`,
+        );
+        assert.deepEqual(log.nav, [], 'no navigation while the keys are coming');
+
+        // 停下來：~700 ms 後切換「一次」，直接到 gamma
+        await waitSearch(`?local=${ids.gamma}`);
+        await titleIs('gamma');
+        await waitShowsRepo(fx.gamma, 'gamma once the keys settle');
+        log = await probe();
+        assert.deepEqual(
+          log.nav.map((n) => n.url),
+          [`/?local=${ids.gamma}`],
+          'exactly one navigation, straight to gamma',
+        );
+        const waited = log.nav[0].t - arrows[1].t;
+        assert.ok(
+          waited >= 650,
+          `it switched ${Math.round(waited)} ms after the last key (it should wait ~700 ms)`,
+        );
+        assert.equal(
+          await page.evaluate(() => history.length),
+          historyBefore + 1,
+          'one history entry for the whole keyboard browse',
+        );
+        assert.ok(
+          !log.titles.includes('beta'),
+          `beta was never shown (titles: ${log.titles.join(' → ')})`,
+        );
+        assert.ok(
+          fetched.length > 0 && fetched.every((id) => id === ids.gamma),
+          `only gamma's snapshot was fetched (${fetched.join(', ')})`,
+        );
+        await waitPickerValue(ids.gamma);
+        assert.equal(await activeLabel(), PICK_LABEL, 'the menu keeps the focus after the switch');
+
+        // ↑ + Enter：Enter 馬上切換，不等 700 ms
+        await resetProbe();
+        fetched.length = 0;
+        await page.keyboard.press('ArrowUp');
+        await page.keyboard.press('Enter');
+        await waitSearch(`?local=${ids.beta}`);
+        log = await probe();
+        const up = log.keys.find((k) => k.key === 'ArrowUp');
+        const enter = log.keys.find((k) => k.key === 'Enter');
+        assert.ok(up && enter, 'sanity: ArrowUp and Enter reached the page');
+        assert.ok(
+          enter.t - up.t < 700,
+          `sanity: Enter came ${Math.round(enter.t - up.t)} ms after ArrowUp (the test needs < 700 ms)`,
+        );
+        assert.deepEqual(
+          log.nav.map((n) => n.url),
+          [`/?local=${ids.beta}`],
+          'one navigation, to beta',
+        );
+        assert.ok(
+          log.nav[0].t >= enter.t && log.nav[0].t - enter.t < 300,
+          `Enter switched right away (${Math.round(log.nav[0].t - enter.t)} ms after Enter, ${Math.round(log.nav[0].t - up.t)} ms after ArrowUp)`,
+        );
+        await titleIs('beta');
+        await waitShowsRepo(fx.beta, 'beta after ↑ + Enter');
+        assert.equal(
+          await page.evaluate(() => history.length),
+          historyBefore + 2,
+          'Enter added exactly one more history entry',
+        );
+        assert.ok(
+          fetched.length > 0 && fetched.every((id) => id === ids.beta),
+          `only beta's snapshot was fetched (${fetched.join(', ')})`,
+        );
+        await waitPickerValue(ids.beta);
+        assert.equal(await activeLabel(), PICK_LABEL);
+        // 之後不會再因為剛才的按鍵而切換（計時器已經取消）
+        await sleep(1000);
+        assert.deepEqual(
+          (await probe()).nav.map((n) => n.url),
+          [`/?local=${ids.beta}`],
+          'no late switch after Enter',
+        );
+        assert.equal(searchOf(), `?local=${ids.beta}`);
+      } finally {
+        page.off('request', onRequest);
+      }
+      await replayDone();
     },
   );
 
@@ -3317,7 +3526,7 @@ try {
       assert.equal(await page.locator('.agg-center').count(), 0, 'the error panel is gone');
       assert.deepEqual(
         (await pickerOptions()).map((o) => o.value),
-        ['default', ids.beta, ids.gamma, '__add'],
+        ['default', ids.beta, ids.gamma],
         'the placeholder option is gone once a listed repo is shown',
       );
       // 格式不對的 id（像路徑）：直接當成預設 repo，不會送到 dev server
@@ -3329,30 +3538,72 @@ try {
   );
 
   await step(
-    'LOCAL PICKER: "+ Open another path…" — relative / missing / non-git paths get a clear error, Esc and ✕ close the form and give focus back to the menu, an absolute path outside the scanned folders opens that repo, joins the menu and is remembered by the dev server (state file), not by the browser',
+    'LOCAL PICKER: ＋ "Open another path…" — relative / missing / non-git paths get a clear error (focus stays in the path box, even after clicking Open), Esc and ✕ close the form and give focus back to the menu, ✕ keeps the ink color under a dark OS scheme, an absolute path outside the scanned folders opens that repo (focus back on the menu), joins the menu and is remembered by the dev server (state file), not by the browser; <default repo>/.git opens the default repo without a duplicate entry',
     async () => {
       await page.goto(base);
       await titleIs('octo/cat');
       await waitPickerHas(ids.beta);
       assert.equal(readState(mainState), null, 'nothing typed yet: no state file');
-      const openForm = async () => {
-        await picker().selectOption('__add');
+      /** 按 ＋ 打開輸入框（`on`：目前顯示的 repo；按 ＋ 本身不會改變選取或網址）。 */
+      const openForm = async (on = 'default') => {
+        await addBtn().click();
         await pathInput().waitFor();
         assert.equal(await activeLabel(), PATH_LABEL, 'the path box gets the keyboard focus');
-        assert.equal(await pickerValue(), 'default', 'the action itself is not a selection');
-        assert.equal(searchOf(), '');
+        assert.equal(await addBtn().count(), 0, 'the ＋ button makes way for the form');
+        assert.equal(await pickerValue(), on, 'the action itself is not a selection');
+        assert.equal(searchOf(), on === 'default' ? '' : `?local=${on}`);
       };
       await openForm();
       const openBtn = page.locator('.web-form button[type="submit"]', { hasText: /^Open$/ });
+      // 空的時候：aria-disabled（不是 disabled：按鈕不能因為送出中 / 清空就失去焦點）
+      assert.equal(
+        await openBtn.getAttribute('aria-disabled'),
+        'true',
+        'Open is marked disabled while the box is empty',
+      );
       assert.equal(await openBtn.isDisabled(), true, 'Open is disabled while the box is empty');
+      assert.equal(
+        await openBtn.evaluate((b) => b.disabled),
+        false,
+        'aria-disabled, not the disabled attribute (the button stays focusable)',
+      );
       assert.equal(await pathInput().getAttribute('placeholder'), '/path/to/repo or ~/code/repo');
       assert.equal(await pathInput().getAttribute('aria-invalid'), 'false');
+      // 深色的系統配色（頁面宣告 color-scheme: light dark，按鈕預設的文字顏色會變成淺色，淺色底上就看不到）：
+      // ✕（之後的 ＋ 也一樣）的文字顏色要是 --agg-ink
+      const iconColor = (sel) =>
+        page.evaluate((s) => {
+          const el = document.querySelector(s);
+          return {
+            color: getComputedStyle(el).color,
+            text: el.textContent,
+            paper: getComputedStyle(el).backgroundColor,
+            dark: matchMedia('(prefers-color-scheme: dark)').matches,
+          };
+        }, sel);
+      const CANCEL_SEL = '.web-form button[aria-label="Cancel"]';
+      await page.emulateMedia({ colorScheme: 'dark' });
+      try {
+        const dark = await iconColor(CANCEL_SEL);
+        assert.equal(dark.dark, true, 'sanity: the dark scheme is emulated');
+        assert.equal(dark.text, '✕');
+        assert.equal(dark.color, INK, `✕ under a dark OS scheme (on ${dark.paper})`);
+        await page.screenshot({ path: resolve(artifacts, '12-add-path-dark.png') });
+      } finally {
+        await page.emulateMedia({ colorScheme: 'light' });
+      }
+      const light = await iconColor(CANCEL_SEL);
+      assert.equal(light.dark, false);
+      assert.equal(light.color, INK, '✕ under a light OS scheme');
+      assert.equal(await activeLabel(), PATH_LABEL, 'still typing in the path box');
 
-      const tryPath = async (value, message, what) => {
+      const tryPath = async (value, message, what, { click = false } = {}) => {
         await pathInput().fill(value);
         assert.equal(await pathError().count(), 0, `${what}: typing clears the previous error`);
+        assert.equal(await openBtn.getAttribute('aria-disabled'), 'false', what);
         assert.equal(await openBtn.isDisabled(), false);
-        await pathInput().press('Enter');
+        if (click) await openBtn.click();
+        else await pathInput().press('Enter');
         await pathError().waitFor();
         assert.equal(await pathError().innerText(), message, what);
         assert.equal(await pathError().getAttribute('id'), 'web-path-error');
@@ -3361,6 +3612,17 @@ try {
         assert.equal(await pathInput().inputValue(), value, `${what}: the text stays for fixing`);
         assert.equal(searchOf(), '', `${what}: no navigation`);
         assert.equal(await page.locator('.web-error').count(), 1);
+        // 失敗後焦點在輸入框（按 Open 送出時，焦點原本在按鈕上）
+        await waitUntil(
+          async () => (await activeLabel()) === PATH_LABEL,
+          5000,
+          `${what}: the focus goes back to the path box`,
+        );
+        assert.equal(
+          await page.evaluate(() => document.activeElement?.getAttribute('aria-invalid')),
+          'true',
+          `${what}: the focused box is the one marked invalid`,
+        );
       };
       await tryPath('beta', 'Enter an absolute path (~ for your home folder works).', 'relative');
       await tryPath(
@@ -3371,7 +3633,14 @@ try {
       await tryPath(
         resolve(fx.rootsDir, 'no-such-folder'),
         'That folder does not exist.',
-        'missing folder',
+        'missing folder (submitted by clicking Open)',
+        { click: true },
+      );
+      await tryPath(
+        resolve(fx.plain, 'notes.txt'),
+        'That folder does not exist.',
+        'a file, not a folder (submitted by clicking Open)',
+        { click: true },
       );
       await tryPath(fx.plain, 'That folder is not inside a git repository.', 'not a git repo');
       await page.screenshot({ path: resolve(artifacts, '12-add-path-error.png') });
@@ -3383,6 +3652,16 @@ try {
       assert.equal(await activeLabel(), PICK_LABEL, 'Esc gives the focus back to the menu');
       assert.equal(searchOf(), '');
       assert.equal(await pickerValue(), 'default');
+      assert.equal(await addBtn().count(), 1, 'the ＋ button is back after Esc');
+      await page.emulateMedia({ colorScheme: 'dark' });
+      try {
+        const plus = await iconColor('button.web-add');
+        assert.equal(plus.dark, true, 'sanity: the dark scheme is emulated');
+        assert.equal(plus.text, '＋');
+        assert.equal(plus.color, INK, `＋ under a dark OS scheme (on ${plus.paper})`);
+      } finally {
+        await page.emulateMedia({ colorScheme: 'light' });
+      }
       await waitShowsRepo(repoDir, 'the default repo after Esc');
       assert.equal(readState(mainState), null, 'failed paths are not remembered');
       // ✕（取消）按鈕也一樣
@@ -3391,6 +3670,7 @@ try {
       await page.locator(`.web-form button[aria-label="Cancel"]`).click();
       await pathInput().waitFor({ state: 'detached' });
       assert.equal(await activeLabel(), PICK_LABEL, '✕ gives the focus back to the menu');
+      assert.equal(await addBtn().count(), 1, 'the ＋ button is back after ✕');
 
       // 範圍外的 repo（絕對路徑）：打開、加進選單、由 dev server 記在 AGG_LOCAL_REPOS_FILE（瀏覽器不記）
       await openForm();
@@ -3402,14 +3682,28 @@ try {
       assert.match(await page.title(), /^far-away · /);
       await pathInput().waitFor({ state: 'detached' });
       assert.equal(await pathError().count(), 0);
+      // 成功：焦點回到選單（按 Open 送出的；表單消失後不能掉回 <body>）
+      await waitUntil(
+        async () => (await activeLabel()) === PICK_LABEL,
+        5000,
+        'the focus goes to the menu after a successful add',
+      );
+      assert.equal(
+        await page.evaluate(
+          (sel) => document.activeElement === document.querySelector(sel),
+          PICK_SEL,
+        ),
+        true,
+        'document.activeElement is the menu',
+      );
       await waitPickerHas(ids.far);
       await waitPickerValue(ids.far);
-      const opts = await pickerOptions();
-      assert.deepEqual(
-        opts.map((o) => o.value),
-        ['default', ids.beta, ids.far, ids.gamma, '__add'],
+      // 先樂觀地放進清單（排在最後），重新掃描回來後依名稱排序：等清單回來
+      await waitPickerValues(
+        ['default', ids.beta, ids.far, ids.gamma],
         'the opened repo joins the menu (by name)',
       );
+      const opts = await pickerOptions();
       assert.equal(opts.find((o) => o.value === ids.far).text, `far-away — ${repoLabelOf(fx.far)}`);
       // 先回應、再寫檔（暫存檔 + rename）：等檔案出現
       await waitUntil(
@@ -3459,6 +3753,53 @@ try {
         page,
         'after the symlink',
       );
+
+      // 預設 repo 的 .git 資料夾（在 git 目錄「裡面」）：打開的是預設 repo 本身（網址沒有 ?local），清單不會多一筆、也不會記下來
+      await replayDone();
+      const historyBefore = await page.evaluate(() => history.length);
+      await openForm(ids.far);
+      await pathInput().fill(resolve(repoDir, '.git'));
+      await pathInput().press('Enter');
+      await waitSearch('');
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo opened through its .git folder');
+      await pathInput().waitFor({ state: 'detached' });
+      assert.equal(await pathError().count(), 0, 'no error for <repo>/.git');
+      await waitPickerValue('default');
+      assert.equal(
+        await page.evaluate(() => history.length),
+        historyBefore + 1,
+        'one history entry (far-away → the default repo)',
+      );
+      await waitPickerValues(
+        ['default', ids.beta, ids.far, ids.gamma],
+        '<default repo>/.git adds no entry (no second copy of the default repo)',
+      );
+      const texts = (await pickerOptions()).map((o) => o.text);
+      assert.deepEqual(
+        texts.filter((t) => t.endsWith(` — ${repoLabelOf(repoDir)}`)),
+        [`★ ${dirBase(repoDir)} — ${repoLabelOf(repoDir)}`],
+        `the default repo is listed once:\n${texts.join('\n')}`,
+      );
+      assert.ok(!texts.some((t) => t.includes('.git')), 'no ".git" entry');
+      const listed = await sameOriginRepos();
+      assert.deepEqual(
+        listed.body.repos.map((r) => r.id),
+        ['default', ids.beta, ids.far, ids.gamma],
+        'the dev server did not add a second entry either',
+      );
+      await waitUntil(
+        () => !readdirSync(stateDir).some((f) => f.endsWith('.tmp')),
+        10_000,
+        'the state file write to finish',
+      );
+      assert.deepEqual(
+        readState(mainState),
+        { paths: [realpathSync(fx.far)] },
+        'the default repo is not remembered as a typed path',
+      );
+      assert.equal(await activeLabel(), PICK_LABEL, 'the focus is back on the menu');
+      await assertNoPathsInBrowser([repoDir], page, 'after <default repo>/.git');
     },
   );
 
@@ -3492,11 +3833,11 @@ try {
         await waitPickerHas(ids.beta, pg);
         assert.deepEqual(
           await values(pg),
-          ['default', ids.beta, ids.gamma, '__add'],
+          ['default', ids.beta, ids.gamma],
           'a dev server with a new state file knows only the scanned repos',
         );
         assert.equal(readState(kept), null, 'no state file before anything is typed');
-        await picker(pg).selectOption('__add');
+        await addBtn(pg).click();
         await pathInput(pg).fill(fx.far);
         await pathInput(pg).press('Enter');
         await waitSearch(`?local=${ids.far}`, pg);
@@ -3532,7 +3873,7 @@ try {
         await waitPickerValue(ids.far, again);
         assert.deepEqual(
           await values(again),
-          ['default', ids.beta, ids.far, ids.gamma, '__add'],
+          ['default', ids.beta, ids.far, ids.gamma],
           'the remembered repo is in the menu right after the restart',
         );
         const titles = await again.evaluate(() => window.__titles);
@@ -3564,7 +3905,7 @@ try {
         const opts = await pickerOptions(other);
         assert.deepEqual(
           opts.map((o) => o.value),
-          ['__current', 'default', ids.beta, ids.gamma, '__add'],
+          ['__current', 'default', ids.beta, ids.gamma],
         );
         assert.deepEqual(
           opts.filter((o) => o.selected).map((o) => o.text),
@@ -3587,7 +3928,7 @@ try {
   );
 
   await step(
-    'LOCAL PICKER + GitHub: Local while a non-default repo is shown keeps it; GitHub and back (Back button, Local button) keep working; a commit made meanwhile is there',
+    'LOCAL PICKER + GitHub: Local while a non-default repo is shown keeps it; GitHub and back (Back button, Local button) keep working; GitHub → Local returns to the last local repo (beta / gamma / ★), not always ★; a commit made meanwhile is there',
     async () => {
       await picker().selectOption(ids.beta);
       await waitSearch(`?local=${ids.beta}`);
@@ -3635,25 +3976,53 @@ try {
       assert.equal((await domRows())[0].subject, 'beta: made while on GitHub');
       assert.equal(await scrollTopNow(), 0);
       await waitPickerValue(ids.beta);
-      // 下一頁 → GitHub；Local 按鈕 → 預設 repo，選單照常可用
+      // 下一頁 → GitHub；Local 按鈕 → 回到最後看的本機 repo（beta），不是預設 repo；選單照常可用
       await page.goForward();
       await titleIs('demo/adorable-git-graph');
       await srcLocal().click();
-      await waitSearch('');
-      await titleIs('octo/cat');
-      await waitForCommits(expected);
-      await waitShowsRepo(repoDir, 'the default repo after GitHub → Local');
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta after GitHub → Local (the last local repo, not ★)');
       await waitPickerHas(ids.far);
-      assert.equal(await pickerValue(), 'default');
+      await waitPickerValue(ids.beta);
+      assert.equal(await commitCount(), gitCount(fx.beta));
       await picker().selectOption(ids.gamma);
       await waitSearch(`?local=${ids.gamma}`);
       await titleIs('gamma');
       await waitShowsRepo(fx.gamma, 'gamma (nested two levels down)');
+
+      // ③ 中間沒有上一頁 / 下一頁：從選單挑一個 → GitHub → Local = 剛才挑的那個（gamma、beta，★ 也一樣）
+      for (const [id, dir, name, search] of [
+        [ids.gamma, fx.gamma, 'gamma', `?local=${ids.gamma}`],
+        [ids.beta, fx.beta, 'beta', `?local=${ids.beta}`],
+        ['default', repoDir, 'octo/cat', ''],
+      ]) {
+        await picker().selectOption(id);
+        await waitSearch(search);
+        await titleIs(name);
+        await waitShowsRepo(dir, `${name} picked from the menu`);
+        await srcGitHub().click();
+        await ghInput().fill('demo/adorable-git-graph');
+        await ghInput().press('Enter');
+        await titleIs('demo/adorable-git-graph');
+        assert.equal(searchOf(), '?repo=demo/adorable-git-graph');
+        const historyBefore = await page.evaluate(() => history.length);
+        await srcLocal().click();
+        await waitSearch(search);
+        await titleIs(name);
+        await waitShowsRepo(dir, `${name} again after GitHub → Local`);
+        await waitPickerValue(id);
+        assert.equal(
+          await page.evaluate(() => history.length),
+          historyBefore + 1,
+          `GitHub → Local (${name}): one history entry`,
+        );
+      }
     },
   );
 
   await step(
-    'LOCAL PICKER responsive: 390×800 and 320×640 — the menu, the path box and its error fit the screen; no horizontal page overflow and nothing scrolls sideways',
+    'LOCAL PICKER responsive: 390×800 and 320×640 — the menu, its ＋ button, the path box and its error fit the screen; no horizontal page overflow and nothing scrolls sideways',
     async () => {
       await picker().selectOption(ids.beta);
       await titleIs('beta');
@@ -3719,6 +4088,7 @@ try {
         assert.deepEqual(
           await inside([
             ['select.web-select', 120],
+            ['button.web-add', 30],
             ['.web-seg', 0],
             ['.web-theme', 0],
           ]),
@@ -3727,7 +4097,7 @@ try {
         );
         await page.screenshot({ path: resolve(artifacts, `12-picker-${w}.png`) });
         // 輸入框 + 錯誤訊息
-        await picker().selectOption('__add');
+        await addBtn().click();
         await pathInput().waitFor();
         await pathInput().fill('relative/path/that/is/fairly/long/for/a/phone');
         await pathInput().press('Enter');
@@ -3756,7 +4126,7 @@ try {
   );
 
   await step(
-    'SECURITY (local picker): other origins (another localhost port, 127.0.0.1) can neither read the repo list / snapshots nor add a repo (cors POST, no-cors POST, form POST); bad requests are rejected; a forged Host gets 403 from Vite',
+    'SECURITY (local picker): other origins (another localhost port, 127.0.0.1) can neither read the repo list / snapshots nor add a repo (cors POST, no-cors POST, form POST); bad requests are rejected (an oversized body gets a real 413 too_large); a forged Host gets 403 from Vite',
     async () => {
       // 別的來源上的空白頁：localhost 的另一個埠（同站不同源：同一台機器上的別的 dev server）與 127.0.0.1（跨站）
       const blankPage = async (host) => {
@@ -3916,13 +4286,7 @@ try {
           }),
         };
       }, fx.sneaky);
-      // 超過 8KB 的 body：一定要被拒絕。程式本意是回 413 too_large，但目前 readBody 先 req.destroy() 把連線關掉，
-      // 413 送不出去，瀏覽器只看到連線中斷（已回報為產品 bug）；這裡先釘住「被拒絕」，修好後只會是 413。
-      assert.ok(
-        ['413 too_large', 'network error'].includes(sameOrigin.tooLarge),
-        `an oversized body must be refused (${sameOrigin.tooLarge})`,
-      );
-      delete sameOrigin.tooLarge;
+      // 超過 8KB 的 body：server 把其餘內容讀掉（不是直接斷線）再回 413，瀏覽器拿得到 { error: 'too_large' }
       assert.deepEqual(sameOrigin, {
         malformedId: '400 invalid_repo',
         unknownId: '404 unknown_repo',
@@ -3930,6 +4294,7 @@ try {
         putRepos: '405 method_not_allowed',
         textPlain: '415 unsupported_media_type',
         notString: '400 invalid_path',
+        tooLarge: '413 too_large',
       });
 
       // 瀏覽器以外的請求（node http）：偽造的 Host（DNS rebinding）在進到 plugin 之前就被 Vite 擋下
@@ -3971,6 +4336,14 @@ try {
           403,
           `POST with ${what}`,
         );
+      // 同源、路徑本身也加得進去，但 body 超過 8KB：整個請求被拒絕，413 的回應送得到（不是連線被重設）
+      const oversized = await raw('/__agg/repos', {
+        method: 'POST',
+        headers: { ...jsonHeaders, 'Sec-Fetch-Site': 'same-origin' },
+        body: JSON.stringify({ path: fx.sneaky, pad: 'x'.repeat(9000) }),
+      });
+      assert.equal(oversized.status, 413, 'an oversized same-origin POST');
+      assert.deepEqual(oversized.json, { error: 'too_large' }, 'an oversized same-origin POST');
       assert.ok(
         !(await sameOriginRepos()).body.repos.some((r) => r.id === ids.sneaky),
         'still not added',
@@ -4012,7 +4385,7 @@ try {
   // `vite --host`：手機等區網裡的裝置也連得到 dev server。它們只能看預設 repo（本來就在 bundle 裡）；
   // 清單 / 輸入路徑 / 其他 repo 的快照只回應 loopback（403 local_only）。用這台機器的非 loopback 位址模擬「另一台裝置」。
   const LAN_STEP =
-    'SECURITY (vite --host): a client on a non-loopback address gets 403 local_only for the repo list, typed paths and other repos’ snapshots (the default repo still works); its page explains why and offers no "+ Open another path…"';
+    'SECURITY (vite --host): a client on a non-loopback address gets 403 local_only for the repo list, typed paths and other repos’ snapshots (the default repo still works); its page shows the disabled "local only" option and explains why, with no ＋ "Open another path…" button';
   const lanIp = lanAddress();
   if (!lanIp)
     console.log(`↷ skipped (this machine has no non-loopback IPv4 interface): ${LAN_STEP}`);
@@ -4119,6 +4492,10 @@ try {
           'LAN menu: only the current (default) repo and why nothing else is offered',
         );
         assert.ok(!opts.some((o) => o.value === '__add' || o.text === '+ Open another path…'));
+        // 「開啟其他路徑…」是選單旁的 ＋ 按鈕：從區網打開的頁面上沒有它
+        assert.equal(await addBtn(lp).count(), 0, 'LAN page: no ＋ "Open another path…" button');
+        assert.equal(await lp.locator('.web-add').count(), 0, 'LAN page: no .web-add');
+        assert.equal(await pathInput(lp).count(), 0, 'LAN page: no path box');
         await lp.screenshot({ path: resolve(artifacts, '12-lan-menu.png') });
         // 其他 repo 的深連結：說明原因（不是「不認得」），不顯示列表
         await lp.goto(`${lanOrigin}/?local=${ids.beta}`);
@@ -4131,13 +4508,16 @@ try {
         assert.equal(await lp.locator('.agg-commit').count(), 0, 'no beta rows');
         await waitLocalOnlyOption();
         opts = await pickerOptions(lp);
+        // 清單永遠拿不到（local_only）：占位選項不能說「不在清單中」，只說是本機 repository
         assert.deepEqual(
           opts.map((o) => [o.value, o.text, o.disabled]),
           [
-            ['__current', '(repository not in the list)', false],
+            ['__current', 'Local repository', false],
             ['', LOCAL_ONLY_TEXT, true],
           ],
         );
+        assert.equal(await addBtn(lp).count(), 0, 'LAN deep link: no ＋ button either');
+        assert.equal(await lp.locator('.web-add').count(), 0);
         await lp.screenshot({ path: resolve(artifacts, '12-lan-other-repo.png') });
         await lp.close();
       } finally {
@@ -4148,7 +4528,104 @@ try {
     });
 
   await step(
-    'other local repositories: no remote → no "Open on GitHub"; empty repo → empty state; not a git repo → error panel',
+    'LOCAL PICKER (fresh dev server, empty AGG_LOCAL_REPOS_FILE): ?local=<far-away id> says it does not know the repo; adding far-away’s absolute path with ＋ on that very page shows its graph right away (no stale error, no reload, same URL)',
+    async () => {
+      const p = await freePort();
+      const origin = `http://localhost:${p}`;
+      const file = stateFileOf('unknown-then-added');
+      writeFileSync(file, '{ "paths": [] }\n');
+      const side = startVite(['--port', String(p), '--strictPort'], {
+        ...env,
+        AGG_LOCAL_REPOS_FILE: file,
+      });
+      let pg;
+      try {
+        await side.ready;
+        pg = await ctx.newPage();
+        watchErrors(pg, 'unknown-then-added page');
+        // 這台 dev server 不認得 far-away（不在掃描範圍、檔案是空的）
+        await pg.goto(`${origin}/?local=${ids.far}`);
+        const panel = pg.locator('.agg-center[role="alert"]');
+        await panel.waitFor();
+        assert.match(await panel.innerText(), /does not know this local repository/);
+        assert.equal(await pg.locator('.agg-scroll').count(), 0, 'no list for an unknown repo');
+        await waitPickerHas(ids.beta, pg);
+        await waitPickerValue('__current', pg);
+        assert.deepEqual(
+          (await pickerOptions(pg)).map((o) => [o.value, o.selected]),
+          [
+            ['__current', true],
+            ['default', false],
+            [ids.beta, false],
+            [ids.gamma, false],
+          ],
+          'the menu: the placeholder for the current repo, then the scanned repos',
+        );
+        assert.equal(
+          (await pickerOptions(pg))[0].text,
+          '(repository not in the list)',
+          'the menu says the current repo is not in the list',
+        );
+        await pg.evaluate(() => (window.__alive = 'unknown far-away'));
+        const historyBefore = await pg.evaluate(() => history.length);
+
+        // 就在這個畫面上用 ＋ 加入 far-away 的絕對路徑（id 和網址裡的一樣）
+        await addBtn(pg).click();
+        await pathInput(pg).waitFor();
+        await pathInput(pg).fill(fx.far);
+        await pathInput(pg).press('Enter');
+        await pathInput(pg).waitFor({ state: 'detached' });
+        assert.equal(await pathError(pg).count(), 0, 'the path was accepted');
+        await waitPickerValue(ids.far, pg);
+        // 列表直接出現：不能還留著「不認得」的錯誤（同一個 id 也要重新向 dev server 要快照）
+        await waitShowsRepo(
+          fx.far,
+          'far-away right after adding its path on the unknown-repo page',
+          pg,
+        ).catch(async (err) => {
+          const stale = await pg
+            .locator('.agg-center')
+            .innerText()
+            .catch(() => '');
+          throw new Error(`${err.message}\n  the page still shows: ${stale || '(nothing)'}`);
+        });
+        await titleIs('far-away', pg);
+        assert.equal(
+          await pg.locator('.agg-center').count(),
+          0,
+          'the stale "does not know" error is gone',
+        );
+        assert.equal(searchOf(pg), `?local=${ids.far}`, 'the URL stays the same');
+        assert.equal(
+          await pg.evaluate(() => history.length),
+          historyBefore,
+          'no extra history entry (it is the repo already in the URL)',
+        );
+        assert.equal(
+          await pg.evaluate(() => window.__alive),
+          'unknown far-away',
+          'the page did not reload',
+        );
+        await waitUntil(
+          () => (readState(file)?.paths ?? []).length === 1,
+          10_000,
+          'the dev server remembers the added path',
+        );
+        assert.deepEqual(readState(file), { paths: [realpathSync(fx.far)] });
+        await assertNoPathsInBrowser([fx.far], pg, 'after adding the path of an unknown repo');
+        await replayDone(pg);
+        await graphSync('far-away added on the unknown-repo page', { pg, minRows: 3 });
+        await pg.screenshot({ path: resolve(artifacts, '12-unknown-then-added.png') });
+      } finally {
+        await pg?.close();
+        await stopVite(side);
+      }
+      await page.bringToFront();
+    },
+  );
+
+  await step(
+    'other local repositories: no remote → no "Open on GitHub"; empty repo → empty state; not a git repo → error panel with the localised explanation',
     async () => {
       const tmp = (name) => mkdtempSync(resolve(tmpdir(), `agg-web-e2e-${name}-`));
       const noRemote = tmp('noremote');
@@ -4218,9 +4695,16 @@ try {
         });
         await open(notRepo, async (pg) => {
           await pg.locator('.agg-center[role="alert"]').waitFor();
-          assert.match(
-            await pg.locator('.agg-center[role="alert"]').innerText(),
-            /not inside a git repository/,
+          const alertText = await pg.locator('.agg-center[role="alert"]').innerText();
+          assert.match(alertText, /not inside a git repository/);
+          // 快照帶 code: 'not_git'：畫面顯示在地化的說明（en-US），不是 dev server 的英文原文
+          assert.ok(
+            alertText.includes('This folder is not inside a git repository.'),
+            `the localised "not a git repo" text: ${alertText}`,
+          );
+          assert.ok(
+            !alertText.includes('The configured directory'),
+            `not the raw server message: ${alertText}`,
           );
           assert.equal(await pg.locator('.agg-scroll').count(), 0);
           // 錯誤訊息不含本機路徑
