@@ -28,11 +28,13 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
   偵測方式：逐層監看 `.git` 的 `HEAD` / `packed-refs` / `refs/**` 目錄（不用遞迴 `fs.watch`，它在 Linux 上第二次 commit 起就會漏事件），
   另有每 2 秒比對 ref 清單的安全網；git 暫時出錯時保留上一張好的圖，不會讓 dev server 掛掉。
 - **選擇本機 repo**（只有 dev server）：`📍 本機` 旁的選單列出預設 repo（★）與它**同層資料夾**裡的 git repo
-  （往下找 3 層；一般 repo、worktree、`*.git` bare repo 都算；略過 `node_modules`、`.` 開頭、`dist` / `build` 等資料夾，不跟隨 symlink、不往 repo 裡面找）。
+  （往下找 3 層；一般 repo、worktree、`*.git` bare repo 都算；不進入 `.` 開頭與 `node_modules` / `dist` / `build` 等資料夾（後者本身就是 repo 時仍會列出），不跟隨 symlink、不往 repo 裡面找）。
   選了之後網址變成 `/?local=<id>`（可加書籤、上一頁 / 下一頁可用），那個 repo 一樣即時更新
   （最多同時監看 4 個非預設 repo，最久沒看的先停；10 分鐘沒人看的也會停，再選到時重新開始）。
-  清單外的 repo：選「＋ 開啟其他路徑…」輸入**絕對路徑**（可用 `~`，repo 裡的子資料夾也可以）；
-  加入過的路徑由 dev server 記在 `apps/web/node_modules/.cache/adorable-git-graph/local-repos.json`（`AGG_LOCAL_REPOS_FILE` 可改位置），重開後仍在清單裡；要移除就編輯或刪掉這個檔案。
+  清單外的 repo：按選單旁的 `＋`（開啟其他路徑…）輸入**絕對路徑**（可用 `~`，repo 裡的子資料夾或 `.git` 也可以）；
+  加入過的路徑由 dev server 記在使用者的 state 目錄：`~/.local/state/adorable-git-graph/local-repos-<專案雜湊>.json`
+  （`$XDG_STATE_HOME`；Windows 為 `%LOCALAPPDATA%\adorable-git-graph\`；`AGG_LOCAL_REPOS_FILE` 可改位置），重開後仍在清單裡；要移除就編輯或刪掉這個檔案。
+  選單可以用鍵盤上下瀏覽：停下來（或按 Enter）才會切換，不會每經過一個 repo 就讀一次。
   回到這個分頁時清單會重新掃描（剛 `git clone` 的 repo 會出現）。
 - 標題列下方的 `📍 本機 | 🐙 GitHub`：切到 GitHub 後輸入 `owner/repo` 或 GitHub 網址（也可直接開 `/?repo=owner/repo`），
   從瀏覽器直接呼叫 GitHub REST API（與 extension 同一套 `fetchGitHubGraph`），結果快取 10 分鐘。
@@ -53,6 +55,7 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
 > 唯一的例外是「開啟其他路徑」：那是使用者自己輸入的路徑，server 只接受同源頁面送來的 `application/json` POST（跨站表單 / no-cors 請求送不出，fetch 會被 CORS preflight 擋下），
 > 不接受 Windows 的 UNC / 裝置路徑，路徑也不存放在瀏覽器（`localhost:<port>` 這個 origin 會被其他專案的 dev server 共用）。
 > repo 清單、手動加入路徑與「預設以外」的 repo 只回應**這台電腦**的連線：`pnpm start -- --host` 讓手機連進來時，其他裝置只看得到預設 repo（它本來就在 bundle 裡）；
+> 記錄路徑的檔案也放在專案外（Vite 不會把它當靜態檔案提供）。注意：經由 tunnel / reverse proxy 轉進 localhost 的連線，在 dev server 看來就是這台電腦；
 > HMR 會廣播給所有連線，所以其他 repo 的更新只送「有變」的通知，內容要經由只回應本機的 endpoint 拿。
 > 掃描只檢查資料夾裡有沒有 `.git`，不會在清單上的每個 repo 執行 git；只有你選了某個 repo，dev server 才會在那裡執行唯讀的 git 指令（等同你自己在那裡打 `git log`）。
 > git 一律以 PATH 裡的**絕對路徑**執行：repo 裡放了一個 `git` / `git.exe` 也不會被執行（Windows 會先在工作目錄找執行檔，所以不能直接用 `git` 這個名字）。
