@@ -119,8 +119,9 @@ export function findGit(): string | null {
 }
 
 /**
- * 這些變數會蓋過「從 cwd 找 repo」：dev server 若繼承了它們（從 git hook 啟動、shell 為 dotfiles 匯出 GIT_DIR…），
- * 選單裡每個 repo 都會變成同一個。
+ * 指向「某一個 repo」的變數（git 自己的清單：`git rev-parse --local-env-vars`）：dev server 若繼承了它們
+ * （從 git hook 啟動、shell 為 dotfiles 匯出 GIT_DIR…），選單裡每個 repo 都會變成同一個。
+ * GIT_CEILING_DIRECTORIES 之類限制「往上找」的設定是使用者刻意的，保留。
  */
 const REPO_LOCATING_ENV = [
   'GIT_DIR',
@@ -131,8 +132,9 @@ const REPO_LOCATING_ENV = [
   'GIT_ALTERNATE_OBJECT_DIRECTORIES',
   'GIT_NAMESPACE',
   'GIT_PREFIX',
-  'GIT_CEILING_DIRECTORIES',
-  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_IMPLICIT_WORK_TREE',
+  'GIT_SHALLOW_FILE',
+  'GIT_GRAFT_FILE',
 ];
 
 function gitEnv(): NodeJS.ProcessEnv {
@@ -146,8 +148,9 @@ function gitEnv(): NodeJS.ProcessEnv {
 async function git(cwd: string, args: string[]): Promise<string> {
   const bin = findGit();
   if (!bin) throw Object.assign(new Error('git is not installed'), { code: 'ENOENT' });
-  const { stdout } = await execFileAsync(bin, args, {
-    cwd,
+  // `-C` 而不是 spawn 的 cwd：spawn 會等子行程 chdir 完才回來，目錄在卡住的網路磁碟上時整個 dev server 會跟著停住；
+  // 交給 git 自己 chdir，卡住的只有那個子行程（60 秒後被砍掉）
+  const { stdout } = await execFileAsync(bin, ['-C', cwd, ...args], {
     maxBuffer: 256 * 1024 * 1024,
     // 網路磁碟卡住等：不要讓 git 子行程與等待中的請求永遠掛著
     timeout: 60_000,
@@ -191,23 +194,28 @@ async function resolveRepo(repoDir: string): Promise<{ dir: string; name: string
   // bare：.../project.git；在 .git 內：.../project/.git
   const named = basename(gitDir) === '.git' ? dirname(gitDir) : gitDir;
   const name = basename(named).replace(/\.git$/, '') || 'repository';
+  // linked worktree 的 git 目錄（<main>/.git/worktrees/<wt>、<bare>.git/worktrees/<wt>）：gitdir 檔記著工作樹的 .git。
+  // 要在 bare 判斷之前：main 是 bare repo 時，共用設定的 core.bare=true 會讓這裡也被當成 bare
+  const [linked, common] = await Promise.all(
+    ['gitdir', 'commondir'].map((file) =>
+      readFile(join(gitDir, file), 'utf8').then(
+        (s) => s.trim(),
+        () => '',
+      ),
+    ),
+  );
+  if (linked && common) {
+    const top = await gitOrUndefined(dirname(resolve(gitDir, linked)), [
+      'rev-parse',
+      '--show-toplevel',
+    ]);
+    if (top) return { dir: top, name: basename(top) };
+  }
   // 指到 git 目錄裡面（<repo>/.git、<bare>.git/refs…）時回傳 repo 本身的位置：清單與 id 才不會重複
   const bare = (await gitOrUndefined(repoDir, ['rev-parse', '--is-bare-repository'])) === 'true';
   if (bare) return { dir: gitDir, name };
   if (basename(gitDir) === '.git') {
     const top = await gitOrUndefined(dirname(gitDir), ['rev-parse', '--show-toplevel']);
-    if (top) return { dir: top, name: basename(top) };
-  }
-  // linked worktree 的 git 目錄（<main>/.git/worktrees/<wt>）：gitdir 檔記著工作樹的 .git
-  const linked = await readFile(join(gitDir, 'gitdir'), 'utf8').then(
-    (s) => s.trim(),
-    () => '',
-  );
-  if (linked) {
-    const top = await gitOrUndefined(dirname(resolve(gitDir, linked)), [
-      'rev-parse',
-      '--show-toplevel',
-    ]);
     if (top) return { dir: top, name: basename(top) };
   }
   // 其他非 bare 的 git 目錄（--separate-git-dir 等）：用 git 目錄本身，裡面任何路徑都收斂成同一筆
@@ -228,12 +236,18 @@ export async function readGitSnapshot(
     generatedAt,
     ...(transient ? { transient: true } : {}),
   });
-  // 非同步：使用者選的路徑可能在卡住的網路磁碟上，同步的 stat 會讓整個 dev server 停住
-  const exists = await stat(repoDir).then(
-    () => true,
-    (err: { code?: string }) => err.code !== 'ENOENT' && err.code !== 'ENOTDIR',
-  );
-  if (!exists) return fail('The configured repository directory does not exist.', 'missing_dir');
+  // 非同步且有時限：使用者選的路徑可能在卡住的網路磁碟上
+  const probe = stalledDirs.has(repoDir)
+    ? 'timeout'
+    : await within(repoDir, stat(repoDir), STALL_MS).then(
+        (r) => (r === 'timeout' ? 'timeout' : 'ok'),
+        (err: { code?: string }) =>
+          err.code === 'ENOENT' || err.code === 'ENOTDIR' ? 'missing' : 'ok',
+      );
+  if (probe === 'missing')
+    return fail('The configured repository directory does not exist.', 'missing_dir');
+  if (probe === 'timeout')
+    return fail('The repository folder is not responding (a network drive?).', 'git_error', true);
 
   try {
     const { dir, name } = await resolveRepo(repoDir);
@@ -533,6 +547,7 @@ export async function discoverRepos(
   }
   const found = new Set<string>();
   const seen = new Set<string>();
+  const listed = new Set<string>();
   for (let i = 0; i < queue.length; i++) {
     const ms = budget();
     if (seen.size >= maxDirs || found.size >= maxRepos || !ms) {
@@ -540,12 +555,20 @@ export async function discoverRepos(
       break;
     }
     const { dir, depth, listOnly } = queue[i]!;
-    if (seen.has(dir)) continue;
-    seen.add(dir);
+    if (seen.has(dir) || listed.has(dir)) continue;
     if (stalledDirs.has(dir)) {
       truncated = true;
       continue;
     }
+    if (listOnly) {
+      // 只看 <dir>/.git 在不在（不讀整個 node_modules / vendor，也不算進 maxDirs）
+      listed.add(dir);
+      const git = await within(dir, stat(join(dir, '.git')), ms).catch(() => null);
+      if (git === 'timeout') truncated = true;
+      else if (git && found.size < maxRepos) found.add(dir);
+      continue;
+    }
+    seen.add(dir);
     const entries = await within(dir, readdir(dir, { withFileTypes: true }), ms).catch(() => null);
     if (entries === 'timeout') truncated = true;
     if (!entries || entries === 'timeout') continue;
@@ -553,7 +576,7 @@ export async function discoverRepos(
       found.add(dir);
       continue;
     }
-    if (listOnly || depth >= maxDepth) continue;
+    if (depth >= maxDepth) continue;
     for (const e of entries) {
       // Dirent.isDirectory() 對 symlink 是 false：不會被連結帶到範圍外或繞圈
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
@@ -602,6 +625,9 @@ class RepoSession {
   private inflight: Promise<void> | undefined;
   private again = false;
   private stopped = false;
+  /** 監看已經裝好了（start 時 repo 還打不開，例如 safe.directory，就要等能讀了再裝一次） */
+  private watching = false;
+  private starting: Promise<void> | undefined;
   private teardown: () => void = () => {};
   readonly dir: string;
   private readonly hooks: SessionHooks;
@@ -640,6 +666,7 @@ class RepoSession {
         do {
           this.again = false;
           const snap = await this.read();
+          if (snap.graph && !this.watching && !this.stopped && this.startedOnce) void this.start();
           const next = snapshotKey(snap);
           if (next === this.key) continue;
           const first = this.key === undefined;
@@ -655,8 +682,18 @@ class RepoSession {
     return this.inflight;
   }
 
-  /** 監看 .git（HEAD、packed-refs、refs/**），外加輪詢 ref 簽章的安全網。 */
-  async start(): Promise<void> {
+  private startedOnce = false;
+
+  /** 監看 .git（HEAD、packed-refs、refs/**），外加輪詢 ref 簽章的安全網。可以重複呼叫：裝好了就什麼都不做。 */
+  start(): Promise<void> {
+    this.startedOnce = true;
+    if (this.watching || this.stopped) return Promise.resolve();
+    return (this.starting ??= this.startOnce().finally(() => {
+      this.starting = undefined;
+    }));
+  }
+
+  private async startOnce(): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
     let poll: NodeJS.Timeout | undefined;
     let stopWatching = () => {};
@@ -682,6 +719,7 @@ class RepoSession {
       ];
       if (this.stopped) return;
       stopWatching = watchGitRefs(dirs, onChange);
+      this.watching = true;
 
       // 安全網：檔案監看可能漏事件（網路磁碟、inotify 上限…），偶爾比對一次 ref 簽章
       // 一次只跑一輪：上一輪的 git 還沒回來（網路磁碟很慢）就不要再疊新的行程
@@ -890,15 +928,25 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
           (dir): dir is string =>
             typeof dir === 'string' && isAbsolute(dir) && !isRemotePath(dir) && dir !== defaultDir,
         );
-        // 已經不存在的就不列了；網路磁碟卡住的照列（等一下下就好，不能讓 dev server 啟動卡住）
-        const alive = await Promise.all(
-          dirs.map((dir) =>
-            within(dir, stat(dir), 500).then(
-              () => true,
-              (err: { code?: string }) => err.code !== 'ENOENT' && err.code !== 'ENOTDIR',
-            ),
-          ),
-        );
+        // 已經不存在的就不列了。一個一個檢查、總共最多等 1 秒，碰到第一個卡住的就停（剩下的照列）：
+        // 卡住的 stat 會一直佔著 libuv 執行緒，不能讓它吃掉掃描的額度或 Vite 讀檔要用的執行緒
+        const alive: boolean[] = [];
+        const until = Date.now() + 1000;
+        let checking = true;
+        for (const dir of dirs) {
+          const left = Math.min(500, until - Date.now());
+          if (!checking || left <= 0 || stalledDirs.size >= MAX_STALLED - 1) {
+            alive.push(true);
+            continue;
+          }
+          const result = await within(dir, stat(dir), left).then(
+            (r) => (r === 'timeout' ? 'timeout' : 'ok'),
+            (err: { code?: string }) =>
+              err.code === 'ENOENT' || err.code === 'ENOTDIR' ? 'gone' : 'ok',
+          );
+          if (result === 'timeout') checking = false;
+          alive.push(result !== 'gone');
+        }
         dirs.forEach((dir, i) => {
           if (!alive[i]) return;
           const entry = entryFor(dir);

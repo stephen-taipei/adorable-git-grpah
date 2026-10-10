@@ -147,8 +147,10 @@ body {
   color: var(--agg-ink);
   background: #ffd9de;
   border: 3px solid var(--agg-ink);
-  border-radius: 999px;
+  /* 訊息可能換好幾行（safe.directory 的指令要能複製）：不用膠囊形狀 */
+  border-radius: 14px;
   max-width: 100%;
+  user-select: text;
 }
 
 .web-go[aria-disabled='true'],

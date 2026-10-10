@@ -149,6 +149,10 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
   const settle = useRef<number | undefined>(undefined);
   const currentRef = useRef(current);
   currentRef.current = current;
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
+  /** 卸載後才回來的「加入路徑」結果不能再切換畫面（不用 addSeq：Fast Refresh 重跑 effect 時不算卸載） */
+  const alive = useRef(true);
 
   const reload = useCallback(async () => {
     const seq = ++listSeq.current;
@@ -159,14 +163,15 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
   }, []);
 
   useEffect(() => {
+    alive.current = true;
     void reload();
     // 回到這個分頁時（例如剛在終端機 clone / git init 了新的 repo）更新清單
     const onFocus = () => void reload();
     window.addEventListener('focus', onFocus);
     return () => {
+      alive.current = false;
       window.removeEventListener('focus', onFocus);
       window.clearTimeout(settle.current);
-      addSeq.current++; // 卸載後才回來的「加入路徑」結果不能再切換畫面
     };
   }, [reload]);
 
@@ -193,19 +198,25 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
     selectRef.current?.focus();
   };
 
-  const submit = async (e: FormEvent) => {
+  const submit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (busy || !path.trim()) return;
+    const form = e.currentTarget;
+    // 等待期間使用者可能已經去做別的事（點了 commit、在搜尋框打字）：焦點還在表單（或掉到 body）才移動它
+    const focusIsOurs = () => {
+      const active = document.activeElement;
+      return !active || active === document.body || form.contains(active);
+    };
     const seq = ++addSeq.current;
     const before = currentRef.current;
     setBusy(true);
     setError(null);
     const result = await addLocalRepo(path);
-    if (seq !== addSeq.current) return; // 取消了 / 卸載了（cancel 已經把 busy 收掉）
+    if (!alive.current || seq !== addSeq.current) return; // 卸載了 / 取消了（cancel 已經把 busy 收掉）
     setBusy(false);
     if (!result.ok) {
       setError(t.pathErrors[result.error]);
-      inputRef.current?.focus();
+      if (focusIsOurs()) inputRef.current?.focus();
       return;
     }
     const repo = result.repo;
@@ -215,12 +226,12 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
         ? { ...prev, repos: [...prev.repos, repo] }
         : prev,
     );
-    selectRef.current?.focus();
+    if (focusIsOurs()) selectRef.current?.focus();
     setAdding(false);
     setPath('');
     void reload();
-    // 等待期間使用者已經換到別的 repo：尊重他的選擇，不切換
-    if (currentRef.current !== before) return;
+    // 等待期間使用者已經換到（或正用鍵盤瀏覽到）別的 repo：尊重他的選擇，不切換
+    if (currentRef.current !== before || pendingRef.current !== null) return;
     // 同一個 id 也要「導覽」一次：網址不變（不多一筆歷史），但畫面會重抓（例如原本顯示「不認得這個 repo」）
     onPick(repo.id);
   };

@@ -1381,6 +1381,8 @@
   max-width: 420px;
   font-size: 14px;
   color: var(--agg-muted);
+  /* 錯誤說明裡可能有要複製的指令（例如 git config safe.directory） */
+  user-select: text;
 }
 
 .agg-row {

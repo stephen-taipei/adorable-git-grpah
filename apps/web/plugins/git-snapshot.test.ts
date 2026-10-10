@@ -968,6 +968,59 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     }
   });
 
+  it('a worktree of a bare repo maps back to the worktree (not the admin dir)', async () => {
+    const r = makeRoot();
+    const bare = join(r.base, 'hub.git');
+    git(r.base, 'clone', '-q', '--bare', r.beta, bare);
+    const wt = join(r.base, 'hub-wt');
+    git(bare, 'worktree', 'add', '-q', wt, '-b', 'from-bare');
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const admin = join(bare, 'worktrees', 'hub-wt');
+      expect((await p.addPath(admin)).json().repo).toMatchObject({
+        id: repoIdFor(wt),
+        name: 'hub-wt',
+      });
+      expect((await p.addPath(join(bare, 'refs'))).json().repo.id).toBe(repoIdFor(bare));
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('keeps the user GIT_CEILING_DIRECTORIES (a folder under a ceiling is not swallowed by a repo above it)', async () => {
+    const r = makeRoot();
+    const inner = join(r.alpha, 'not-a-repo');
+    mkdirSync(inner);
+    const saved = process.env['GIT_CEILING_DIRECTORIES'];
+    process.env['GIT_CEILING_DIRECTORIES'] = r.alpha;
+    try {
+      expect((await readGitSnapshot(inner)).code).toBe('not_git');
+    } finally {
+      if (saved === undefined) delete process.env['GIT_CEILING_DIRECTORIES'];
+      else process.env['GIT_CEILING_DIRECTORIES'] = saved;
+    }
+  });
+
+  it('starts watching once a repo that could not be opened becomes readable (e.g. after git init / safe.directory)', async () => {
+    const r = makeRoot();
+    const later = join(r.base, 'later');
+    mkdirSync(join(later, '.git'), { recursive: true }); // 掃描看得到（有 .git），但還不是 repo
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const id = repoIdFor(later);
+      expect((await p.snapshotOf(id)).json().code).toBe('not_git');
+      rmSync(join(later, '.git'), { recursive: true, force: true });
+      git(later, 'init', '-q', '-b', 'main');
+      commit(later, 'l1');
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(1);
+      await sleep(300); // 監看是在背景裝上的
+      commit(later, 'l2');
+      await waitFor(() => p.sent.some((m) => m.data.repo === id), 8000);
+    } finally {
+      await p.close();
+    }
+  });
+
   it('ignores an inherited GIT_DIR / GIT_WORK_TREE (each repo is read from its own folder)', async () => {
     const r = makeRoot();
     const saved = { dir: process.env['GIT_DIR'], tree: process.env['GIT_WORK_TREE'] };
