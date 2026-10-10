@@ -587,6 +587,7 @@ try {
         winTop: Number(d.winTop),
         hostTop: hostR.top - log.top,
         hostHeight: hostR.height,
+        trackHeight: log.height,
         replay: d.replay,
         rows,
       };
@@ -651,11 +652,13 @@ try {
       if (geom.rows.length < minRows)
         problems.push(`only ${geom.rows.length} fully visible rows (need ≥ ${minRows})`);
       // canvas 視窗要涵蓋整個可視範圍，並且位置和 data-win-top 一致
+      // （列表比畫面短時，視窗只到內容底部為止：planWindow 會把高度夾在捲動內容的高度）
       if (geom.winTop > geom.scrollTop + 0.5)
         problems.push(`canvas window starts at ${geom.winTop}, below scrollTop ${geom.scrollTop}`);
-      if (geom.winTop + geom.hostHeight < geom.scrollTop + geom.clientHeight - 0.5)
+      const wantBottom = Math.min(geom.scrollTop + geom.clientHeight, Math.floor(geom.trackHeight));
+      if (geom.winTop + geom.hostHeight < wantBottom - 0.5)
         problems.push(
-          `canvas window ends at ${geom.winTop + geom.hostHeight}, above the viewport bottom ${geom.scrollTop + geom.clientHeight}`,
+          `canvas window ends at ${geom.winTop + geom.hostHeight}, above ${wantBottom} (viewport bottom ${geom.scrollTop + geom.clientHeight}, track ${geom.trackHeight})`,
         );
       if (Math.abs(geom.hostTop - geom.winTop) > 1)
         problems.push(`canvas host top ${geom.hostTop} ≠ data-win-top ${geom.winTop}`);
