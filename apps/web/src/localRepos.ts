@@ -6,10 +6,17 @@ import type { GitSnapshot, LocalRepo, ReposResponse } from './protocol';
  * 手動加入的路徑由 dev server 自己記（不放在瀏覽器：localhost:<port> 這個 origin 會被其他專案的 dev server 共用）。
  */
 
-export type AddRepoError = 'invalid_path' | 'not_absolute' | 'not_found' | 'not_git' | 'failed';
+export type AddRepoError =
+  'invalid_path' | 'not_absolute' | 'not_found' | 'not_git' | 'unsafe_repo' | 'failed';
 export type AddRepoResult = { ok: true; repo: LocalRepo } | { ok: false; error: AddRepoError };
 
-const ADD_ERRORS = new Set<string>(['invalid_path', 'not_absolute', 'not_found', 'not_git']);
+const ADD_ERRORS = new Set<string>([
+  'invalid_path',
+  'not_absolute',
+  'not_found',
+  'not_git',
+  'unsafe_repo',
+]);
 
 /** dev server 只回應這台電腦的請求（`vite --host` 時，用手機等其他裝置開的畫面不能選其他 repo）。 */
 export const LOCAL_ONLY = 'local_only';

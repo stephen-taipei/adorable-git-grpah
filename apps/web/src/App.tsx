@@ -31,7 +31,8 @@ export function App() {
   const [source, navigate] = useSource();
   // 最近一次看的本機 repo（從 GitHub 切回本機時回到它）
   const lastLocal = useRef<Source>({ kind: 'local' });
-  if (source.kind === 'local') lastLocal.current = source;
+  // 靜態建置只有預設 repo：網址裡的 ?local= 不用帶回去
+  if (source.kind === 'local') lastLocal.current = import.meta.env.DEV ? source : { kind: 'local' };
   const [theme, setTheme] = useStored('agg.theme', 'auto', isThemeSetting);
   const [token, setToken] = useState(() => readStored(TOKEN_KEY) ?? '');
   const [tokenOpen, setTokenOpen] = useState(false);

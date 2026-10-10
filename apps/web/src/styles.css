@@ -152,10 +152,12 @@ body {
 }
 
 .web-go[aria-disabled='true'],
-.web-go[aria-disabled='true']:hover {
+.web-go[aria-disabled='true']:hover,
+.web-go[aria-disabled='true']:active {
   cursor: default;
   opacity: 0.55;
   transform: none;
+  box-shadow: 0 3px 0 var(--agg-ink);
 }
 
 .web-go,
@@ -163,6 +165,7 @@ body {
   appearance: none;
   margin: 0;
   padding: 4px 16px;
+  white-space: nowrap;
   font: inherit;
   font-size: 13px;
   font-weight: 900;

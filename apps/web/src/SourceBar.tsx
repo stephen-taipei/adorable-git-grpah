@@ -201,8 +201,7 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
     setBusy(true);
     setError(null);
     const result = await addLocalRepo(path);
-    // 取消了、卸載了、或等待期間使用者已經換到別的 repo：不要再切換
-    if (seq !== addSeq.current || currentRef.current !== before) return;
+    if (seq !== addSeq.current) return; // 取消了 / 卸載了（cancel 已經把 busy 收掉）
     setBusy(false);
     if (!result.ok) {
       setError(t.pathErrors[result.error]);
@@ -220,7 +219,10 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
     setAdding(false);
     setPath('');
     void reload();
-    if (repo.id !== currentRef.current) onPick(repo.id);
+    // 等待期間使用者已經換到別的 repo：尊重他的選擇，不切換
+    if (currentRef.current !== before) return;
+    // 同一個 id 也要「導覽」一次：網址不變（不多一筆歷史），但畫面會重抓（例如原本顯示「不認得這個 repo」）
+    onPick(repo.id);
   };
 
   return (

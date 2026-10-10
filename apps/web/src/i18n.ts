@@ -31,6 +31,8 @@ const zh = {
     not_absolute: '請輸入絕對路徑（可以用 ~ 代表家目錄）。',
     not_found: '找不到這個資料夾。',
     not_git: '這個資料夾不在 git repository 裡。',
+    unsafe_repo:
+      'git 拒絕開啟這個 repository：它屬於另一個使用者（請用 git config --global --add safe.directory <路徑> 信任它）。',
     failed: '無法開啟（dev server 沒有回應）。',
   },
   localUnknown:
@@ -42,7 +44,9 @@ const zh = {
     missing_dir: '找不到這個 repository 的資料夾（可能已移動或刪除）。',
     not_git: '這個資料夾不在 git repository 裡。',
     no_git: '找不到 git：請確認已安裝 git，而且在 PATH 裡。',
-    git_error: '無法讀取 git 歷史（git 回報錯誤），稍後會自動重試。',
+    unsafe_repo:
+      'git 拒絕開啟這個 repository：它屬於另一個使用者（請用 git config --global --add safe.directory <路徑> 信任它）。',
+    git_error: '無法讀取 git 歷史（git 回報錯誤）。詳細原因請看執行 dev server 或建置的終端機。',
   } as Record<string, string>,
 };
 
@@ -77,6 +81,8 @@ const en: typeof zh = {
     not_absolute: 'Enter an absolute path (~ for your home folder works).',
     not_found: 'That folder does not exist.',
     not_git: 'That folder is not inside a git repository.',
+    unsafe_repo:
+      'Git refuses to open this repository because it belongs to another user (trust it with: git config --global --add safe.directory <path>).',
     failed: 'Could not open it (the dev server did not respond).',
   },
   localUnknown:
@@ -90,8 +96,10 @@ const en: typeof zh = {
       'The folder of this repository does not exist (it may have been moved or deleted).',
     not_git: 'This folder is not inside a git repository.',
     no_git: 'git was not found: make sure it is installed and on your PATH.',
+    unsafe_repo:
+      'Git refuses to open this repository because it belongs to another user (trust it with: git config --global --add safe.directory <path>).',
     git_error:
-      'Could not read the git history (git reported an error); it will retry automatically.',
+      'Could not read the git history (git reported an error). The details are in the terminal running the dev server or the build.',
   },
 };
 

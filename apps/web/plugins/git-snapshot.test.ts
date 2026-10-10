@@ -10,7 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -419,6 +419,23 @@ describe('watchGitRefs (regression: live updates must keep working after the fir
       await expectEvent('only the ref inside after pack-refs', () =>
         git(dir, 'update-ref', 'refs/heads/feat/c', git(dir, 'rev-parse', 'HEAD~1')),
       );
+    } finally {
+      stop();
+    }
+  });
+
+  it('still watches when <gitDir>/refs itself is a symlink (git-new-workdir layouts), but never below it', async () => {
+    const dir = tmp('agg-watch-linkedrefs-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const shared = tmp('agg-watch-sharedrefs-');
+    execFileSync('mv', [join(dir, '.git', 'refs'), join(shared, 'refs')]);
+    symlinkSync(join(shared, 'refs'), join(dir, '.git', 'refs'));
+    let calls = 0;
+    const stop = watchGitRefs([join(dir, '.git')], () => calls++);
+    try {
+      git(dir, 'branch', 'feat/linked');
+      await waitFor(() => calls > 0, 4000);
     } finally {
       stop();
     }
@@ -929,6 +946,44 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     }
   });
 
+  it('paths inside a linked worktree or a separate git dir collapse to one entry', async () => {
+    const r = makeRoot();
+    const wt = join(r.base, 'beta-wt');
+    git(r.beta, 'worktree', 'add', '-q', wt, '-b', 'wt-branch');
+    const sep = join(r.base, 'sep-store');
+    const sepWork = join(r.base, 'sep-work');
+    mkdirSync(sepWork);
+    git(sepWork, 'init', '-q', '-b', 'main', '--separate-git-dir', sep);
+    commit(sepWork, 's1');
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const wtGitDir = join(r.beta, '.git', 'worktrees', 'beta-wt');
+      expect((await p.addPath(wtGitDir)).json().repo).toMatchObject({ id: repoIdFor(wt) });
+      expect((await p.addPath(join(wtGitDir, 'logs'))).json().repo.id).toBe(repoIdFor(wt));
+      const a = (await p.addPath(join(sep, 'refs'))).json().repo.id;
+      expect((await p.addPath(join(sep, 'refs', 'heads'))).json().repo.id).toBe(a);
+      expect((await p.addPath(sep)).json().repo.id).toBe(a);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('ignores an inherited GIT_DIR / GIT_WORK_TREE (each repo is read from its own folder)', async () => {
+    const r = makeRoot();
+    const saved = { dir: process.env['GIT_DIR'], tree: process.env['GIT_WORK_TREE'] };
+    process.env['GIT_DIR'] = join(r.gamma, '.git');
+    process.env['GIT_WORK_TREE'] = r.gamma;
+    try {
+      expect((await readGitSnapshot(r.beta)).graph!.commits).toHaveLength(3);
+      expect((await readGitSnapshot(r.alpha)).graph!.commits).toHaveLength(2);
+    } finally {
+      if (saved.dir === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved.dir;
+      if (saved.tree === undefined) delete process.env['GIT_WORK_TREE'];
+      else process.env['GIT_WORK_TREE'] = saved.tree;
+    }
+  });
+
   it('AGG_DEFAULT_BRANCH / defaultBranch only applies to the default repo', async () => {
     const r = makeRoot();
     git(r.beta, 'branch', 'develop');
@@ -1083,13 +1138,18 @@ describe('defaultStateFile', () => {
     const saved = process.env['XDG_STATE_HOME'];
     process.env['XDG_STATE_HOME'] = '/state-home';
     try {
-      const a = defaultStateFile('/work/app-a');
+      const a = defaultStateFile('/work/app-a') as string;
       expect(a.startsWith('/state-home/adorable-git-graph/local-repos-')).toBe(
         process.platform !== 'win32',
       );
       expect(a).not.toContain('/work/app-a');
       expect(defaultStateFile('/work/app-b')).not.toBe(a);
       expect(defaultStateFile('/work/app-a/')).toBe(a);
+      // 相對的 XDG_STATE_HOME 不算（會變成相對於 cwd = Vite 的 root）：退回家目錄底下
+      process.env['XDG_STATE_HOME'] = '.local/state';
+      const fallback = defaultStateFile('/work/app-a') as string;
+      expect(isAbsolute(fallback)).toBe(true);
+      expect(fallback.startsWith(homedir())).toBe(true);
     } finally {
       if (saved === undefined) delete process.env['XDG_STATE_HOME'];
       else process.env['XDG_STATE_HOME'] = saved;

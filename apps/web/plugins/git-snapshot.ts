@@ -1,14 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import {
-  accessSync,
-  constants,
-  existsSync,
-  lstatSync,
-  readdirSync,
-  statSync,
-  watch,
-} from 'node:fs';
+import { accessSync, constants, lstatSync, readdirSync, statSync, watch } from 'node:fs';
 import type { Dirent, FSWatcher } from 'node:fs';
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -79,11 +71,15 @@ export interface SnapshotOptions {
  * 預設的 state 檔位置。不能放在專案裡（例如 node_modules/.cache）：那在 Vite 的 root / fs.allow 底下，
  * `vite --host` 時區網裡的裝置可以直接把它當靜態檔案讀走。
  */
-export function defaultStateFile(root: string): string {
+export function defaultStateFile(root: string): string | false {
+  // 相對路徑一律不算（XDG 規範也這麼要求）：會變成相對於 cwd，也就是 Vite 的 root
+  const abs = (p: string | undefined) => (p && isAbsolute(p) ? p : undefined);
+  const home = abs(homedir());
   const base =
     process.platform === 'win32'
-      ? (process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'))
-      : process.env['XDG_STATE_HOME'] || join(homedir(), '.local', 'state');
+      ? (abs(process.env['LOCALAPPDATA']) ?? (home && join(home, 'AppData', 'Local')))
+      : (abs(process.env['XDG_STATE_HOME']) ?? (home && join(home, '.local', 'state')));
+  if (!base) return false; // 沒有安全的位置：不記
   const project = createHash('sha256').update(resolve(root)).digest('hex').slice(0, 12);
   return join(base, 'adorable-git-graph', `local-repos-${project}.json`);
 }
@@ -122,6 +118,30 @@ export function findGit(): string | null {
   return bin;
 }
 
+/**
+ * 這些變數會蓋過「從 cwd 找 repo」：dev server 若繼承了它們（從 git hook 啟動、shell 為 dotfiles 匯出 GIT_DIR…），
+ * 選單裡每個 repo 都會變成同一個。
+ */
+const REPO_LOCATING_ENV = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_COMMON_DIR',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_NAMESPACE',
+  'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+];
+
+function gitEnv(): NodeJS.ProcessEnv {
+  // 唯讀操作也避免 index 鎖，LC_ALL 讓輸出格式（含錯誤訊息）穩定
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' };
+  for (const name of REPO_LOCATING_ENV) delete env[name];
+  return env;
+}
+
 /** 不經 shell（execFile），參數全是我們組出來的 ref 名稱，不會被當成選項。 */
 async function git(cwd: string, args: string[]): Promise<string> {
   const bin = findGit();
@@ -131,8 +151,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
     maxBuffer: 256 * 1024 * 1024,
     // 網路磁碟卡住等：不要讓 git 子行程與等待中的請求永遠掛著
     timeout: 60_000,
-    // 唯讀操作也避免 index 鎖，LC_ALL 讓輸出格式穩定
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+    env: gitEnv(),
   });
   return stdout;
 }
@@ -157,8 +176,14 @@ async function resolveRepo(repoDir: string): Promise<{ dir: string; name: string
     const top = (await git(repoDir, ['rev-parse', '--show-toplevel'])).trim();
     return { dir: top, name: basename(top) };
   } catch (err) {
-    if ((err as { code?: string }).code === 'ENOENT')
-      throw new SnapshotError('git is not installed', 'no_git');
+    // ENOENT 也可能是 cwd 剛好不見了：只有真的找不到 git 才說沒安裝
+    if (findGit() === null) throw new SnapshotError('git is not installed', 'no_git');
+    // git ≥ 2.35.2 拒絕別的使用者擁有的 repo（外接硬碟、WSL / Docker 掛載…）。不要自己加 safe.directory：那是在防 repo 裡的設定
+    if (/detected dubious ownership/.test(String((err as { stderr?: unknown }).stderr ?? '')))
+      throw new SnapshotError(
+        'Git refused to open this repository because it is owned by another user (see git config safe.directory).',
+        'unsafe_repo',
+      );
   }
   const gitDir = await gitOrUndefined(repoDir, ['rev-parse', '--absolute-git-dir']);
   if (!gitDir)
@@ -173,7 +198,20 @@ async function resolveRepo(repoDir: string): Promise<{ dir: string; name: string
     const top = await gitOrUndefined(dirname(gitDir), ['rev-parse', '--show-toplevel']);
     if (top) return { dir: top, name: basename(top) };
   }
-  return { dir: repoDir, name };
+  // linked worktree 的 git 目錄（<main>/.git/worktrees/<wt>）：gitdir 檔記著工作樹的 .git
+  const linked = await readFile(join(gitDir, 'gitdir'), 'utf8').then(
+    (s) => s.trim(),
+    () => '',
+  );
+  if (linked) {
+    const top = await gitOrUndefined(dirname(resolve(gitDir, linked)), [
+      'rev-parse',
+      '--show-toplevel',
+    ]);
+    if (top) return { dir: top, name: basename(top) };
+  }
+  // 其他非 bare 的 git 目錄（--separate-git-dir 等）：用 git 目錄本身，裡面任何路徑都收斂成同一筆
+  return { dir: gitDir, name };
 }
 
 export async function readGitSnapshot(
@@ -190,8 +228,12 @@ export async function readGitSnapshot(
     generatedAt,
     ...(transient ? { transient: true } : {}),
   });
-  if (!existsSync(repoDir))
-    return fail('The configured repository directory does not exist.', 'missing_dir');
+  // 非同步：使用者選的路徑可能在卡住的網路磁碟上，同步的 stat 會讓整個 dev server 停住
+  const exists = await stat(repoDir).then(
+    () => true,
+    (err: { code?: string }) => err.code !== 'ENOENT' && err.code !== 'ENOTDIR',
+  );
+  if (!exists) return fail('The configured repository directory does not exist.', 'missing_dir');
 
   try {
     const { dir, name } = await resolveRepo(repoDir);
@@ -334,10 +376,11 @@ export function watchGitRefs(
     }
   };
 
-  const watchTree = (dir: string, replace = false) => {
-    // 只走真的目錄：git 不會在 refs 底下建 symlink，跟著連結走可能把整個磁碟同步讀一遍（輪詢會補上其餘的變化）
+  const watchTree = (dir: string, replace = false, root = false) => {
+    // 只走真的目錄：git 不會在 refs 底下建 symlink，跟著連結走可能把整個磁碟同步讀一遍（輪詢會補上其餘的變化）。
+    // 例外是 <gitDir>/refs 本身（git-new-workdir 之類的佈局會把它做成 symlink），它底下的仍然不跟。
     try {
-      if (!lstatSync(dir).isDirectory()) return;
+      if (!(root ? statSync : lstatSync)(dir).isDirectory()) return;
     } catch {
       return;
     }
@@ -370,9 +413,9 @@ export function watchGitRefs(
   for (const gitDir of gitDirs) {
     add(gitDir, (_event, filename) => {
       if (filename === null || filename === 'HEAD' || filename === 'packed-refs') onChange();
-      if (filename === 'refs') watchTree(join(gitDir, 'refs'), true);
+      if (filename === 'refs') watchTree(join(gitDir, 'refs'), true, true);
     });
-    watchTree(join(gitDir, 'refs'));
+    watchTree(join(gitDir, 'refs'), false, true);
   }
 
   return () => {
@@ -420,25 +463,28 @@ export interface DiscoverOptions {
   timeBudgetMs?: number;
 }
 
-/** 卡住的目錄（掛掉的網路磁碟等）：之後的掃描直接略過，每個最多只佔住一條 libuv 執行緒。 */
+/**
+ * 卡住的目錄（掛掉的網路磁碟等）：之後的掃描直接略過，等它哪天回應了才恢復。
+ * 卡住的 fs 呼叫會一直佔著一條 libuv 執行緒（預設只有 4 條，Vite 讀檔也靠它們），所以同時最多容忍 MAX_STALLED 個，
+ * 超過就不再冒險開新的 readdir（這次掃描到此為止，清單沿用上一次的結果）。
+ */
 const stalledDirs = new Set<string>();
 const STALL_MS = 1000;
+const MAX_STALLED = 2;
 
-/** readdir，但最多等 `ms`：網路磁碟卡住時 readdir 可能永遠不回來，不能讓整個掃描（和等它的請求）跟著卡住。 */
-async function readdirWithin(dir: string, ms: number): Promise<Dirent[] | 'timeout'> {
-  const pending = readdir(dir, { withFileTypes: true });
+/** 最多等 `ms`：網路磁碟卡住時 fs 呼叫可能永遠不回來，不能讓整個掃描（和等它的請求）跟著卡住。 */
+async function within<T>(key: string, op: Promise<T>, ms: number): Promise<T | 'timeout'> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<'timeout'>((ok) => {
     timer = setTimeout(ok, Math.max(0, ms), 'timeout');
   });
   try {
-    const result = await Promise.race([pending, timeout]);
+    const result = await Promise.race([op, timeout]);
     if (result === 'timeout') {
-      stalledDirs.add(dir);
-      // 哪天回應了就恢復掃描它
-      pending.then(
-        () => stalledDirs.delete(dir),
-        () => stalledDirs.delete(dir),
+      stalledDirs.add(key);
+      op.then(
+        () => stalledDirs.delete(key),
+        () => stalledDirs.delete(key),
       );
     }
     return result;
@@ -456,7 +502,7 @@ const isBareRepo = (entries: Dirent[]) => {
 /**
  * 找出 roots 底下的 git repository（一般 repo、worktree、`*.git` 的 bare repo）。
  * 只看資料夾裡有沒有 `.git`：不執行 git（不會碰到陌生 repo 的設定）、不跟隨 symlink、不往 repo 裡面找（submodule 等）。
- * 回傳排序過的 realpath；碰到上限就停下並標記 truncated。
+ * 所有 fs 呼叫都是非同步且有時限的（不會卡住 dev server）。回傳排序過的 realpath；碰到上限就停下並標記 truncated。
  */
 export async function discoverRepos(
   roots: string[],
@@ -466,53 +512,53 @@ export async function discoverRepos(
   const maxDirs = opts.maxDirs ?? 5000;
   const maxRepos = opts.maxRepos ?? 300;
   const deadline = Date.now() + (opts.timeBudgetMs ?? 3000);
-  const queue: Array<{ dir: string; depth: number }> = [];
+  let truncated = false;
+  /** 還能不能再發一個可能卡住的 fs 呼叫；不行就停在這裡 */
+  const budget = (): number => {
+    const left = Math.min(STALL_MS, deadline - Date.now());
+    return left > 0 && stalledDirs.size < MAX_STALLED ? left : 0;
+  };
+  /** `listOnly`：只看它本身是不是 repo，不往裡面找（名字叫 build / tmp / vendor… 的資料夾） */
+  const queue: Array<{ dir: string; depth: number; listOnly?: boolean }> = [];
   for (const root of roots) {
-    try {
-      const dir = await realpath(root);
-      // 整個磁碟（/、C:\）沒有意義又慢
-      if (parse(dir).root !== dir) queue.push({ dir, depth: 0 });
-    } catch {
-      /* 不存在 */
+    const ms = budget();
+    if (!ms || stalledDirs.has(root)) {
+      truncated = true;
+      continue;
     }
+    const dir = await within(root, realpath(root), ms).catch(() => null);
+    if (dir === 'timeout') truncated = true;
+    // 不存在 / 卡住 / 整個磁碟（/、C:\）：略過
+    else if (dir && parse(dir).root !== dir) queue.push({ dir, depth: 0 });
   }
   const found = new Set<string>();
   const seen = new Set<string>();
-  let truncated = false;
   for (let i = 0; i < queue.length; i++) {
-    if (seen.size >= maxDirs || found.size >= maxRepos || Date.now() > deadline) {
+    const ms = budget();
+    if (seen.size >= maxDirs || found.size >= maxRepos || !ms) {
       truncated = true;
       break;
     }
-    const { dir, depth } = queue[i]!;
+    const { dir, depth, listOnly } = queue[i]!;
     if (seen.has(dir)) continue;
     seen.add(dir);
     if (stalledDirs.has(dir)) {
       truncated = true;
       continue;
     }
-    let entries: Dirent[] | 'timeout';
-    try {
-      entries = await readdirWithin(dir, Math.min(STALL_MS, deadline - Date.now()));
-    } catch {
-      continue;
-    }
-    if (entries === 'timeout') {
-      truncated = true;
-      continue;
-    }
+    const entries = await within(dir, readdir(dir, { withFileTypes: true }), ms).catch(() => null);
+    if (entries === 'timeout') truncated = true;
+    if (!entries || entries === 'timeout') continue;
     if (entries.some((e) => e.name === '.git') || (dir.endsWith('.git') && isBareRepo(entries))) {
       found.add(dir);
       continue;
     }
-    if (depth >= maxDepth) continue;
+    if (listOnly || depth >= maxDepth) continue;
     for (const e of entries) {
       // Dirent.isDirectory() 對 symlink 是 false：不會被連結帶到範圍外或繞圈
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
-      const child = join(dir, e.name);
-      if (!SKIP_DIRS.has(e.name)) queue.push({ dir: child, depth: depth + 1 });
       // 名字剛好叫 build / tmp / vendor… 的 repo 還是要列出來，只是不往裡面找
-      else if (found.size < maxRepos && existsSync(join(child, '.git'))) found.add(child);
+      queue.push({ dir: join(dir, e.name), depth: depth + 1, listOnly: SKIP_DIRS.has(e.name) });
     }
   }
   return { repos: [...found].sort(), truncated };
@@ -840,13 +886,24 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
       try {
         const saved: unknown = JSON.parse(await readFile(stateFile, 'utf8'));
         const paths = (saved as { paths?: unknown } | null)?.paths;
-        for (const dir of Array.isArray(paths) ? paths.slice(0, MAX_ADDED) : []) {
-          if (typeof dir !== 'string' || !isAbsolute(dir) || isRemotePath(dir) || !existsSync(dir))
-            continue;
-          if (dir === defaultDir) continue;
+        const dirs = (Array.isArray(paths) ? paths.slice(0, MAX_ADDED) : []).filter(
+          (dir): dir is string =>
+            typeof dir === 'string' && isAbsolute(dir) && !isRemotePath(dir) && dir !== defaultDir,
+        );
+        // 已經不存在的就不列了；網路磁碟卡住的照列（等一下下就好，不能讓 dev server 啟動卡住）
+        const alive = await Promise.all(
+          dirs.map((dir) =>
+            within(dir, stat(dir), 500).then(
+              () => true,
+              (err: { code?: string }) => err.code !== 'ENOENT' && err.code !== 'ENOTDIR',
+            ),
+          ),
+        );
+        dirs.forEach((dir, i) => {
+          if (!alive[i]) return;
           const entry = entryFor(dir);
           added.set(entry.id, entry);
-        }
+        });
       } catch {
         /* 還沒有檔案 / 壞掉：當作空的 */
       }
@@ -882,6 +939,9 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
             const entry = entryFor(dir);
             next.set(entry.id, entry);
           }
+          // 掃描被中斷（上限 / 時間 / 卡住的磁碟）：沒掃到的不代表不見了，沿用上一次的結果
+          if (result.truncated)
+            for (const [id, entry] of discovered) if (!next.has(id)) next.set(id, entry);
           discovered = next;
           truncated = result.truncated;
           scannedAt = Date.now();
@@ -992,8 +1052,10 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
         const repo = await resolveRepo(dir);
         top = await realpath(repo.dir);
         name = repo.name;
-      } catch {
-        return { status: 422, body: { error: 'not_git' } };
+      } catch (err) {
+        const code =
+          err instanceof SnapshotError && err.code === 'unsafe_repo' ? err.code : 'not_git';
+        return { status: 422, body: { error: code } };
       }
       if (top === defaultDir) return { status: 200, body: { repo: toPublic(defaultEntry) } };
       const id = repoIdFor(top);

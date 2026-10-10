@@ -12,7 +12,7 @@ export interface GitSnapshot {
   generatedAt: number;
 }
 
-export type SnapshotErrorCode = 'missing_dir' | 'not_git' | 'no_git' | 'git_error';
+export type SnapshotErrorCode = 'missing_dir' | 'not_git' | 'no_git' | 'unsafe_repo' | 'git_error';
 
 export const HMR_EVENT = 'agg:git-snapshot';
 /** `GET ?repo=<id>`：某個本機 repo 的快照（省略 repo = 預設 repo）。只有 dev server 有。 */
