@@ -21,7 +21,8 @@ type Missing = 'unknown' | 'offline' | typeof LOCAL_ONLY;
  * 每個 repo 的更新都由 HMR 推送（payload 帶 repo id）。
  * 監聽器一律註冊（不隨目前顯示的來源開關）：切到別處期間發生的 commit，切回來時才不會是舊圖。
  */
-function useLocalSnapshot(id: string) {
+/** `selection`：每次導覽（含再選一次同一個 repo）都是新的物件，用來在同一個 id 上也重抓一次。 */
+function useLocalSnapshot(id: string, selection: unknown) {
   const [snaps, setSnaps] = useState<Record<string, GitSnapshot>>(() => ({
     [DEFAULT_REPO]: snapshot,
   }));
@@ -90,7 +91,7 @@ function useLocalSnapshot(id: string) {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', again);
     };
-  }, [id, load, forget]);
+  }, [id, selection, load, forget]);
 
   const refresh = useCallback(() => load(id), [id, load]);
   return { snap: snaps[id], missing: missing[id], refresh };
@@ -220,7 +221,7 @@ export function useGraphSource(source: Source, token: string): GraphSource {
   // 靜態建置只有預設 repo 的快照（沒有 dev server 可以問）
   const localId =
     import.meta.env.DEV && source.kind === 'local' ? (source.id ?? DEFAULT_REPO) : DEFAULT_REPO;
-  const local = useLocalSnapshot(localId);
+  const local = useLocalSnapshot(localId, source);
   const gh = useGitHubGraph(source, token);
   // dev server 說不認得 / 不給看這個 repo 時，不要繼續顯示快取的舊圖（它不會再更新了）
   const localSnap =
@@ -254,7 +255,9 @@ export function useGraphSource(source: Source, token: string): GraphSource {
         : local.missing === LOCAL_ONLY
           ? t.localOnly
           : localSnap
-            ? (localSnap.error ?? t.localFailed)
+            ? ((localSnap.code && t.snapshotErrors[localSnap.code]) ??
+              localSnap.error ??
+              t.localFailed)
             : local.missing === 'offline'
               ? t.localOffline
               : undefined;

@@ -151,8 +151,8 @@ body {
   max-width: 100%;
 }
 
-.web-go:disabled,
-.web-go:disabled:hover {
+.web-go[aria-disabled='true'],
+.web-go[aria-disabled='true']:hover {
   cursor: default;
   opacity: 0.55;
   transform: none;
@@ -195,7 +195,9 @@ body {
   padding: 0;
   margin: 0;
   font-size: 16px;
+  font-weight: 900;
   line-height: 1;
+  color: var(--agg-ink);
   background: var(--agg-paper);
   border: 3px solid var(--agg-ink);
   border-radius: 50%;

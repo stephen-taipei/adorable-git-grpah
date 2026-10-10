@@ -16,6 +16,7 @@ import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildLayout } from '@adorable/graph-core';
 import {
+  defaultStateFile,
   discoverRepos,
   findGit,
   gitSnapshot,
@@ -463,7 +464,11 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       idleMs?: number;
     } = {},
   ) {
-    const plugin = gitSnapshot({ repoDir, pollMs, stateFile: false, ...extra }) as unknown as {
+    return startWith(gitSnapshot({ repoDir, pollMs, stateFile: false, ...extra }), repoDir);
+  }
+
+  async function startWith(instance: ReturnType<typeof gitSnapshot>, repoDir: string) {
+    const plugin = instance as unknown as {
       configResolved(c: unknown): void;
       configureServer(s: unknown): Promise<void>;
       load(id: string): Promise<string | undefined>;
@@ -901,6 +906,70 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     }
   });
 
+  it('typing a path inside a git directory resolves to the repository itself (no duplicate entries)', async () => {
+    const r = makeRoot();
+    const bare = join(r.base, 'srv', 'b.git');
+    git(r.base, 'clone', '-q', '--bare', r.beta, bare);
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      expect((await p.addPath(join(r.alpha, '.git'))).json().repo.id).toBe('default');
+      expect((await p.addPath(join(r.alpha, '.git', 'refs'))).json().repo.id).toBe('default');
+      expect((await p.addPath(join(r.beta, '.git'))).json().repo).toMatchObject({
+        id: repoIdFor(r.beta),
+        name: 'beta',
+      });
+      expect((await p.addPath(join(bare, 'refs'))).json().repo).toMatchObject({
+        id: repoIdFor(bare),
+        name: 'b',
+      });
+      const names = (await p.repos()).json().repos.map((x: { name: string }) => x.name);
+      expect(names).toEqual(['alpha', 'b', 'beta', 'gamma']);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('AGG_DEFAULT_BRANCH / defaultBranch only applies to the default repo', async () => {
+    const r = makeRoot();
+    git(r.beta, 'branch', 'develop');
+    git(r.alpha, 'branch', 'develop');
+    const plugin = gitSnapshot({
+      repoDir: r.alpha,
+      pollMs: 0,
+      stateFile: false,
+      defaultBranch: 'develop',
+    });
+    const q = await startWith(plugin, r.alpha);
+    try {
+      const def = (await q.snapshotOf('default')).json().graph;
+      expect(def.refs.find((x: { isDefault?: boolean }) => x.isDefault).name).toBe('develop');
+      const beta = (await q.snapshotOf(repoIdFor(r.beta))).json().graph;
+      expect(beta.refs.find((x: { isDefault?: boolean }) => x.isDefault).name).toBe('main');
+    } finally {
+      await q.close();
+    }
+  });
+
+  it('the same plugin instance configured twice (server.restart) keeps pushing after the old server closes', async () => {
+    const dir = tmp('agg-restart-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const plugin = gitSnapshot({ repoDir: dir, pollMs: 0, stateFile: false });
+    const first = await startWith(plugin, dir);
+    const second = await startWith(plugin, dir);
+    await first.close(); // 舊 server 的 cleanup 不能停掉新 server 的監看
+    try {
+      commit(dir, 'two');
+      await waitFor(
+        () => second.sent.some((m) => m.data.snapshot?.graph?.commits.length === 2),
+        8000,
+      );
+      expect(first.sent.some((m) => m.data.snapshot?.graph?.commits.length === 2)).toBe(false);
+    } finally {
+      await second.close();
+    }
+  });
+
   it('scans the configured roots (repoRoots) instead of the default repo siblings', async () => {
     const r = makeRoot();
     const other = realpathSync(tmp('agg-other-root-'));
@@ -943,10 +1012,12 @@ describe('discoverRepos', () => {
     git(base, 'clone', '-q', '--bare', a, join(base, 'srv', 'b.git'));
     git(a, 'worktree', 'add', '-q', join(base, 'wt'), '-b', 'wt-branch');
     mkdirSync(join(base, 'not-a-repo', 'empty'), { recursive: true });
+    const build = init('build'); // 名字在略過清單裡，但它本身就是 repo：要列出來（只是不往裡面找）
+    init('build/inner');
 
     const { repos, truncated } = await discoverRepos([base]);
     expect(truncated).toBe(false);
-    expect(repos).toEqual([a, deep, join(base, 'srv', 'b.git'), join(base, 'wt')].sort());
+    expect(repos).toEqual([a, build, deep, join(base, 'srv', 'b.git'), join(base, 'wt')].sort());
 
     expect((await discoverRepos([base], { maxDepth: 4 })).repos).toContain(
       join(base, 'x/y/z/too-deep'),
@@ -1004,5 +1075,33 @@ describe('findGit', () => {
       process.env['PATH'] = saved;
     }
     expect(findGit()).toBe(real);
+  });
+});
+
+describe('defaultStateFile', () => {
+  it('lives in the user state dir (never inside the project Vite serves), one file per project', () => {
+    const saved = process.env['XDG_STATE_HOME'];
+    process.env['XDG_STATE_HOME'] = '/state-home';
+    try {
+      const a = defaultStateFile('/work/app-a');
+      expect(a.startsWith('/state-home/adorable-git-graph/local-repos-')).toBe(
+        process.platform !== 'win32',
+      );
+      expect(a).not.toContain('/work/app-a');
+      expect(defaultStateFile('/work/app-b')).not.toBe(a);
+      expect(defaultStateFile('/work/app-a/')).toBe(a);
+    } finally {
+      if (saved === undefined) delete process.env['XDG_STATE_HOME'];
+      else process.env['XDG_STATE_HOME'] = saved;
+    }
+  });
+});
+
+describe('snapshot error codes', () => {
+  it('tags failures so the page can show a localised explanation', async () => {
+    expect((await readGitSnapshot(join(tmpdir(), 'agg-definitely-missing'))).code).toBe(
+      'missing_dir',
+    );
+    expect((await readGitSnapshot(tmp('agg-nogit-code-'))).code).toBe('not_git');
   });
 });

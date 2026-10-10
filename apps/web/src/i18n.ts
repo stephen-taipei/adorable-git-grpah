@@ -20,7 +20,7 @@ const zh = {
   localHint: '正在讀取本機 git 歷史；有新 commit 時畫面會自己更新。',
   pickRepo: '選擇本機 repository',
   localUnlisted: '（不在清單中的 repository）',
-  addPath: '＋ 開啟其他路徑…',
+  addPath: '開啟其他路徑…',
   pathLabel: 'git repository 的路徑',
   pathPlaceholder: '/path/to/repo 或 ~/code/repo',
   open: '開啟',
@@ -38,6 +38,12 @@ const zh = {
   localOffline: '連不到 dev server，無法讀取這個本機 repository。',
   localFailed: '無法讀取本機的 git 歷史。',
   localOnly: '只有在執行 dev server 的這台電腦上，才能選擇與讀取其他本機 repository。',
+  snapshotErrors: {
+    missing_dir: '找不到這個 repository 的資料夾（可能已移動或刪除）。',
+    not_git: '這個資料夾不在 git repository 裡。',
+    no_git: '找不到 git：請確認已安裝 git，而且在 PATH 裡。',
+    git_error: '無法讀取 git 歷史（git 回報錯誤），稍後會自動重試。',
+  } as Record<string, string>,
 };
 
 const en: typeof zh = {
@@ -60,7 +66,7 @@ const en: typeof zh = {
   localHint: 'Reading your local git history; the view updates when you commit.',
   pickRepo: 'Choose a local repository',
   localUnlisted: '(repository not in the list)',
-  addPath: '+ Open another path…',
+  addPath: 'Open another path…',
   pathLabel: 'Path to a git repository',
   pathPlaceholder: '/path/to/repo or ~/code/repo',
   open: 'Open',
@@ -79,6 +85,14 @@ const en: typeof zh = {
   localFailed: 'Could not read the local git history.',
   localOnly:
     'Other local repositories can only be chosen and read on the computer running the dev server.',
+  snapshotErrors: {
+    missing_dir:
+      'The folder of this repository does not exist (it may have been moved or deleted).',
+    not_git: 'This folder is not inside a git repository.',
+    no_git: 'git was not found: make sure it is installed and on your PATH.',
+    git_error:
+      'Could not read the git history (git reported an error); it will retry automatically.',
+  },
 };
 
 export const locale: Locale = detectLocale();

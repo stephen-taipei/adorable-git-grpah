@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { FormEvent, KeyboardEvent } from 'react';
 import { localSource, parseRepoInput } from './source';
 import type { Source } from './source';
 import { DEFAULT_REPO } from './protocol';
@@ -21,11 +21,14 @@ const THEME_LABEL: Record<ThemeSetting, string> = {
 
 export function SourceBar({
   source,
+  lastLocal,
   onNavigate,
   theme,
   onThemeChange,
 }: {
   source: Source;
+  /** 最近一次看的本機 repo：從 GitHub 切回「本機」時回到它，而不是預設 repo */
+  lastLocal: Source;
   onNavigate: (s: Source) => void;
   theme: ThemeSetting;
   onThemeChange: (t: ThemeSetting) => void;
@@ -64,7 +67,7 @@ export function SourceBar({
             setEditing(false);
             setInvalid(false);
             // 已經在本機時不要把選好的 repo 換回預設
-            if (source.kind !== 'local') onNavigate({ kind: 'local' });
+            if (source.kind !== 'local') onNavigate(lastLocal);
           }}
         >
           📍 {t.local}
@@ -121,8 +124,12 @@ export function SourceBar({
   );
 }
 
-const ADD = '__add';
 const CURRENT = '__current';
+/** 鍵盤在「關著的」select 上移動時，Chrome / Firefox 每按一下就觸發一次 change：停下來這麼久才真的切換 */
+const KEY_SETTLE_MS = 700;
+const isKeyNav = (e: KeyboardEvent<HTMLSelectElement>) =>
+  /^(Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down))$/.test(e.key) ||
+  (e.key.length === 1 && e.key !== ' ' && !e.altKey && !e.ctrlKey && !e.metaKey);
 
 /** 本機 repo 選單：dev server 掃描到的 repo + 手動輸入路徑。瀏覽器只送出 repo id（和使用者自己輸入的路徑）。 */
 function LocalPicker({ current, onPick }: { current: string; onPick: (id: string) => void }) {
@@ -132,11 +139,21 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
   const [path, setPath] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 鍵盤移動中、還沒確定的選擇 */
+  const [pending, setPending] = useState<string | null>(null);
   const selectRef = useRef<HTMLSelectElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listSeq = useRef(0);
+  const addSeq = useRef(0);
+  const keyNav = useRef(false);
+  const settle = useRef<number | undefined>(undefined);
+  const currentRef = useRef(current);
+  currentRef.current = current;
 
   const reload = useCallback(async () => {
+    const seq = ++listSeq.current;
     const next = await fetchLocalRepos();
+    if (seq !== listSeq.current) return; // 比較晚發出的請求已經回來了
     if (next && next !== LOCAL_ONLY) setList(next);
     setFailed(next === LOCAL_ONLY ? LOCAL_ONLY : next ? false : 'offline');
   }, []);
@@ -146,17 +163,31 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
     // 回到這個分頁時（例如剛在終端機 clone / git init 了新的 repo）更新清單
     const onFocus = () => void reload();
     window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      window.clearTimeout(settle.current);
+      addSeq.current++; // 卸載後才回來的「加入路徑」結果不能再切換畫面
+    };
   }, [reload]);
 
   useEffect(() => {
     if (adding) inputRef.current?.focus();
   }, [adding]);
 
+  const commit = (value: string) => {
+    window.clearTimeout(settle.current);
+    keyNav.current = false;
+    setPending(null);
+    if (value !== CURRENT && value !== currentRef.current) onPick(value);
+  };
+
   const repos = list?.repos ?? [];
   const selected = repos.find((r) => r.id === current);
+  const shown = pending ?? (selected ? current : CURRENT);
 
   const cancel = () => {
+    addSeq.current++; // 還在路上的請求回來後不要切換
+    setBusy(false);
     setAdding(false);
     setError(null);
     selectRef.current?.focus();
@@ -164,19 +195,32 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (busy) return;
+    if (busy || !path.trim()) return;
+    const seq = ++addSeq.current;
+    const before = currentRef.current;
     setBusy(true);
     setError(null);
     const result = await addLocalRepo(path);
+    // 取消了、卸載了、或等待期間使用者已經換到別的 repo：不要再切換
+    if (seq !== addSeq.current || currentRef.current !== before) return;
     setBusy(false);
     if (!result.ok) {
       setError(t.pathErrors[result.error]);
+      inputRef.current?.focus();
       return;
     }
+    const repo = result.repo;
+    // 先放進清單（重新掃描回來之前，選單就要顯示它的名字，而不是「不在清單中」）
+    setList((prev) =>
+      prev && !prev.repos.some((r) => r.id === repo.id)
+        ? { ...prev, repos: [...prev.repos, repo] }
+        : prev,
+    );
+    selectRef.current?.focus();
     setAdding(false);
     setPath('');
     void reload();
-    onPick(result.repo.id);
+    if (repo.id !== currentRef.current) onPick(repo.id);
   };
 
   return (
@@ -185,17 +229,30 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
         ref={selectRef}
         className="web-select"
         aria-label={t.pickRepo}
-        title={selected?.label ?? t.pickRepo}
-        value={selected ? current : CURRENT}
+        title={repos.find((r) => r.id === shown)?.label ?? t.pickRepo}
+        value={shown}
+        onPointerDown={() => {
+          keyNav.current = false;
+        }}
+        onKeyDown={(e) => {
+          if (isKeyNav(e)) keyNav.current = true;
+          else if (e.key === 'Enter' && pending !== null) commit(pending);
+        }}
+        onBlur={() => {
+          if (pending !== null) commit(pending);
+        }}
         onChange={(e) => {
           const value = e.target.value;
-          if (value === ADD) setAdding(true);
-          else if (value !== CURRENT) onPick(value);
+          if (!keyNav.current) return commit(value);
+          // 鍵盤瀏覽：先只改顯示，停下來（或按 Enter / 離開選單）才切換，不會每經過一個 repo 就多一筆歷史和一次讀取
+          setPending(value);
+          window.clearTimeout(settle.current);
+          settle.current = window.setTimeout(() => commit(value), KEY_SETTLE_MS);
         }}
       >
         {!selected && (
           <option value={CURRENT}>
-            {current === DEFAULT_REPO ? t.localTitle : t.localUnlisted}
+            {current === DEFAULT_REPO || !list ? t.localTitle : t.localUnlisted}
           </option>
         )}
         {repos.map((r) => (
@@ -214,8 +271,19 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
             {failed === LOCAL_ONLY ? t.localOnly : t.reposFailed}
           </option>
         )}
-        {failed !== LOCAL_ONLY && <option value={ADD}>{t.addPath}</option>}
       </select>
+
+      {failed !== LOCAL_ONLY && !adding && (
+        <button
+          type="button"
+          className="web-icon web-add"
+          aria-label={t.addPath}
+          title={t.addPath}
+          onClick={() => setAdding(true)}
+        >
+          ＋
+        </button>
+      )}
 
       {adding && (
         <form className="web-form" onSubmit={(e) => void submit(e)}>
@@ -240,7 +308,8 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
               }
             }}
           />
-          <button type="submit" className="web-go" disabled={busy || !path.trim()}>
+          {/* 送出中不用 disabled：disabled 會讓按鈕失去焦點，鍵盤使用者就掉回 <body> */}
+          <button type="submit" className="web-go" aria-disabled={busy || !path.trim()}>
             {t.open}
           </button>
           <button

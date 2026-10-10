@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { GitGraphViewer } from '@adorable/graph-ui';
 import { SourceBar, isThemeSetting } from './SourceBar';
 import { TokenDialog } from './TokenDialog';
@@ -29,6 +29,9 @@ function useSource(): [Source, (s: Source) => void] {
 
 export function App() {
   const [source, navigate] = useSource();
+  // 最近一次看的本機 repo（從 GitHub 切回本機時回到它）
+  const lastLocal = useRef<Source>({ kind: 'local' });
+  if (source.kind === 'local') lastLocal.current = source;
   const [theme, setTheme] = useStored('agg.theme', 'auto', isThemeSetting);
   const [token, setToken] = useState(() => readStored(TOKEN_KEY) ?? '');
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -62,7 +65,13 @@ export function App() {
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
         headerExtra={
-          <SourceBar source={source} onNavigate={navigate} theme={theme} onThemeChange={setTheme} />
+          <SourceBar
+            source={source}
+            lastLocal={lastLocal.current}
+            onNavigate={navigate}
+            theme={theme}
+            onThemeChange={setTheme}
+          />
         }
       />
       {tokenOpen && (

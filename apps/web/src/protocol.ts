@@ -5,10 +5,14 @@ export interface GitSnapshot {
   graph: GraphData | null;
   /** graph 為 null 時的原因（例如不是 git repo）。 */
   error?: string;
+  /** error 的種類：畫面依此顯示在地化的說明（不認得的種類就直接顯示 error）。 */
+  code?: SnapshotErrorCode;
   /** 暫時性的 git 錯誤（例如 gc / fetch 進行中）。已經有好的圖時，dev plugin 會保留舊圖；第一次讀取就失敗時才會帶著這個旗標送出。 */
   transient?: boolean;
   generatedAt: number;
 }
+
+export type SnapshotErrorCode = 'missing_dir' | 'not_git' | 'no_git' | 'git_error';
 
 export const HMR_EVENT = 'agg:git-snapshot';
 /** `GET ?repo=<id>`：某個本機 repo 的快照（省略 repo = 預設 repo）。只有 dev server 有。 */

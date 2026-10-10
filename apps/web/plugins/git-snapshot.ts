@@ -1,6 +1,14 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { accessSync, constants, existsSync, readdirSync, statSync, watch } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  accessSync,
+  constants,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  statSync,
+  watch,
+} from 'node:fs';
 import type { Dirent, FSWatcher } from 'node:fs';
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -23,7 +31,13 @@ import {
   isRepoId,
   snapshotKey,
 } from '../src/protocol.ts';
-import type { GitSnapshot, LocalRepo, ReposResponse, SnapshotEvent } from '../src/protocol.ts';
+import type {
+  GitSnapshot,
+  LocalRepo,
+  ReposResponse,
+  SnapshotErrorCode,
+  SnapshotEvent,
+} from '../src/protocol.ts';
 
 export type { GitSnapshot };
 export { snapshotKey };
@@ -52,11 +66,26 @@ export interface SnapshotOptions {
   scanDepth?: number;
   /**
    * 記住「開啟其他路徑…」加入的 repo 的檔案（dev server 重新啟動後清單裡還在）。`false` = 不記。
-   * 預設：環境變數 AGG_LOCAL_REPOS_FILE，否則為 `<vite root>/node_modules/.cache/adorable-git-graph/local-repos.json`。
+   * 預設：環境變數 AGG_LOCAL_REPOS_FILE，否則放在使用者的 state 目錄（Vite 不會提供的地方）：
+   * `$XDG_STATE_HOME`（預設 `~/.local/state`）或 Windows 的 `%LOCALAPPDATA%` 底下的
+   * `adorable-git-graph/local-repos-<這個專案路徑的雜湊>.json`。
    */
   stateFile?: string | false;
   /** 非預設 repo 多久沒有人要快照就停止監看。預設 10 分鐘（主要是給測試調短用）。 */
   idleMs?: number;
+}
+
+/**
+ * 預設的 state 檔位置。不能放在專案裡（例如 node_modules/.cache）：那在 Vite 的 root / fs.allow 底下，
+ * `vite --host` 時區網裡的裝置可以直接把它當靜態檔案讀走。
+ */
+export function defaultStateFile(root: string): string {
+  const base =
+    process.platform === 'win32'
+      ? (process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'))
+      : process.env['XDG_STATE_HOME'] || join(homedir(), '.local', 'state');
+  const project = createHash('sha256').update(resolve(root)).digest('hex').slice(0, 12);
+  return join(base, 'adorable-git-graph', `local-repos-${project}.json`);
 }
 
 const intFromEnv = (name: string): number | undefined => {
@@ -82,7 +111,8 @@ export function findGit(): string | null {
     try {
       if (!statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
-      bin = file;
+      // resolve：Windows 的 `\\bin` 這種只有根目錄的項目也算 isAbsolute，執行時卻會依 cwd 的磁碟機解析
+      bin = resolve(file);
       break;
     } catch {
       /* 不在這裡 */
@@ -113,22 +143,37 @@ const gitOrUndefined = (cwd: string, args: string[]) =>
     () => undefined,
   );
 
-class SnapshotError extends Error {}
+class SnapshotError extends Error {
+  readonly code: SnapshotErrorCode;
+  constructor(message: string, code: SnapshotErrorCode) {
+    super(message);
+    this.code = code;
+  }
+}
 
-/** 工作樹的根；bare repo 或直接指到 .git 時退而求其次。 */
+/** repo 的位置（工作樹的根；bare repo 則是 git 目錄本身）與顯示名稱。 */
 async function resolveRepo(repoDir: string): Promise<{ dir: string; name: string }> {
   try {
     const top = (await git(repoDir, ['rev-parse', '--show-toplevel'])).trim();
     return { dir: top, name: basename(top) };
   } catch (err) {
     if ((err as { code?: string }).code === 'ENOENT')
-      throw new SnapshotError('git is not installed');
+      throw new SnapshotError('git is not installed', 'no_git');
   }
   const gitDir = await gitOrUndefined(repoDir, ['rev-parse', '--absolute-git-dir']);
-  if (!gitDir) throw new SnapshotError('The configured directory is not inside a git repository.');
+  if (!gitDir)
+    throw new SnapshotError('The configured directory is not inside a git repository.', 'not_git');
   // bare：.../project.git；在 .git 內：.../project/.git
   const named = basename(gitDir) === '.git' ? dirname(gitDir) : gitDir;
-  return { dir: repoDir, name: basename(named).replace(/\.git$/, '') || 'repository' };
+  const name = basename(named).replace(/\.git$/, '') || 'repository';
+  // 指到 git 目錄裡面（<repo>/.git、<bare>.git/refs…）時回傳 repo 本身的位置：清單與 id 才不會重複
+  const bare = (await gitOrUndefined(repoDir, ['rev-parse', '--is-bare-repository'])) === 'true';
+  if (bare) return { dir: gitDir, name };
+  if (basename(gitDir) === '.git') {
+    const top = await gitOrUndefined(dirname(gitDir), ['rev-parse', '--show-toplevel']);
+    if (top) return { dir: top, name: basename(top) };
+  }
+  return { dir: repoDir, name };
 }
 
 export async function readGitSnapshot(
@@ -138,13 +183,15 @@ export async function readGitSnapshot(
   const generatedAt = Date.now();
   // 錯誤訊息會被烤進 bundle / 經由 endpoint 送出，所以一律不含本機路徑；細節給 onWarn（終端機）。
   // transient：git 自己出錯（gc / fetch 進行中等），保留上一張好的圖；其餘是確定的失敗，要如實顯示。
-  const fail = (error: string, transient = false): GitSnapshot => ({
+  const fail = (error: string, code: SnapshotErrorCode, transient = false): GitSnapshot => ({
     graph: null,
     error,
+    code,
     generatedAt,
     ...(transient ? { transient: true } : {}),
   });
-  if (!existsSync(repoDir)) return fail('The configured repository directory does not exist.');
+  if (!existsSync(repoDir))
+    return fail('The configured repository directory does not exist.', 'missing_dir');
 
   try {
     const { dir, name } = await resolveRepo(repoDir);
@@ -225,11 +272,11 @@ export async function readGitSnapshot(
     if (shallow === 'true') graph.truncated = true;
     return { graph, generatedAt };
   } catch (err) {
-    if (err instanceof SnapshotError) return fail(err.message);
+    if (err instanceof SnapshotError) return fail(err.message, err.code);
     opts.onWarn?.(
       `could not read git history: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return fail('Could not read the git history (git reported an error).', true);
+    return fail('Could not read the git history (git reported an error).', 'git_error', true);
   }
 }
 
@@ -288,13 +335,19 @@ export function watchGitRefs(
   };
 
   const watchTree = (dir: string, replace = false) => {
+    // 只走真的目錄：git 不會在 refs 底下建 symlink，跟著連結走可能把整個磁碟同步讀一遍（輪詢會補上其餘的變化）
+    try {
+      if (!lstatSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
     add(
       dir,
       (event, filename) => {
         if (filename) {
           const child = join(dir, filename);
           try {
-            if (statSync(child).isDirectory()) watchTree(child, event === 'rename');
+            if (lstatSync(child).isDirectory()) watchTree(child, event === 'rename');
           } catch {
             drop(child); // 已被刪除：放掉舊的監看，之後重建時才會重新加上
           }
@@ -303,6 +356,8 @@ export function watchGitRefs(
       },
       replace,
     );
+    // 超過上限（或監看失敗）就不再往下走
+    if (!watchers.has(dir)) return;
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.isDirectory()) watchTree(join(dir, entry.name), replace);
@@ -365,6 +420,33 @@ export interface DiscoverOptions {
   timeBudgetMs?: number;
 }
 
+/** 卡住的目錄（掛掉的網路磁碟等）：之後的掃描直接略過，每個最多只佔住一條 libuv 執行緒。 */
+const stalledDirs = new Set<string>();
+const STALL_MS = 1000;
+
+/** readdir，但最多等 `ms`：網路磁碟卡住時 readdir 可能永遠不回來，不能讓整個掃描（和等它的請求）跟著卡住。 */
+async function readdirWithin(dir: string, ms: number): Promise<Dirent[] | 'timeout'> {
+  const pending = readdir(dir, { withFileTypes: true });
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<'timeout'>((ok) => {
+    timer = setTimeout(ok, Math.max(0, ms), 'timeout');
+  });
+  try {
+    const result = await Promise.race([pending, timeout]);
+    if (result === 'timeout') {
+      stalledDirs.add(dir);
+      // 哪天回應了就恢復掃描它
+      pending.then(
+        () => stalledDirs.delete(dir),
+        () => stalledDirs.delete(dir),
+      );
+    }
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const isBareRepo = (entries: Dirent[]) => {
   const has = (name: string, dir: boolean) =>
     entries.some((e) => e.name === name && (dir ? e.isDirectory() : e.isFile()));
@@ -405,10 +487,18 @@ export async function discoverRepos(
     const { dir, depth } = queue[i]!;
     if (seen.has(dir)) continue;
     seen.add(dir);
-    let entries: Dirent[];
+    if (stalledDirs.has(dir)) {
+      truncated = true;
+      continue;
+    }
+    let entries: Dirent[] | 'timeout';
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      entries = await readdirWithin(dir, Math.min(STALL_MS, deadline - Date.now()));
     } catch {
+      continue;
+    }
+    if (entries === 'timeout') {
+      truncated = true;
       continue;
     }
     if (entries.some((e) => e.name === '.git') || (dir.endsWith('.git') && isBareRepo(entries))) {
@@ -418,9 +508,11 @@ export async function discoverRepos(
     if (depth >= maxDepth) continue;
     for (const e of entries) {
       // Dirent.isDirectory() 對 symlink 是 false：不會被連結帶到範圍外或繞圈
-      if (e.isDirectory() && !e.name.startsWith('.') && !SKIP_DIRS.has(e.name)) {
-        queue.push({ dir: join(dir, e.name), depth: depth + 1 });
-      }
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      const child = join(dir, e.name);
+      if (!SKIP_DIRS.has(e.name)) queue.push({ dir: child, depth: depth + 1 });
+      // 名字剛好叫 build / tmp / vendor… 的 repo 還是要列出來，只是不往裡面找
+      else if (found.size < maxRepos && existsSync(join(child, '.git'))) found.add(child);
     }
   }
   return { repos: [...found].sort(), truncated };
@@ -524,7 +616,7 @@ class RepoSession {
     let stopWatching = () => {};
     this.teardown = () => {
       clearTimeout(timer);
-      clearInterval(poll);
+      clearTimeout(poll);
       stopWatching();
     };
     const onChange = () => {
@@ -546,18 +638,24 @@ class RepoSession {
       stopWatching = watchGitRefs(dirs, onChange);
 
       // 安全網：檔案監看可能漏事件（網路磁碟、inotify 上限…），偶爾比對一次 ref 簽章
+      // 一次只跑一輪：上一輪的 git 還沒回來（網路磁碟很慢）就不要再疊新的行程
       const pollMs = this.hooks.options.pollMs ?? 2000;
       if (pollMs > 0) {
         let sig = await refsSignature(this.dir);
-        if (this.stopped) return;
-        poll = setInterval(() => {
-          void refsSignature(this.dir).then((next) => {
-            if (next === sig) return;
-            sig = next;
-            void this.sync();
-          });
-        }, pollMs);
-        poll.unref();
+        const tick = () => {
+          if (this.stopped) return;
+          poll = setTimeout(() => {
+            void refsSignature(this.dir).then((next) => {
+              if (next !== sig) {
+                sig = next;
+                void this.sync();
+              }
+              tick();
+            });
+          }, pollMs);
+          poll.unref();
+        };
+        tick();
       }
     } catch {
       // 不是 git repo：沒東西可監看，endpoint 仍可手動重抓
@@ -616,19 +714,26 @@ export function isSameOrigin(req: IncomingMessage, direct: boolean): boolean {
   return direct;
 }
 
+/**
+ * 讀取 request body（最多 `limit` bytes）。超過時丟掉其餘內容、讀完才回報錯誤，413 才送得到瀏覽器
+ * （馬上 destroy 會連 socket 一起關掉，瀏覽器只會看到連線被重設）；大得離譜（> 1 MB）才直接斷線。
+ */
 const readBody = (req: IncomingMessage, limit: number) =>
   new Promise<string>((ok, fail) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > limit) {
-        fail(new Error('request body too large'));
-        req.destroy();
-      } else chunks.push(chunk);
+      if (size <= limit) chunks.push(chunk);
+      else if (size > 1024 * 1024) req.destroy();
     });
-    req.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () =>
+      size > limit
+        ? fail(new Error('request body too large'))
+        : ok(Buffer.concat(chunks).toString('utf8')),
+    );
     req.on('error', fail);
+    req.on('close', () => fail(new Error('request aborted')));
   });
 
 /** 同時監看幾個「非預設」repo；超過就停掉最久沒用的那個（之後再選到時會重新開始監看）。 */
@@ -667,9 +772,7 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
     configResolved(config) {
       repoDir = options.repoDir ?? process.env['AGG_REPO_DIR'] ?? config.root;
       stateFile =
-        options.stateFile ??
-        process.env['AGG_LOCAL_REPOS_FILE'] ??
-        join(config.root, 'node_modules', '.cache', 'adorable-git-graph', 'local-repos.json');
+        options.stateFile ?? process.env['AGG_LOCAL_REPOS_FILE'] ?? defaultStateFile(config.root);
       warn = options.onWarn ?? ((m) => config.logger.warn(`[git-snapshot] ${m}`));
     },
     resolveId(id) {
@@ -701,6 +804,10 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
       server.ws.send({ type: 'custom', event: HMR_EVENT, data });
     };
 
+    // 每個 dev server 用自己的預設 session：同一個 plugin 實例被重新設定時（例如 server.restart()），
+    // 舊 server 關閉時的 cleanup 只能停掉它自己的監看，不能把新 server 的也停掉
+    main?.stop();
+    main = undefined;
     const def = mainSession();
     await def.sync();
     await def.start();
@@ -749,12 +856,14 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
       if (!stateFile) return;
       const file = stateFile;
       const body = JSON.stringify({ paths: [...added.values()].map((e) => e.dir) }, null, 2);
-      // 依序寫入；先寫暫存檔再 rename，中途中斷也不會留下半個檔案
+      // 依序寫入；先寫暫存檔再 rename，中途中斷也不會留下半個檔案。
+      // 暫存檔用不會重複的名字 + 'wx'：已經存在的檔案或 symlink 不會被跟著寫進去
       saving = saving
         .then(async () => {
-          await mkdir(dirname(file), { recursive: true });
-          await writeFile(`${file}.tmp`, `${body}\n`, { mode: 0o600 });
-          await rename(`${file}.tmp`, file);
+          await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+          const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+          await writeFile(tmp, `${body}\n`, { mode: 0o600, flag: 'wx' });
+          await rename(tmp, file);
         })
         .catch((err: unknown) => warn(`could not remember the added repositories: ${String(err)}`));
     };
@@ -822,7 +931,9 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
           const entry = await findEntry(id);
           if (!entry || closed) return undefined;
           const session = new RepoSession(entry.dir, {
-            options,
+            // AGG_DEFAULT_BRANCH 是給預設 repo 的；其他 repo 用它自己的 origin/HEAD → main → master…
+            // （'' 會蓋過環境變數，selectRefs 會略過空字串）
+            options: { ...options, defaultBranch: '' },
             warn: (m) => warn(`${entry.name}: ${m}`),
             onUpdate: (snap) => push(id, snap),
           });
@@ -841,7 +952,7 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
     };
 
     // 看過一次就一直輪詢（每 2 秒 3 個 git 行程）太浪費：久沒人要的停掉，再選到時會重新開始
-    const idleMs = options.idleMs ?? IDLE_MS;
+    const idleMs = options.idleMs && options.idleMs > 0 ? options.idleMs : IDLE_MS;
     const sweep = setInterval(
       () => {
         const cutoff = Date.now() - idleMs;
@@ -957,6 +1068,7 @@ export function gitSnapshot(options: SnapshotOptions = {}): Plugin {
       closed = true;
       clearInterval(sweep);
       def.stop();
+      if (main === def) main = undefined;
       for (const { session } of sessions.values()) session.stop();
       sessions.clear();
     };
