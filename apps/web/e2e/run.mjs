@@ -2852,6 +2852,940 @@ try {
     }
   });
 
+  // ═════════════════════════ 本機 repo 選擇器（dev server） ═════════════════════════
+  // AGG_REPO_ROOTS = fx.rootsDir：清單只有 預設 repo（★）、beta、group/gamma；其他（略過的資料夾 / symlink / 範圍外）都不能出現。
+
+  const ids = {
+    beta: repoIdOf(fx.beta),
+    gamma: repoIdOf(fx.gamma),
+    far: repoIdOf(fx.far),
+    sneaky: repoIdOf(fx.sneaky),
+  };
+  const PICK_LABEL = 'Choose a local repository';
+  const PATH_LABEL = 'Path to a git repository';
+  const picker = (pg = page) => pg.locator(`select.web-select[aria-label="${PICK_LABEL}"]`);
+  const pathInput = (pg = page) => pg.locator(`input.web-input[aria-label="${PATH_LABEL}"]`);
+  const pathError = (pg = page) => pg.locator('.web-error[role="alert"]');
+  const ghInput = (pg = page) => pg.locator(`input.web-input:not([aria-label="${PATH_LABEL}"])`);
+  /** 選單目前的選項（值 / 文字 / 是否選取）。 */
+  const pickerOptions = (pg = page) =>
+    picker(pg).evaluate((sel) =>
+      [...sel.options].map((o) => ({
+        value: o.value,
+        text: o.textContent,
+        selected: o.selected,
+        disabled: o.disabled,
+      })),
+    );
+  const pickerValue = (pg = page) => picker(pg).inputValue();
+  /** 清單是非同步抓的：等到選單裡出現 `id`。 */
+  const waitPickerHas = (id, pg = page) =>
+    waitUntil(
+      async () => (await pickerOptions(pg).catch(() => [])).some((o) => o.value === id),
+      15_000,
+      `the local repo menu to list ${id}`,
+    );
+  /** 清單載入後選單才會選到目前的 repo（之前顯示的是「目前的 repo」占位選項）。 */
+  const waitPickerValue = (id, pg = page) =>
+    waitUntil(
+      async () => (await pickerValue(pg).catch(() => null)) === id,
+      15_000,
+      `the local repo menu to select ${id}`,
+    );
+  const activeLabel = (pg = page) =>
+    pg.evaluate(() => document.activeElement?.getAttribute('aria-label') ?? null);
+  const shasOf = (dir) => gitLog(dir).map((c) => c.sha);
+  /** 畫面上的列表 = 這個 repo 的 git log（整串 sha、順序都一樣）。 */
+  const waitShowsRepo = async (dir, what, pg = page) => {
+    const want = shasOf(dir);
+    await waitUntil(
+      async () => {
+        const got = (await domRows(pg)).map((r) => r.sha);
+        return got.length === want.length && got.every((s, i) => s === want[i]);
+      },
+      20_000,
+      `${what}: rows = git log of ${dirBase(dir)}`,
+    );
+  };
+  const searchOf = (pg = page) => new URL(pg.url()).search;
+  const waitSearch = (want, pg = page) => pg.waitForURL((u) => new URL(u).search === want);
+  const reEscape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  /** 標題「剛好是」這個名稱（不是子字串：beta 不能被 alphabeta 之類的騙過）。 */
+  const titleIs = (name, pg = page) =>
+    pg.locator('.agg-title-text', { hasText: new RegExp(`^${reEscape(name)}$`) }).waitFor();
+  const sameOriginRepos = (pg = page) =>
+    pg.evaluate(async () => {
+      const res = await fetch('/__agg/repos', { cache: 'no-store' });
+      return { status: res.status, body: await res.json() };
+    });
+  const storedPaths = (pg = page) =>
+    pg.evaluate(() => {
+      const v = localStorage.getItem('agg.local-paths');
+      return v === null ? null : JSON.parse(v);
+    });
+
+  /** vite 的 HMR websocket 收到的 agg:git-snapshot 推送（{ repo, snapshot }）：用來確認「推送已經到了」，不用固定 sleep。 */
+  const hmrFrames = [];
+  page.on('websocket', (ws) =>
+    ws.on('framereceived', ({ payload }) => {
+      const text = String(payload);
+      if (!text.includes('agg:git-snapshot')) return;
+      try {
+        const m = JSON.parse(text);
+        if (m.event === 'agg:git-snapshot') hmrFrames.push(m.data);
+      } catch {
+        /* 不是 JSON：略過 */
+      }
+    }),
+  );
+  const waitPushed = (repo, sha, what) =>
+    waitUntil(
+      () => hmrFrames.some((f) => f.repo === repo && JSON.stringify(f.snapshot).includes(sha)),
+      20_000,
+      `HMR push for ${what}`,
+    );
+
+  await step(
+    'LOCAL PICKER: the menu lists the default repo (★) first, then beta and group/gamma; node_modules / dot / symlinked / outside repos are not listed; option values are ids, never paths',
+    async () => {
+      await page.goto(base); // 也讓 websocket 監聽從這裡開始
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'default repo');
+      await waitPickerHas(ids.gamma);
+      const opts = await pickerOptions();
+      assert.deepEqual(
+        opts.map((o) => o.value),
+        ['default', ids.beta, ids.gamma, '__add'],
+        'menu: the default repo, the scanned repos by name, then "open another path"',
+      );
+      assert.deepEqual(
+        opts.map((o) => o.text),
+        [
+          `★ ${dirBase(repoDir)} — ${repoLabelOf(repoDir)}`,
+          `beta — ${repoLabelOf(fx.beta)}`,
+          `gamma — ${repoLabelOf(fx.gamma)}`,
+          '+ Open another path…',
+        ],
+      );
+      assert.equal(await pickerValue(), 'default', 'the default repo is selected');
+      assert.deepEqual(
+        opts.filter((o) => o.selected).map((o) => o.value),
+        ['default'],
+      );
+      assert.equal(
+        await picker().getAttribute('title'),
+        repoLabelOf(repoDir),
+        'the menu tooltip is the location of the selected repo',
+      );
+      for (const o of opts) {
+        assert.match(o.value, /^(default|[0-9a-f]{12}|__add)$/, `option value "${o.value}"`);
+        assert.ok(!o.value.includes('/'), 'option values never carry a path');
+      }
+      const texts = opts.map((o) => o.text).join('\n');
+      for (const absent of ['hidden', 'node_modules', 'linked', 'far-away', 'plain', 'sneaky'])
+        assert.ok(!texts.includes(absent), `"${absent}" must not be listed:\n${texts}`);
+      // API 本身：同一份清單；每個 repo 只有 id / name / label / isDefault（沒有資料夾路徑以外的東西，也沒有 dir）
+      const api = await sameOriginRepos();
+      assert.equal(api.status, 200);
+      assert.equal(api.body.truncated, false);
+      assert.deepEqual(
+        api.body.repos.map((r) => [r.id, r.name, r.isDefault]),
+        [
+          ['default', dirBase(repoDir), true],
+          [ids.beta, 'beta', false],
+          [ids.gamma, 'gamma', false],
+        ],
+      );
+      for (const r of api.body.repos)
+        assert.deepEqual(Object.keys(r).sort(), ['id', 'isDefault', 'label', 'name']);
+      await page.screenshot({ path: resolve(artifacts, '12-picker.png') });
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: choosing beta shows its history (URL ?local=<id>, title, rows, branches, graph) from the top; choosing ★ returns to the 88-commit repo',
+    async () => {
+      // 預設 repo 先捲下去、選一列：換 repo 時兩者都要重設
+      await scrollTo(900);
+      const g = await visibleGeometry();
+      await clickRow(g.rows[2].sha);
+      await waitSelected(g.rows[2].sha, 'a default-repo row');
+      const historyBefore = await page.evaluate(() => history.length);
+      await picker().selectOption(ids.beta);
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta');
+      assert.equal(
+        await page.evaluate(() => history.length),
+        historyBefore + 1,
+        'one history entry per pick',
+      );
+      assert.match(await page.title(), /^beta · /);
+      assert.equal(await pickerValue(), ids.beta);
+      assert.equal(await picker().getAttribute('title'), repoLabelOf(fx.beta));
+      assert.equal(await commitCount(), gitCount(fx.beta));
+      assert.equal(await page.locator('.agg-branch').count(), gitBranches(fx.beta).length);
+      const rows = await domRows();
+      const defaultShas = new Set(shasOf(repoDir));
+      assert.ok(
+        rows.every((r) => !defaultShas.has(r.sha)),
+        'no row of the 88-commit repo is left',
+      );
+      assert.ok(
+        rows.every((r) => r.subject.startsWith('beta: ')),
+        'every row is a beta commit',
+      );
+      assert.equal(await scrollTopNow(), 0, 'another repo starts at the top');
+      assert.equal(await selectedSha(), null, 'the selection made in the other repo is gone');
+      assert.equal(await page.locator('.agg-detail').count(), 0);
+      assert.ok((await scrollMax()) > 300, 'sanity: beta is long enough to scroll');
+      await replayDone();
+      await graphSync('beta repo');
+      await page.mouse.move(720, 8);
+      await page.screenshot({ path: resolve(artifacts, '12-beta.png') });
+
+      // ★ 預設 repo（beta 先捲下去：回來時一樣從頭看）
+      await scrollTo(400);
+      await picker().selectOption('default');
+      await waitSearch('');
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo again');
+      assert.equal(await commitCount(), expected);
+      assert.equal(await pickerValue(), 'default');
+      assert.match(await page.title(), /^octo\/cat · /);
+      assert.equal(await scrollTopNow(), 0, 'back to the default repo: from the top');
+      assert.equal(await selectedSha(), null);
+      await replayDone();
+      await graphSync('default repo after beta');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: browser Back / Forward switch between the local repos (the view and the menu follow, not just the URL)',
+    async () => {
+      await page.goBack();
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta after Back');
+      assert.equal(await pickerValue(), ids.beta);
+      assert.match(
+        await page.locator('.web-seg button[aria-pressed="true"]').first().innerText(),
+        /Local/,
+      );
+      assert.equal(await scrollTopNow(), 0);
+      await page.goForward();
+      await waitSearch('');
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo after Forward');
+      assert.equal(await pickerValue(), 'default');
+      await page.goBack();
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta after Back again');
+      await page.goForward();
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo after Forward again');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: a deep link ?local=<id> in a fresh tab opens that repo directly (the default repo never flashes first)',
+    async () => {
+      const deep = await ctx.newPage();
+      watchErrors(deep, 'deep-link page');
+      try {
+        // 記下標題的每一次變化（MutationObserver 從文件建立就開始看）
+        await deep.addInitScript(() => {
+          window.__titles = [];
+          new MutationObserver(() => {
+            const t = document.querySelector('.agg-title-text')?.textContent;
+            if (t && window.__titles[window.__titles.length - 1] !== t) window.__titles.push(t);
+          }).observe(document, { subtree: true, childList: true, characterData: true });
+        });
+        await deep.goto(`${base}/?local=${ids.beta}`);
+        await titleIs('beta', deep);
+        await waitShowsRepo(fx.beta, 'beta (deep link)', deep);
+        assert.match(await deep.title(), /^beta · /);
+        assert.equal(searchOf(deep), `?local=${ids.beta}`);
+        await waitPickerValue(ids.beta, deep);
+        const titles = await deep.evaluate(() => window.__titles);
+        assert.ok(
+          !titles.includes('octo/cat'),
+          `the default repo was shown before beta (${titles.join(' → ')})`,
+        );
+        await replayDone(deep);
+        await graphSync('beta (deep link)', { pg: deep });
+      } finally {
+        await deep.close();
+      }
+      await page.bringToFront();
+    },
+  );
+
+  await step(
+    'LIVE (local picker): a commit in the selected non-default repo pops in without reloading; a commit in the default repo meanwhile does not leak into it and is there when switching back',
+    async () => {
+      await picker().selectOption(ids.beta);
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta');
+      await replayDone();
+      await page.evaluate(() => (window.__alive = 'beta'));
+      await watchReplay();
+      commit(fx.beta, 'beta: live from the other repo', 'Dan');
+      const betaHead = git(fx.beta, 'rev-parse', 'HEAD');
+      await waitShowsRepo(fx.beta, 'beta after a live commit');
+      assert.equal((await domRows())[0].subject, 'beta: live from the other repo');
+      assert.equal((await domRows())[0].sha, betaHead);
+      assert.equal(await page.evaluate(() => window.__alive), 'beta', 'page must not have reloaded');
+      assert.ok(
+        hmrFrames.some((f) => f.repo === ids.beta && JSON.stringify(f.snapshot).includes(betaHead)),
+        'the update came as an HMR push tagged with the beta id',
+      );
+      assert.equal(await commitCount(), gitCount(fx.beta));
+      assert.equal(searchOf(), `?local=${ids.beta}`);
+      assert.equal(await scrollTopNow(), 0);
+      assert.ok(await rowFullyVisible(betaHead), 'the new commit is visible without scrolling');
+      await waitUntil(
+        async () => (await replayLog()).includes('playing'),
+        10_000,
+        'the new beta commit pops in',
+      );
+      await replayDone();
+      await graphSync('beta after a live commit');
+
+      // beta 顯示中，預設 repo 來了一筆：推送到了以後 beta 的畫面也不能變
+      const betaRows = (await domRows()).map((r) => r.sha);
+      commit(repoDir, 'live: while beta is shown');
+      expected++;
+      const defHead = git(repoDir, 'rev-parse', 'HEAD');
+      await waitPushed('default', defHead, 'the default-repo commit');
+      await sleep(400); // 推送已經到了：給 React 一點時間（若有錯）重畫
+      assert.deepEqual(
+        (await domRows()).map((r) => r.sha),
+        betaRows,
+        'a default-repo update must not change the beta view',
+      );
+      assert.equal(await page.locator('.agg-title-text').innerText(), 'beta');
+      assert.equal(searchOf(), `?local=${ids.beta}`);
+      // 切回 ★：新的 commit 已經在最上面（推送是在看 beta 時收下的）
+      await picker().selectOption('default');
+      await waitSearch('');
+      await titleIs('octo/cat');
+      await waitForCommits(expected);
+      await waitShowsRepo(repoDir, 'the default repo with the commit made while beta was shown');
+      assert.equal((await domRows())[0].subject, 'live: while beta is shown');
+      assert.equal(await page.evaluate(() => window.__alive), 'beta', 'still no reload');
+      assert.equal(expected, gitCount(repoDir), 'expected-count bookkeeping');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: an unknown id (?local=0123456789ab) shows the "does not know this local repository" error and "(repository not in the list)" in the menu; picking from the menu recovers; a malformed id falls back to the default repo',
+    async () => {
+      await page.goto(`${base}/?local=0123456789ab`);
+      const panel = page.locator('.agg-center[role="alert"]');
+      await panel.waitFor();
+      assert.match(await panel.innerText(), /does not know this local repository/);
+      assert.ok(!(await panel.innerText()).includes(tmpdir()), 'no local path in the message');
+      assert.equal(await page.locator('.agg-scroll').count(), 0, 'no list for an unknown repo');
+      assert.equal(searchOf(), '?local=0123456789ab', 'the URL is left alone');
+      await waitPickerHas(ids.beta);
+      const sel = (await pickerOptions()).filter((o) => o.selected);
+      assert.deepEqual(
+        sel.map((o) => o.text),
+        ['(repository not in the list)'],
+        'the menu says the current repo is not in the list',
+      );
+      assert.equal(await pickerValue(), '__current');
+      await page.screenshot({ path: resolve(artifacts, '12-unknown-repo.png') });
+      // 從選單挑一個就好了
+      await picker().selectOption(ids.beta);
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta after the unknown id');
+      assert.equal(await page.locator('.agg-center').count(), 0, 'the error panel is gone');
+      assert.deepEqual(
+        (await pickerOptions()).map((o) => o.value),
+        ['default', ids.beta, ids.gamma, '__add'],
+        'the placeholder option is gone once a listed repo is shown',
+      );
+      // 格式不對的 id（像路徑）：直接當成預設 repo，不會送到 dev server
+      await page.goto(`${base}/?local=..%2F..%2Fetc`);
+      await titleIs('octo/cat');
+      await waitShowsRepo(repoDir, 'the default repo for a malformed id');
+      await waitPickerValue('default');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: "+ Open another path…" — relative / missing / non-git paths get a clear error, Esc and ✕ close the form and give focus back to the menu, an absolute path outside the scanned folders opens that repo, joins the menu and is remembered',
+    async () => {
+      await page.goto(base);
+      await titleIs('octo/cat');
+      await waitPickerHas(ids.beta);
+      assert.equal(await storedPaths(), null, 'nothing typed yet');
+      const openForm = async () => {
+        await picker().selectOption('__add');
+        await pathInput().waitFor();
+        assert.equal(await activeLabel(), PATH_LABEL, 'the path box gets the keyboard focus');
+        assert.equal(await pickerValue(), 'default', 'the action itself is not a selection');
+        assert.equal(searchOf(), '');
+      };
+      await openForm();
+      const openBtn = page.locator('.web-form button[type="submit"]', { hasText: /^Open$/ });
+      assert.equal(await openBtn.isDisabled(), true, 'Open is disabled while the box is empty');
+      assert.equal(await pathInput().getAttribute('placeholder'), '/path/to/repo or ~/code/repo');
+      assert.equal(await pathInput().getAttribute('aria-invalid'), 'false');
+
+      const tryPath = async (value, message, what) => {
+        await pathInput().fill(value);
+        assert.equal(await pathError().count(), 0, `${what}: typing clears the previous error`);
+        assert.equal(await openBtn.isDisabled(), false);
+        await pathInput().press('Enter');
+        await pathError().waitFor();
+        assert.equal(await pathError().innerText(), message, what);
+        assert.equal(await pathError().getAttribute('id'), 'web-path-error');
+        assert.equal(await pathInput().getAttribute('aria-invalid'), 'true', what);
+        assert.equal(await pathInput().getAttribute('aria-describedby'), 'web-path-error', what);
+        assert.equal(await pathInput().inputValue(), value, `${what}: the text stays for fixing`);
+        assert.equal(searchOf(), '', `${what}: no navigation`);
+        assert.equal(await page.locator('.web-error').count(), 1);
+      };
+      await tryPath('beta', 'Enter an absolute path (~ for your home folder works).', 'relative');
+      await tryPath('./group/gamma', 'Enter an absolute path (~ for your home folder works).', './');
+      await tryPath(
+        resolve(fx.rootsDir, 'no-such-folder'),
+        'That folder does not exist.',
+        'missing folder',
+      );
+      await tryPath(fx.plain, 'That folder is not inside a git repository.', 'not a git repo');
+      await page.screenshot({ path: resolve(artifacts, '12-add-path-error.png') });
+
+      // Esc：表單與錯誤都收掉，焦點回到選單，viewer 不受影響（Esc 不會漏到 viewer）
+      await pathInput().press('Escape');
+      await pathInput().waitFor({ state: 'detached' });
+      assert.equal(await pathError().count(), 0, 'Esc also clears the error');
+      assert.equal(await activeLabel(), PICK_LABEL, 'Esc gives the focus back to the menu');
+      assert.equal(searchOf(), '');
+      assert.equal(await pickerValue(), 'default');
+      await waitShowsRepo(repoDir, 'the default repo after Esc');
+      assert.equal(await storedPaths(), null, 'failed paths are not remembered');
+      // ✕（取消）按鈕也一樣
+      await openForm();
+      await pathInput().fill('/somewhere');
+      await page.locator(`.web-form button[aria-label="Cancel"]`).click();
+      await pathInput().waitFor({ state: 'detached' });
+      assert.equal(await activeLabel(), PICK_LABEL, '✕ gives the focus back to the menu');
+
+      // 範圍外的 repo（絕對路徑）：打開、加進選單、記在 localStorage
+      await openForm();
+      await pathInput().fill(fx.far);
+      await openBtn.click();
+      await waitSearch(`?local=${ids.far}`);
+      await titleIs('far-away');
+      await waitShowsRepo(fx.far, 'far-away');
+      assert.match(await page.title(), /^far-away · /);
+      await pathInput().waitFor({ state: 'detached' });
+      assert.equal(await pathError().count(), 0);
+      await waitPickerHas(ids.far);
+      await waitPickerValue(ids.far);
+      const opts = await pickerOptions();
+      assert.deepEqual(
+        opts.map((o) => o.value),
+        ['default', ids.beta, ids.far, ids.gamma, '__add'],
+        'the opened repo joins the menu (by name)',
+      );
+      assert.equal(
+        opts.find((o) => o.value === ids.far).text,
+        `far-away — ${repoLabelOf(fx.far)}`,
+      );
+      assert.deepEqual(await storedPaths(), [fx.far], 'the typed path is remembered');
+      await replayDone();
+      // 透過 symlink（在掃描範圍內、但本身不列出）輸入的路徑：同一個 repo、同一個 id，不會多一筆
+      await picker().selectOption('default');
+      await titleIs('octo/cat');
+      await openForm();
+      await pathInput().fill(resolve(fx.rootsDir, 'linked'));
+      await pathInput().press('Enter');
+      await waitSearch(`?local=${ids.far}`);
+      await titleIs('far-away');
+      await waitShowsRepo(fx.far, 'far-away through the symlink');
+      await waitPickerValue(ids.far);
+      assert.equal(
+        (await pickerOptions()).filter((o) => o.value === ids.far).length,
+        1,
+        'the symlink resolves to the same repo: no duplicate entry',
+      );
+    },
+  );
+
+  await step(
+    'LOCAL PICKER: a typed path is re-registered from localStorage, so ?local=<id> still opens after the dev server restarts (a browser that never typed it gets the unknown-repo message)',
+    async () => {
+      const p = await freePort();
+      const origin = `http://localhost:${p}`;
+      const stop = async (v) => {
+        if (v.proc.exitCode !== null || v.proc.signalCode !== null) return;
+        const exited = new Promise((ok) => v.proc.once('exit', ok));
+        v.proc.kill();
+        await exited;
+      };
+      let side = startVite(['--port', String(p), '--strictPort'], env);
+      const stranger = await browser.newContext({
+        viewport: { width: 1440, height: 900 },
+        locale: 'en-US',
+      });
+      stranger.setDefaultTimeout(30_000 * SCALE);
+      stranger.setDefaultNavigationTimeout(30_000 * SCALE);
+      try {
+        await side.ready;
+        const pg = await ctx.newPage();
+        watchErrors(pg, 'restart page (before)');
+        await pg.goto(origin);
+        await titleIs('octo/cat', pg);
+        await waitPickerHas(ids.beta, pg);
+        assert.equal(await storedPaths(pg), null, 'a fresh origin has nothing remembered');
+        await picker(pg).selectOption('__add');
+        await pathInput(pg).fill(fx.far);
+        await pathInput(pg).press('Enter');
+        await waitSearch(`?local=${ids.far}`, pg);
+        await waitShowsRepo(fx.far, 'far-away before the restart', pg);
+        assert.deepEqual(await storedPaths(pg), [fx.far]);
+        await pg.close(); // 關掉，免得 vite client 在 server 重啟時自己重新整理
+
+        // 同一個埠重新啟動：新的 server 只認得掃描範圍內的 repo
+        await stop(side);
+        side = startVite(['--port', String(p), '--strictPort'], env);
+        await side.ready;
+
+        // 沒輸入過這個路徑的瀏覽器：不認得（證明下面是靠 localStorage 重新登記，不是 server 記得）
+        const other = await stranger.newPage();
+        watchErrors(other, 'restart page (stranger)');
+        await other.goto(`${origin}/?local=${ids.far}`);
+        await other.locator('.agg-center[role="alert"]').waitFor();
+        assert.match(
+          await other.locator('.agg-center[role="alert"]').innerText(),
+          /does not know this local repository/,
+        );
+        await other.close();
+
+        const again = await ctx.newPage();
+        watchErrors(again, 'restart page (after)');
+        await again.goto(`${origin}/?local=${ids.far}`);
+        await titleIs('far-away', again);
+        await waitShowsRepo(fx.far, 'far-away after the restart', again);
+        await waitPickerHas(ids.far, again);
+        await waitPickerValue(ids.far, again);
+        assert.deepEqual(await storedPaths(again), [fx.far], 'still remembered');
+        await again.close();
+      } finally {
+        await stranger.close();
+        await stop(side);
+      }
+      await page.bringToFront();
+    },
+  );
+
+  await step(
+    'LOCAL PICKER + GitHub: Local while a non-default repo is shown keeps it; GitHub and back (Back button, Local button) keep working; a commit made meanwhile is there',
+    async () => {
+      await picker().selectOption(ids.beta);
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta');
+      // ① GitHub 只是打開輸入框；再按 Local：仍然是 beta（不能被換回預設 repo）
+      await srcGitHub().click();
+      await ghInput().waitFor();
+      assert.equal(await picker().count(), 0, 'the local menu hides while the GitHub box is open');
+      assert.equal(searchOf(), `?local=${ids.beta}`, 'opening the GitHub box alone does not navigate');
+      await srcLocal().click();
+      await picker().waitFor();
+      assert.equal(await ghInput().count(), 0);
+      assert.equal(
+        searchOf(),
+        `?local=${ids.beta}`,
+        'Local while a local repo is shown must not reset to the default repo',
+      );
+      await waitPickerValue(ids.beta);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'still beta after clicking Local');
+      await srcLocal().click(); // 已經在本機：再按一次也一樣
+      await sleep(300);
+      assert.equal(searchOf(), `?local=${ids.beta}`);
+      assert.equal(await page.locator('.agg-title-text').innerText(), 'beta');
+
+      // ② 真的切到 GitHub；那段時間 beta 有新 commit
+      await srcGitHub().click();
+      await ghInput().fill('demo/adorable-git-graph');
+      await ghInput().press('Enter');
+      await titleIs('demo/adorable-git-graph');
+      assert.equal(searchOf(), '?repo=demo/adorable-git-graph');
+      await waitUntil(
+        async () => (await domRows()).length === SPECS.length,
+        10_000,
+        'github rows',
+      );
+      assert.equal(await picker().count(), 0, 'no local menu on GitHub');
+      commit(fx.beta, 'beta: made while on GitHub', 'Dan');
+      // 上一頁 → beta（含剛才的 commit）
+      await page.goBack();
+      await waitSearch(`?local=${ids.beta}`);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta after Back from GitHub (with the commit made meanwhile)');
+      assert.equal((await domRows())[0].subject, 'beta: made while on GitHub');
+      assert.equal(await scrollTopNow(), 0);
+      await waitPickerValue(ids.beta);
+      // 下一頁 → GitHub；Local 按鈕 → 預設 repo，選單照常可用
+      await page.goForward();
+      await titleIs('demo/adorable-git-graph');
+      await srcLocal().click();
+      await waitSearch('');
+      await titleIs('octo/cat');
+      await waitForCommits(expected);
+      await waitShowsRepo(repoDir, 'the default repo after GitHub → Local');
+      await waitPickerHas(ids.far);
+      assert.equal(await pickerValue(), 'default');
+      await picker().selectOption(ids.gamma);
+      await waitSearch(`?local=${ids.gamma}`);
+      await titleIs('gamma');
+      await waitShowsRepo(fx.gamma, 'gamma (nested two levels down)');
+    },
+  );
+
+  await step(
+    'LOCAL PICKER responsive: 390×800 and 320×640 — the menu, the path box and its error fit the screen; no horizontal page overflow and nothing scrolls sideways',
+    async () => {
+      await picker().selectOption(ids.beta);
+      await titleIs('beta');
+      await waitShowsRepo(fx.beta, 'beta');
+      /** 頁面不能橫向捲動；工具列的每一層祖先也不能偷偷被捲（overflow: hidden 的元素用程式捲得動 = 內容被裁掉）。 */
+      const sideways = () =>
+        page.evaluate(() => {
+          const bad = [];
+          const se = document.scrollingElement;
+          if (se.scrollWidth > innerWidth) bad.push(`page scrollWidth ${se.scrollWidth} > ${innerWidth}`);
+          if (document.body.scrollWidth > innerWidth)
+            bad.push(`body scrollWidth ${document.body.scrollWidth} > ${innerWidth}`);
+          const probe = (el, name) => {
+            el.scrollLeft = 100_000;
+            const left = el.scrollLeft;
+            el.scrollLeft = 0;
+            if (left !== 0) bad.push(`${name} scrolls sideways by ${left}px`);
+          };
+          probe(se, 'the page');
+          probe(document.querySelector('.web-root'), '.web-root');
+          for (let el = document.querySelector('.web-bar'); el && el !== document.body; el = el.parentElement)
+            probe(el, `<${el.tagName.toLowerCase()} class="${el.className}">`);
+          if (document.querySelector('.web-root').scrollLeft !== 0) bad.push('.web-root scrollLeft ≠ 0');
+          return bad;
+        });
+      /** 這些元素整個在畫面內（左右都不超出），而且不會被擠到不能用。 */
+      const inside = (sels) =>
+        page.evaluate((list) => {
+          const bad = [];
+          for (const [sel, minWidth] of list) {
+            const el = document.querySelector(sel);
+            if (!el) {
+              bad.push(`${sel} is missing`);
+              continue;
+            }
+            const r = el.getBoundingClientRect();
+            if (r.left < -0.5 || r.right > innerWidth + 0.5 || r.top < -0.5)
+              bad.push(`${sel} spans ${r.left.toFixed(1)}–${r.right.toFixed(1)} in a ${innerWidth}px viewport`);
+            if (r.width < minWidth) bad.push(`${sel} is only ${r.width.toFixed(1)}px wide`);
+            if (el.scrollWidth > el.clientWidth + 1 && sel === '.web-error')
+              bad.push(`${sel} text is clipped (${el.scrollWidth} > ${el.clientWidth})`);
+          }
+          return bad;
+        }, sels);
+      for (const [w, h] of [
+        [390, 800],
+        [320, 640],
+      ]) {
+        await page.setViewportSize({ width: w, height: h });
+        await page.locator('.agg-root[data-size="narrow"]').waitFor();
+        await settleScroll();
+        // 選單顯示中
+        assert.deepEqual(await sideways(), [], `${w}×${h} with the menu`);
+        assert.deepEqual(await noOverflow(), [], `${w}×${h} with the menu`);
+        assert.deepEqual(
+          await inside([
+            ['select.web-select', 120],
+            ['.web-seg', 0],
+            ['.web-theme', 0],
+          ]),
+          [],
+          `${w}×${h}: the menu`,
+        );
+        await page.screenshot({ path: resolve(artifacts, `12-picker-${w}.png`) });
+        // 輸入框 + 錯誤訊息
+        await picker().selectOption('__add');
+        await pathInput().waitFor();
+        await pathInput().fill('relative/path/that/is/fairly/long/for/a/phone');
+        await pathInput().press('Enter');
+        await pathError().waitFor();
+        assert.deepEqual(await sideways(), [], `${w}×${h} with the path form and an error`);
+        assert.deepEqual(await noOverflow(), [], `${w}×${h} with the path form and an error`);
+        assert.deepEqual(
+          await inside([
+            ['select.web-select', 120],
+            [`input[aria-label="${PATH_LABEL}"]`, 100],
+            ['.web-form button[type="submit"]', 0],
+            ['.web-form button[aria-label="Cancel"]', 0],
+            ['.web-error', 0],
+          ]),
+          [],
+          `${w}×${h}: the path form`,
+        );
+        await page.screenshot({ path: resolve(artifacts, `12-add-path-${w}.png`) });
+        await pathInput().press('Escape');
+        await pathInput().waitFor({ state: 'detached' });
+      }
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.locator('.agg-root[data-size="wide"]').waitFor();
+      await settleScroll();
+    },
+  );
+
+  await step(
+    'SECURITY (local picker): other origins (another localhost port, 127.0.0.1) can neither read the repo list / snapshots nor add a repo (cors POST, no-cors POST, form POST); bad requests are rejected; a forged Host gets 403 from Vite',
+    async () => {
+      // 別的來源上的空白頁：localhost 的另一個埠（同站不同源：同一台機器上的別的 dev server）與 127.0.0.1（跨站）
+      const blankPage = async (host) => {
+        const srv = createHttpServer((_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>other origin</title><body></body>');
+        });
+        await new Promise((ok) => srv.listen(0, host, ok));
+        return srv;
+      };
+      const blanks = [await blankPage('localhost'), await blankPage('127.0.0.1')];
+      const origins = [
+        `http://localhost:${blanks[0].address().port}/`,
+        `http://127.0.0.1:${blanks[1].address().port}/`,
+      ];
+      try {
+        for (const url of origins) {
+          const other = await ctx.newPage();
+          // 從網路層看 server 的回應碼：no-cors 請求的回應頁面讀不到，但 Playwright 看得到（CORS 擋下的則完全不會回報）。
+          // 用來證明不只是瀏覽器不給讀，server 本身就拒絕了。
+          const responses = [];
+          other.on('response', (r) => {
+            if (r.url().startsWith(`${base}/__agg/`))
+              responses.push(`${r.request().method()} ${new URL(r.url()).pathname} ${r.status()}`);
+          });
+          try {
+            await other.goto(url);
+            const out = await other.evaluate(
+              async ({ base, path, betaId }) => {
+                const read = async (u, init) => {
+                  try {
+                    const res = await fetch(u, init);
+                    return `readable:${res.status}`;
+                  } catch {
+                    return 'blocked';
+                  }
+                };
+                const body = JSON.stringify({ path });
+                const opaque = (u, init) =>
+                  fetch(u, { ...init, mode: 'no-cors' }).then(
+                    (r) => r.type,
+                    () => 'failed',
+                  );
+                return {
+                  list: await read(`${base}/__agg/repos`),
+                  snapshot: await read(`${base}/__agg/git-snapshot?repo=${betaId}`),
+                  listNoCors: await opaque(`${base}/__agg/repos`),
+                  snapshotNoCors: await opaque(`${base}/__agg/git-snapshot?repo=${betaId}`),
+                  corsPost: await read(`${base}/__agg/repos`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body,
+                  }),
+                  // no-cors：請求會送出去（回應讀不到），server 必須自己拒絕
+                  noCorsPost: await opaque(`${base}/__agg/repos`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'text/plain' },
+                    body,
+                  }),
+                };
+              },
+              { base, path: fx.sneaky, betaId: ids.beta },
+            );
+            assert.equal(out.list, 'blocked', `${url}: the repo list must not be readable`);
+            assert.equal(out.snapshot, 'blocked', `${url}: a repo snapshot must not be readable`);
+            assert.equal(out.corsPost, 'blocked', `${url}: a JSON POST must not go through`);
+            assert.deepEqual(
+              [out.listNoCors, out.snapshotNoCors, out.noCorsPost],
+              ['opaque', 'opaque', 'opaque'],
+              `${url}: sanity: the no-cors requests were sent`,
+            );
+            const want = ['GET /__agg/repos 403', 'GET /__agg/git-snapshot 403', 'POST /__agg/repos 403'];
+            await waitUntil(
+              () => want.every((w) => responses.includes(w)),
+              5000,
+              `${url}: the server's answers to the no-cors requests (${responses})`,
+            );
+            assert.ok(
+              responses.every((r) => / 403$/.test(r)),
+              `${url}: the server refused every request (${responses})`,
+            );
+            // 傳統的跨站表單（text/plain 可以拼出 JSON 的樣子）：導覽過去，但 server 拒絕
+            await Promise.all([
+              other.waitForURL(`${base}/__agg/repos`),
+              other.evaluate(
+                ({ base, path }) => {
+                  const f = document.createElement('form');
+                  f.method = 'POST';
+                  f.action = `${base}/__agg/repos`;
+                  f.enctype = 'text/plain';
+                  const i = document.createElement('input');
+                  i.name = `{"path":"${path}","x":"`;
+                  i.value = '"}';
+                  f.append(i);
+                  document.body.append(f);
+                  f.submit();
+                },
+                { base, path: fx.sneaky },
+              ),
+            ]);
+            assert.match(await other.locator('body').innerText(), /forbidden/);
+            assert.equal(responses.filter((r) => r === 'POST /__agg/repos 403').length, 2);
+          } finally {
+            await other.close();
+          }
+        }
+      } finally {
+        for (const srv of blanks) await new Promise((ok) => srv.close(ok));
+      }
+      // server 這邊：sneaky 沒有被加進去
+      const listed = await sameOriginRepos();
+      assert.equal(listed.status, 200);
+      assert.ok(
+        !listed.body.repos.some((r) => r.id === ids.sneaky || r.name === 'sneaky'),
+        'a cross-origin request must not add a repository',
+      );
+
+      // 同源但格式不對的請求
+      const sameOrigin = await page.evaluate(async (sneaky) => {
+        const go = async (u, init) => {
+          try {
+            const res = await fetch(u, init);
+            return `${res.status} ${(await res.json().catch(() => ({}))).error ?? ''}`.trim();
+          } catch {
+            return 'network error';
+          }
+        };
+        const json = { 'content-type': 'application/json' };
+        return {
+          malformedId: await go('/__agg/git-snapshot?repo=..%2F..%2Fetc'),
+          unknownId: await go('/__agg/git-snapshot?repo=0123456789ab'),
+          postSnapshot: await go('/__agg/git-snapshot', { method: 'POST' }),
+          putRepos: await go('/__agg/repos', { method: 'PUT', headers: json, body: '{}' }),
+          textPlain: await go('/__agg/repos', {
+            method: 'POST',
+            headers: { 'content-type': 'text/plain' },
+            body: JSON.stringify({ path: sneaky }),
+          }),
+          notString: await go('/__agg/repos', { method: 'POST', headers: json, body: '{"path":42}' }),
+          tooLarge: await go('/__agg/repos', {
+            method: 'POST',
+            headers: json,
+            body: JSON.stringify({ path: `/${'a'.repeat(9000)}` }),
+          }),
+        };
+      }, fx.sneaky);
+      // 超過 8KB 的 body：一定要被拒絕。程式本意是回 413 too_large，但目前 readBody 先 req.destroy() 把連線關掉，
+      // 413 送不出去，瀏覽器只看到連線中斷（已回報為產品 bug）；這裡先釘住「被拒絕」，修好後只會是 413。
+      assert.ok(
+        ['413 too_large', 'network error'].includes(sameOrigin.tooLarge),
+        `an oversized body must be refused (${sameOrigin.tooLarge})`,
+      );
+      delete sameOrigin.tooLarge;
+      assert.deepEqual(sameOrigin, {
+        malformedId: '400 invalid_repo',
+        unknownId: '404 unknown_repo',
+        postSnapshot: '405 method_not_allowed',
+        putRepos: '405 method_not_allowed',
+        textPlain: '415 unsupported_media_type',
+        notString: '400 invalid_path',
+      });
+
+      // 瀏覽器以外的請求（node http）：偽造的 Host（DNS rebinding）在進到 plugin 之前就被 Vite 擋下
+      const raw = (path, { method = 'GET', headers = {}, body } = {}) =>
+        new Promise((ok, fail) => {
+          const req = httpRequest({ host: 'localhost', port, path, method, headers }, (res) => {
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', (d) => (data += d));
+            res.on('end', () => ok({ status: res.statusCode, body: data }));
+          });
+          req.on('error', fail);
+          if (body) req.write(body);
+          req.end();
+        });
+      const post = JSON.stringify({ path: fx.sneaky });
+      const jsonHeaders = { 'content-type': 'application/json' };
+      for (const path of ['/__agg/repos', `/__agg/git-snapshot?repo=${ids.beta}`]) {
+        const r = await raw(path, { headers: { Host: 'evil.example' } });
+        assert.equal(r.status, 403, `forged Host → ${path}`);
+        assert.match(r.body, /Blocked request/, 'rejected by Vite’s host check');
+        assert.ok(!r.body.includes('beta') && !r.body.includes(fx.rootsDir), 'no data leaks');
+      }
+      const forgedPost = await raw('/__agg/repos', {
+        method: 'POST',
+        headers: { ...jsonHeaders, Host: `evil.example:${port}`, Origin: 'http://evil.example' },
+        body: post,
+      });
+      assert.equal(forgedPost.status, 403, 'forged Host + POST');
+      // 正確的 Host：直接 GET（網址列 / curl）可以；fetch metadata 說是別的站就不行；POST 一定要同源頁面
+      assert.equal((await raw('/__agg/repos')).status, 200, 'a direct GET is allowed');
+      for (const site of ['same-site', 'cross-site'])
+        assert.equal(
+          (await raw('/__agg/repos', { headers: { 'Sec-Fetch-Site': site } })).status,
+          403,
+          `Sec-Fetch-Site: ${site}`,
+        );
+      assert.equal(
+        (await raw('/__agg/repos', { headers: { Origin: 'http://localhost:1' } })).status,
+        403,
+        'Origin of another port',
+      );
+      for (const [what, headers] of [
+        ['no Origin / fetch metadata', jsonHeaders],
+        ['a foreign Origin', { ...jsonHeaders, Origin: 'http://evil.example' }],
+        ['Sec-Fetch-Site: same-site', { ...jsonHeaders, 'Sec-Fetch-Site': 'same-site' }],
+      ])
+        assert.equal(
+          (await raw('/__agg/repos', { method: 'POST', headers, body: post })).status,
+          403,
+          `POST with ${what}`,
+        );
+      assert.ok(
+        !(await sameOriginRepos()).body.repos.some((r) => r.id === ids.sneaky),
+        'still not added',
+      );
+
+      // 對照組：同一個請求從頁面自己（同源）送出就會成功 → 上面「沒加進去」不是因為這個路徑本來就加不進去
+      const added = await page.evaluate(async (path) => {
+        const res = await fetch('/__agg/repos', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ path }),
+        });
+        return { status: res.status, body: await res.json() };
+      }, fx.sneaky);
+      assert.equal(added.status, 200);
+      assert.deepEqual(added.body.repo, {
+        id: ids.sneaky,
+        name: 'sneaky',
+        label: repoLabelOf(fx.sneaky),
+        isDefault: false,
+      });
+      assert.ok((await sameOriginRepos()).body.repos.some((r) => r.id === ids.sneaky));
+    },
+  );
+
   await step(
     'other local repositories: no remote → no "Open on GitHub"; empty repo → empty state; not a git repo → error panel',
     async () => {
