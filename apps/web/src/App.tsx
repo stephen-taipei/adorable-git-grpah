@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { GitGraphViewer } from '@adorable/graph-ui';
 import { SourceBar, isThemeSetting } from './SourceBar';
 import { TokenDialog } from './TokenDialog';
@@ -7,6 +7,7 @@ import type { Source } from './source';
 import { readStored, useStored, writeStored } from './storage';
 import { locale, t } from './i18n';
 import { clearGitHubCache, useGraphSource } from './useGraphSource';
+import { DEFAULT_REPO } from './protocol';
 
 const TOKEN_KEY = 'agg.github-token';
 
@@ -28,6 +29,10 @@ function useSource(): [Source, (s: Source) => void] {
 
 export function App() {
   const [source, navigate] = useSource();
+  // 最近一次看的本機 repo（從 GitHub 切回本機時回到它）
+  const lastLocal = useRef<Source>({ kind: 'local' });
+  // 靜態建置只有預設 repo：網址裡的 ?local= 不用帶回去
+  if (source.kind === 'local') lastLocal.current = import.meta.env.DEV ? source : { kind: 'local' };
   const [theme, setTheme] = useStored('agg.theme', 'auto', isThemeSetting);
   const [token, setToken] = useState(() => readStored(TOKEN_KEY) ?? '');
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -53,11 +58,21 @@ export function App() {
         state={state}
         theme={theme === 'auto' ? 'auto' : theme}
         locale={locale}
-        sourceKey={source.kind === 'github' ? `github:${source.owner}/${source.repo}` : 'local'}
+        sourceKey={
+          source.kind === 'github'
+            ? `github:${source.owner}/${source.repo}`
+            : `local:${source.id ?? DEFAULT_REPO}`
+        }
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
         headerExtra={
-          <SourceBar source={source} onNavigate={navigate} theme={theme} onThemeChange={setTheme} />
+          <SourceBar
+            source={source}
+            lastLocal={lastLocal.current}
+            onNavigate={navigate}
+            theme={theme}
+            onThemeChange={setTheme}
+          />
         }
       />
       {tokenOpen && (

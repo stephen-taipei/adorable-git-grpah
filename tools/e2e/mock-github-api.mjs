@@ -61,10 +61,22 @@ const apiCommit = (c, base) => ({
 });
 
 export const seen = { auth: [], paths: [] };
+/**
+ * 每個 API 回應前多等幾毫秒（預設 0）。快到 React 把「開始重新整理」和「完成」合併成同一次 render 時，
+ * 轉圈根本不會出現；要驗證轉圈的步驟把這個調高，結束後記得歸零。
+ */
+export const latency = { ms: 0 };
 
 export function startMock() {
   return new Promise((ok) => {
     const server = createServer((req, res) => {
+      if (latency.ms > 0 && !req.url.startsWith('/avatar/')) {
+        setTimeout(() => handle(req, res), latency.ms);
+        return;
+      }
+      handle(req, res);
+    });
+    function handle(req, res) {
       const url = new URL(req.url, 'http://x');
       const base = `http://127.0.0.1:${server.address().port}`;
       seen.paths.push(url.pathname + url.search);
@@ -145,7 +157,7 @@ export function startMock() {
         default:
           return json(404, { message: 'Not Found' });
       }
-    });
+    }
     server.listen(0, '127.0.0.1', () => ok(server));
   });
 }

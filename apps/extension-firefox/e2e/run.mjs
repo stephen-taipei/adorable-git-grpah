@@ -29,7 +29,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GECKO_ID } from '@adorable/extension-core/manifest';
 import { startFakeGithub } from '../../../tools/e2e/fake-github-page.mjs';
-import { SPECS, seen, sha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
+import { SPECS, latency, seen, sha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
 import { colorDistance, inkRatio, samplePixels } from '../../../tools/e2e/pixels.mjs';
 import {
   backgroundControl,
@@ -1608,21 +1608,28 @@ try {
       assert.ok(before.scrollTop > 100, `scrolled down before refreshing (${before.scrollTop})`);
       assert.equal(before.selected, sha('m6'));
       const requests = apiCalls();
-      await button(L.refresh);
-      await waitUntil(() => apiCalls() > requests, 15_000, 'refresh hits the API again');
-      // 結束條件：轉圈停了；或列表被卸載 / 出現 loading 畫面（那就是 bug，下面的斷言會講清楚原因）
-      await waitUntil(
-        async () => {
-          const log = await page.evaluate(() => window.__aggRefreshLog);
-          return (
-            log.includes('aria-busy=null') ||
-            log.includes('scroll-removed') ||
-            log.includes('loading-or-error-shown')
-          );
-        },
-        20_000,
-        'the refresh finishes (spinner stops)',
-      );
+      // API 回應太快時，React 會把「開始重新整理」和「完成」合併成同一次 render，轉圈根本不會出現：
+      // 讓每個回應慢一點，轉圈一定看得到（要驗證的是「轉圈而列表不卸載」，不是網路有多快）
+      latency.ms = 150;
+      try {
+        await button(L.refresh);
+        await waitUntil(() => apiCalls() > requests, 15_000, 'refresh hits the API again');
+        // 結束條件：轉圈停了；或列表被卸載 / 出現 loading 畫面（那就是 bug，下面的斷言會講清楚原因）
+        await waitUntil(
+          async () => {
+            const log = await page.evaluate(() => window.__aggRefreshLog);
+            return (
+              log.includes('aria-busy=null') ||
+              log.includes('scroll-removed') ||
+              log.includes('loading-or-error-shown')
+            );
+          },
+          20_000,
+          'the refresh finishes (spinner stops)',
+        );
+      } finally {
+        latency.ms = 0;
+      }
       await settle(500);
       const after = await ui((r) => {
         const sc = r.querySelector('.agg-scroll');

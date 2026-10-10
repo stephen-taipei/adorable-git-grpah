@@ -19,9 +19,21 @@ body {
 
 .web-bar {
   display: flex;
+  flex: 1 1 100%;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  /* 子元素（select 的寬度 = 最長的選項）不能把整條撐出畫面 */
+  min-width: 0;
+}
+
+/* 主題按鈕緊跟在來源切換後面：窄螢幕時 repo 選單 / 輸入框換到下一行，按鈕不會自己孤零零佔一行 */
+.web-seg {
+  order: -2;
+}
+
+.web-theme {
+  order: -1;
 }
 
 .web-seg {
@@ -61,6 +73,13 @@ body {
 .web-form {
   display: flex;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.web-form .web-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .web-input {
@@ -90,11 +109,65 @@ body {
   font-size: 15px;
 }
 
+/* 本機 repo 選單：原生 select（鍵盤 / 螢幕報讀器 / 手機都有原生體驗），外觀跟 segmented 按鈕一致 */
+.web-select {
+  flex: 0 1 auto;
+  appearance: none;
+  width: auto;
+  min-width: 0;
+  max-width: min(360px, 100%);
+  padding: 4px 32px 4px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--agg-ink);
+  text-overflow: ellipsis;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--agg-ink) 50%) no-repeat right 17px center / 6px
+      6px,
+    linear-gradient(135deg, var(--agg-ink) 50%, transparent 50%) no-repeat right 11px center / 6px
+      6px,
+    var(--agg-paper);
+  border: 3px solid var(--agg-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--agg-ink);
+  cursor: pointer;
+}
+
+.web-select option {
+  color: #2b2140;
+  background: #fff;
+}
+
+/* 夜晚主題的背景是深色：做成淺色小卡，兩種主題都看得清楚 */
+.web-error {
+  padding: 3px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--agg-ink);
+  background: #ffd9de;
+  border: 3px solid var(--agg-ink);
+  /* 訊息可能換好幾行（safe.directory 的指令要能複製）：不用膠囊形狀 */
+  border-radius: 14px;
+  max-width: 100%;
+  user-select: text;
+}
+
+.web-go[aria-disabled='true'],
+.web-go[aria-disabled='true']:hover,
+.web-go[aria-disabled='true']:active {
+  cursor: default;
+  opacity: 0.55;
+  transform: none;
+  box-shadow: 0 3px 0 var(--agg-ink);
+}
+
 .web-go,
 .web-cta {
   appearance: none;
   margin: 0;
   padding: 4px 16px;
+  white-space: nowrap;
   font: inherit;
   font-size: 13px;
   font-weight: 900;
@@ -127,7 +200,9 @@ body {
   padding: 0;
   margin: 0;
   font-size: 16px;
+  font-weight: 900;
   line-height: 1;
+  color: var(--agg-ink);
   background: var(--agg-paper);
   border: 3px solid var(--agg-ink);
   border-radius: 50%;
@@ -141,6 +216,7 @@ body {
 }
 
 .web-seg button:focus-visible,
+.web-select:focus-visible,
 .web-input:focus-visible,
 .web-go:focus-visible,
 .web-icon:focus-visible,

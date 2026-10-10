@@ -1,10 +1,31 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildLayout } from '@adorable/graph-core';
-import { gitSnapshot, readGitSnapshot, snapshotKey, watchGitRefs } from './git-snapshot.ts';
+import {
+  defaultStateFile,
+  discoverRepos,
+  findGit,
+  gitSnapshot,
+  isSameOrigin,
+  readGitSnapshot,
+  repoIdFor,
+  snapshotKey,
+  watchGitRefs,
+} from './git-snapshot.ts';
 
 const tmps: string[] = [];
 const tmp = (prefix: string) => {
@@ -403,6 +424,23 @@ describe('watchGitRefs (regression: live updates must keep working after the fir
     }
   });
 
+  it('still watches when <gitDir>/refs itself is a symlink (git-new-workdir layouts), but never below it', async () => {
+    const dir = tmp('agg-watch-linkedrefs-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const shared = tmp('agg-watch-sharedrefs-');
+    execFileSync('mv', [join(dir, '.git', 'refs'), join(shared, 'refs')]);
+    symlinkSync(join(shared, 'refs'), join(dir, '.git', 'refs'));
+    let calls = 0;
+    const stop = watchGitRefs([join(dir, '.git')], () => calls++);
+    try {
+      git(dir, 'branch', 'feat/linked');
+      await waitFor(() => calls > 0, 4000);
+    } finally {
+      stop();
+    }
+  });
+
   it('stops notifying after being closed', async () => {
     const dir = tmp('agg-watch-close-');
     git(dir, 'init', '-q', '-b', 'main');
@@ -420,20 +458,44 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
   interface Sent {
     type: string;
     event: string;
-    data: { graph: { commits: unknown[] } | null };
+    data: { repo: string; snapshot?: { graph: { commits: unknown[] } | null } };
+  }
+  interface Req {
+    path?: string;
+    headers?: Record<string, string>;
+    method?: string;
+    /** connect 會把掛載路徑拿掉，handler 看到的是剩下的部分（例如 `/?repo=abc`） */
+    url?: string;
+    body?: string;
+    /** 連線的來源位址（預設是本機） */
+    remote?: string;
   }
 
-  async function startPlugin(repoDir: string, pollMs = 300) {
-    const plugin = gitSnapshot({ repoDir, pollMs }) as unknown as {
+  async function startPlugin(
+    repoDir: string,
+    pollMs = 300,
+    extra: {
+      repoRoots?: string[];
+      scanDepth?: number;
+      stateFile?: string | false;
+      idleMs?: number;
+    } = {},
+  ) {
+    return startWith(gitSnapshot({ repoDir, pollMs, stateFile: false, ...extra }), repoDir);
+  }
+
+  async function startWith(instance: ReturnType<typeof gitSnapshot>, repoDir: string) {
+    const plugin = instance as unknown as {
       configResolved(c: unknown): void;
       configureServer(s: unknown): Promise<void>;
       load(id: string): Promise<string | undefined>;
     };
     const sent: Sent[] = [];
-    let handler: ((req: unknown, res: unknown) => void) | undefined;
+    type Handler = (req: unknown, res: unknown) => void;
+    const handlers = new Map<string, Handler>();
     let invalidated = 0;
     const server = {
-      middlewares: { use: (_path: string, h: typeof handler) => (handler = h) },
+      middlewares: { use: (path: string, h: Handler) => handlers.set(path, h) },
       moduleGraph: { getModuleById: () => ({}), invalidateModule: () => invalidated++ },
       ws: { send: (m: Sent) => sent.push(m) },
       httpServer: null,
@@ -449,22 +511,55 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     } finally {
       process.env['VITEST'] = flag;
     }
-    const request = (headers: Record<string, string> = {}, method = 'GET') =>
-      new Promise<{ status: number; body: string }>((resolve) => {
+    const call = ({
+      path = '/__agg/git-snapshot',
+      headers = {},
+      method = 'GET',
+      url = '/',
+      body,
+      remote = '127.0.0.1',
+    }: Req = {}) =>
+      new Promise<{ status: number; body: string; json: () => any }>((resolve) => {
         const res = {
           statusCode: 200,
           setHeader() {},
-          end(body = '') {
-            resolve({ status: this.statusCode, body });
+          end(text = '') {
+            resolve({ status: this.statusCode, body: text, json: () => JSON.parse(text) });
           },
         };
-        handler!({ method, headers }, res);
+        const req = Object.assign(Readable.from(body === undefined ? [] : [Buffer.from(body)]), {
+          method,
+          headers: { host: 'localhost:4200', ...headers },
+          url,
+          socket: { remoteAddress: remote },
+        });
+        handlers.get(path)!(req, res);
+      });
+    const request = (headers: Record<string, string> = {}, method = 'GET') =>
+      call({ headers, method });
+    const snapshotOf = (repo: string, headers: Record<string, string> = {}) =>
+      call({ url: `/?repo=${encodeURIComponent(repo)}`, headers });
+    const repos = (headers: Record<string, string> = {}) => call({ path: '/__agg/repos', headers });
+    const addPath = (path: unknown, headers: Record<string, string> = {}) =>
+      call({
+        path: '/__agg/repos',
+        method: 'POST',
+        headers: {
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({ path }),
       });
     return {
       plugin,
       sent,
       warnings,
+      call,
       request,
+      snapshotOf,
+      repos,
+      addPath,
       invalidated: () => invalidated,
       close: () => server.close(),
     };
@@ -480,7 +575,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       for (let i = 2; i <= 5; i++) {
         commit(dir, `c${i}`);
         await waitFor(() => p.sent.length >= i - 1, 8000);
-        expect(p.sent.at(-1)!.data.graph!.commits).toHaveLength(i);
+        expect(p.sent.at(-1)!.data.snapshot!.graph!.commits).toHaveLength(i);
       }
       expect(p.invalidated()).toBeGreaterThanOrEqual(4); // 重新整理頁面時要拿到新的 module，而不是舊快取
     } finally {
@@ -496,7 +591,7 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
     try {
       commit(dir, 'two');
       await waitFor(() => p.sent.length >= 1, 8000);
-      expect(p.sent.at(-1)!.data.graph!.commits).toHaveLength(2);
+      expect(p.sent.at(-1)!.data.snapshot!.graph!.commits).toHaveLength(2);
     } finally {
       await p.close();
     }
@@ -554,9 +649,572 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       expect(body.graph).toBeNull();
       expect(body.error).toMatch(/not inside a git repository/);
       expect(body.error).not.toContain(tmpdir());
-      await waitFor(() => p.sent.some((m) => m.data.graph === null), 4000); // 也會推送給畫面
+      await waitFor(() => p.sent.some((m) => m.data.snapshot?.graph === null), 4000); // 也會推送給畫面
     } finally {
       await p.close();
     }
+  });
+
+  /** 一個放了幾個 repo 的資料夾：default 是 alpha，其他的是畫面上可以選的。 */
+  function makeRoot() {
+    const base = realpathSync(tmp('agg-roots-'));
+    const repo = (rel: string, msgs: string[]) => {
+      const dir = join(base, rel);
+      mkdirSync(dir, { recursive: true });
+      git(dir, 'init', '-q', '-b', 'main');
+      for (const m of msgs) commit(dir, m);
+      return dir;
+    };
+    return {
+      base,
+      alpha: repo('alpha', ['a1', 'a2']),
+      beta: repo('beta', ['b1', 'b2', 'b3']),
+      gamma: repo('group/gamma', ['g1']),
+    };
+  }
+
+  it('lists the default repo first, then the sibling repos — by id, never asking the browser for a path', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const res = await p.repos({ 'sec-fetch-site': 'same-origin' });
+      expect(res.status).toBe(200);
+      const body = res.json();
+      expect(body.truncated).toBe(false);
+      expect(body.repos.map((x: { name: string }) => x.name)).toEqual(['alpha', 'beta', 'gamma']);
+      expect(body.repos[0]).toMatchObject({ id: 'default', isDefault: true });
+      expect(body.repos[1]).toMatchObject({ id: repoIdFor(r.beta), isDefault: false });
+      expect(body.repos[1].id).toMatch(/^[0-9a-f]{12}$/);
+      expect(body.repos[2].label).toContain('group');
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('serves any listed repo by id; unknown ids are 404 and malformed ones 400', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      // 直接用 id（例如 dev server 重開後打開 `?local=<id>` 的網址）：還沒掃描過也要找得到
+      const beta = await p.snapshotOf(repoIdFor(r.beta));
+      expect(beta.status).toBe(200);
+      expect(beta.json().graph.commits).toHaveLength(3);
+      expect(beta.json().graph.repo.name).toBe('beta');
+      expect((await p.snapshotOf('default')).json().graph.commits).toHaveLength(2);
+      expect((await p.request()).json().graph.commits).toHaveLength(2); // 省略 repo = 預設
+      expect((await p.snapshotOf('0123456789ab')).status).toBe(404);
+      for (const bad of ['../etc', r.beta, 'ABCDEF012345', '0123456789abc', '']) {
+        expect((await p.snapshotOf(bad)).status, bad).toBe(400);
+      }
+      expect(
+        (await p.snapshotOf(repoIdFor(r.beta), { 'sec-fetch-site': 'cross-site' })).status,
+      ).toBe(403);
+      expect((await p.repos({ 'sec-fetch-site': 'cross-site' })).status).toBe(403);
+      expect((await p.repos({ 'sec-fetch-site': 'same-site' })).status).toBe(403);
+      expect((await p.repos({ origin: 'http://localhost:9999' })).status).toBe(403);
+      expect((await p.repos({ origin: 'http://localhost:4200' })).status).toBe(200);
+      expect((await p.call({ path: '/__agg/repos', method: 'DELETE' })).status).toBe(405);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('pushes live updates for a selected (non-default) repo, tagged with its id', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const id = repoIdFor(r.beta);
+      expect((await p.snapshotOf(id)).status).toBe(200);
+      commit(r.beta, 'b4');
+      await waitFor(() => p.sent.some((m) => m.data.repo === id), 8000);
+      // HMR 會廣播給所有連線（含 `vite --host` 時的區網裝置）：非預設 repo 只通知、不帶內容
+      const last = p.sent.filter((m) => m.data.repo === id).at(-1)!;
+      expect(last.data.snapshot).toBeUndefined();
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(4);
+      // 預設 repo 的 virtual module 不受影響
+      expect(p.sent.every((m) => m.data.repo === id)).toBe(true);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('keeps at most 4 non-default repos watched, and re-watches an evicted one when it is selected again', async () => {
+    const base = realpathSync(tmp('agg-lru-'));
+    const dirs = ['r0', 'r1', 'r2', 'r3', 'r4', 'main'].map((name) => {
+      const dir = join(base, name);
+      mkdirSync(dir);
+      git(dir, 'init', '-q', '-b', 'main');
+      commit(dir, `${name} one`);
+      return dir;
+    });
+    const p = await startPlugin(dirs[5]!, 0);
+    try {
+      for (const dir of dirs.slice(0, 5)) {
+        expect((await p.snapshotOf(repoIdFor(dir))).status).toBe(200);
+      }
+      const first = repoIdFor(dirs[0]!);
+      const last = repoIdFor(dirs[4]!);
+      commit(dirs[0]!, 'r0 two'); // r0 是最久沒用的：已經停止監看
+      commit(dirs[4]!, 'r4 two');
+      await waitFor(() => p.sent.some((m) => m.data.repo === last), 8000);
+      await sleep(600);
+      expect(p.sent.some((m) => m.data.repo === first)).toBe(false);
+      // 再選一次：拿到最新內容，而且之後的 commit 又會即時推送
+      expect((await p.snapshotOf(first)).json().graph.commits).toHaveLength(2);
+      commit(dirs[0]!, 'r0 three');
+      await waitFor(() => p.sent.some((m) => m.data.repo === first), 8000);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('opens a typed absolute path (or ~ path) only for same-origin JSON requests', async () => {
+    const r = makeRoot();
+    const elsewhere = realpathSync(tmp('agg-elsewhere-'));
+    const delta = join(elsewhere, 'delta');
+    mkdirSync(join(delta, 'src'), { recursive: true });
+    git(delta, 'init', '-q', '-b', 'main');
+    commit(delta, 'd1');
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      // 子資料夾也可以：解析成 repo 的根
+      const ok = await p.addPath(join(delta, 'src'));
+      expect(ok.status).toBe(200);
+      const repo = ok.json().repo;
+      expect(repo).toMatchObject({ id: repoIdFor(delta), name: 'delta', isDefault: false });
+      expect((await p.snapshotOf(repo.id)).json().graph.commits).toHaveLength(1);
+      // 加入後也出現在清單裡
+      const listed = (await p.repos()).json().repos.map((x: { id: string }) => x.id);
+      expect(listed).toContain(repo.id);
+      // 預設 repo 本身 → 回傳 default，不重複列出
+      expect((await p.addPath(r.alpha)).json().repo.id).toBe('default');
+
+      expect((await p.addPath('relative/path')).json().error).toBe('not_absolute');
+      expect((await p.addPath(join(elsewhere, 'missing'))).json().error).toBe('not_found');
+      expect((await p.addPath(elsewhere)).json().error).toBe('not_git');
+      expect((await p.addPath(42)).json().error).toBe('invalid_path');
+      expect((await p.addPath('/tmp/\0x')).status).toBe(400);
+      expect((await p.addPath('x'.repeat(5000))).status).toBe(400);
+
+      // CSRF：跨站、沒有來源資訊、來源不符、不是 JSON、太大 → 一律拒絕，而且不會被加進清單
+      const before = (await p.repos()).json().repos.length;
+      expect((await p.addPath(r.beta, { 'sec-fetch-site': 'cross-site' })).status).toBe(403);
+      expect((await p.addPath(r.beta, { 'sec-fetch-site': 'none' })).status).toBe(403);
+      expect((await p.addPath(r.beta, { 'sec-fetch-site': '' })).status).toBe(403);
+      expect(
+        (await p.addPath(r.beta, { 'sec-fetch-site': '', origin: 'http://evil.example' })).status,
+      ).toBe(403);
+      expect(
+        (await p.addPath(r.beta, { 'sec-fetch-site': '', origin: 'http://localhost:4200' })).status,
+      ).toBe(200);
+      expect((await p.addPath(r.beta, { 'content-type': 'text/plain' })).status).toBe(415);
+      expect(
+        (await p.addPath(r.beta, { 'content-type': 'application/x-www-form-urlencoded' })).status,
+      ).toBe(415);
+      const big = await p.call({
+        path: '/__agg/repos',
+        method: 'POST',
+        headers: { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+        body: JSON.stringify({ path: r.beta, pad: 'x'.repeat(20_000) }),
+      });
+      expect(big.status).toBe(413);
+      const garbage = await p.call({
+        path: '/__agg/repos',
+        method: 'POST',
+        headers: { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+        body: '{not json',
+      });
+      expect(garbage.status).toBe(400);
+      expect((await p.repos()).json().repos.length).toBe(before);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('only answers this machine: LAN clients (vite --host) see the default repo but cannot list, add or read others', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const lan = '192.168.1.23';
+      const id = repoIdFor(r.beta);
+      expect((await p.call({ path: '/__agg/repos', remote: lan })).json().error).toBe('local_only');
+      expect((await p.call({ path: '/__agg/repos', remote: lan })).status).toBe(403);
+      const post = await p.call({
+        path: '/__agg/repos',
+        method: 'POST',
+        remote: lan,
+        headers: { origin: 'http://localhost:4200', 'content-type': 'application/json' },
+        body: JSON.stringify({ path: r.beta }),
+      });
+      expect(post.status).toBe(403);
+      expect((await p.call({ url: `/?repo=${id}`, remote: lan })).status).toBe(403);
+      expect((await p.call({ url: '/?repo=default', remote: lan })).status).toBe(200);
+      for (const local of ['127.0.0.1', '127.1.2.3', '::1', '::ffff:127.0.0.1']) {
+        expect((await p.call({ url: `/?repo=${id}`, remote: local })).status, local).toBe(200);
+      }
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('remembers typed paths in the state file across dev server restarts (not in the browser)', async () => {
+    const r = makeRoot();
+    const elsewhere = realpathSync(tmp('agg-state-'));
+    const delta = join(elsewhere, 'delta');
+    mkdirSync(delta);
+    git(delta, 'init', '-q', '-b', 'main');
+    commit(delta, 'd1');
+    const stateFile = join(elsewhere, 'cache', 'local-repos.json');
+    const first = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      expect((await first.addPath(delta)).status).toBe(200);
+      await waitFor(() => existsSync(stateFile));
+    } finally {
+      await first.close();
+    }
+    expect(JSON.parse(readFileSync(stateFile, 'utf8'))).toEqual({ paths: [delta] });
+    const second = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      const ids = (await second.repos()).json().repos.map((x: { id: string }) => x.id);
+      expect(ids).toContain(repoIdFor(delta));
+      expect((await second.snapshotOf(repoIdFor(delta))).json().graph.commits).toHaveLength(1);
+    } finally {
+      await second.close();
+    }
+    // 壞掉的檔案 / 不存在的路徑 / 相對路徑：略過，不影響啟動
+    writeFileSync(stateFile, JSON.stringify({ paths: ['relative', join(elsewhere, 'gone'), 7] }));
+    const third = await startPlugin(r.alpha, 0, { stateFile });
+    try {
+      expect((await third.repos()).json().repos.map((x: { name: string }) => x.name)).toEqual([
+        'alpha',
+        'beta',
+        'gamma',
+      ]);
+    } finally {
+      await third.close();
+    }
+  });
+
+  it('rejects UNC / device paths (realpath would reach out to a network host on Windows)', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      for (const unc of ['//attacker/share', '\\\\attacker\\share', '\\\\?\\C:\\x']) {
+        expect((await p.addPath(unc)).status, unc).toBe(400);
+      }
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('stops watching a non-default repo nobody asked for in a while, and picks it up again when asked', async () => {
+    const r = makeRoot();
+    const p = await startPlugin(r.alpha, 0, { idleMs: 300 });
+    try {
+      const id = repoIdFor(r.beta);
+      expect((await p.snapshotOf(id)).status).toBe(200);
+      await sleep(1200); // 掃過一次以上：已經停止監看
+      commit(r.beta, 'b4');
+      await sleep(800);
+      expect(p.sent.some((m) => m.data.repo === id)).toBe(false);
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(4);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('typing a path inside a git directory resolves to the repository itself (no duplicate entries)', async () => {
+    const r = makeRoot();
+    const bare = join(r.base, 'srv', 'b.git');
+    git(r.base, 'clone', '-q', '--bare', r.beta, bare);
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      expect((await p.addPath(join(r.alpha, '.git'))).json().repo.id).toBe('default');
+      expect((await p.addPath(join(r.alpha, '.git', 'refs'))).json().repo.id).toBe('default');
+      expect((await p.addPath(join(r.beta, '.git'))).json().repo).toMatchObject({
+        id: repoIdFor(r.beta),
+        name: 'beta',
+      });
+      expect((await p.addPath(join(bare, 'refs'))).json().repo).toMatchObject({
+        id: repoIdFor(bare),
+        name: 'b',
+      });
+      const names = (await p.repos()).json().repos.map((x: { name: string }) => x.name);
+      expect(names).toEqual(['alpha', 'b', 'beta', 'gamma']);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('paths inside a linked worktree or a separate git dir collapse to one entry', async () => {
+    const r = makeRoot();
+    const wt = join(r.base, 'beta-wt');
+    git(r.beta, 'worktree', 'add', '-q', wt, '-b', 'wt-branch');
+    const sep = join(r.base, 'sep-store');
+    const sepWork = join(r.base, 'sep-work');
+    mkdirSync(sepWork);
+    git(sepWork, 'init', '-q', '-b', 'main', '--separate-git-dir', sep);
+    commit(sepWork, 's1');
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const wtGitDir = join(r.beta, '.git', 'worktrees', 'beta-wt');
+      expect((await p.addPath(wtGitDir)).json().repo).toMatchObject({ id: repoIdFor(wt) });
+      expect((await p.addPath(join(wtGitDir, 'logs'))).json().repo.id).toBe(repoIdFor(wt));
+      const a = (await p.addPath(join(sep, 'refs'))).json().repo.id;
+      expect((await p.addPath(join(sep, 'refs', 'heads'))).json().repo.id).toBe(a);
+      expect((await p.addPath(sep)).json().repo.id).toBe(a);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('a worktree of a bare repo maps back to the worktree (not the admin dir)', async () => {
+    const r = makeRoot();
+    const bare = join(r.base, 'hub.git');
+    git(r.base, 'clone', '-q', '--bare', r.beta, bare);
+    const wt = join(r.base, 'hub-wt');
+    git(bare, 'worktree', 'add', '-q', wt, '-b', 'from-bare');
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const admin = join(bare, 'worktrees', 'hub-wt');
+      expect((await p.addPath(admin)).json().repo).toMatchObject({
+        id: repoIdFor(wt),
+        name: 'hub-wt',
+      });
+      expect((await p.addPath(join(bare, 'refs'))).json().repo.id).toBe(repoIdFor(bare));
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('keeps the user GIT_CEILING_DIRECTORIES (a folder under a ceiling is not swallowed by a repo above it)', async () => {
+    const r = makeRoot();
+    const inner = join(r.alpha, 'not-a-repo');
+    mkdirSync(inner);
+    const saved = process.env['GIT_CEILING_DIRECTORIES'];
+    process.env['GIT_CEILING_DIRECTORIES'] = r.alpha;
+    try {
+      expect((await readGitSnapshot(inner)).code).toBe('not_git');
+    } finally {
+      if (saved === undefined) delete process.env['GIT_CEILING_DIRECTORIES'];
+      else process.env['GIT_CEILING_DIRECTORIES'] = saved;
+    }
+  });
+
+  it('starts watching once a repo that could not be opened becomes readable (e.g. after git init / safe.directory)', async () => {
+    const r = makeRoot();
+    const later = join(r.base, 'later');
+    mkdirSync(join(later, '.git'), { recursive: true }); // 掃描看得到（有 .git），但還不是 repo
+    const p = await startPlugin(r.alpha, 0);
+    try {
+      const id = repoIdFor(later);
+      expect((await p.snapshotOf(id)).json().code).toBe('not_git');
+      rmSync(join(later, '.git'), { recursive: true, force: true });
+      git(later, 'init', '-q', '-b', 'main');
+      commit(later, 'l1');
+      expect((await p.snapshotOf(id)).json().graph.commits).toHaveLength(1);
+      await sleep(300); // 監看是在背景裝上的
+      commit(later, 'l2');
+      await waitFor(() => p.sent.some((m) => m.data.repo === id), 8000);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('ignores an inherited GIT_DIR / GIT_WORK_TREE (each repo is read from its own folder)', async () => {
+    const r = makeRoot();
+    const saved = { dir: process.env['GIT_DIR'], tree: process.env['GIT_WORK_TREE'] };
+    process.env['GIT_DIR'] = join(r.gamma, '.git');
+    process.env['GIT_WORK_TREE'] = r.gamma;
+    try {
+      expect((await readGitSnapshot(r.beta)).graph!.commits).toHaveLength(3);
+      expect((await readGitSnapshot(r.alpha)).graph!.commits).toHaveLength(2);
+    } finally {
+      if (saved.dir === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved.dir;
+      if (saved.tree === undefined) delete process.env['GIT_WORK_TREE'];
+      else process.env['GIT_WORK_TREE'] = saved.tree;
+    }
+  });
+
+  it('AGG_DEFAULT_BRANCH / defaultBranch only applies to the default repo', async () => {
+    const r = makeRoot();
+    git(r.beta, 'branch', 'develop');
+    git(r.alpha, 'branch', 'develop');
+    const plugin = gitSnapshot({
+      repoDir: r.alpha,
+      pollMs: 0,
+      stateFile: false,
+      defaultBranch: 'develop',
+    });
+    const q = await startWith(plugin, r.alpha);
+    try {
+      const def = (await q.snapshotOf('default')).json().graph;
+      expect(def.refs.find((x: { isDefault?: boolean }) => x.isDefault).name).toBe('develop');
+      const beta = (await q.snapshotOf(repoIdFor(r.beta))).json().graph;
+      expect(beta.refs.find((x: { isDefault?: boolean }) => x.isDefault).name).toBe('main');
+    } finally {
+      await q.close();
+    }
+  });
+
+  it('the same plugin instance configured twice (server.restart) keeps pushing after the old server closes', async () => {
+    const dir = tmp('agg-restart-');
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'one');
+    const plugin = gitSnapshot({ repoDir: dir, pollMs: 0, stateFile: false });
+    const first = await startWith(plugin, dir);
+    const second = await startWith(plugin, dir);
+    await first.close(); // 舊 server 的 cleanup 不能停掉新 server 的監看
+    try {
+      commit(dir, 'two');
+      await waitFor(
+        () => second.sent.some((m) => m.data.snapshot?.graph?.commits.length === 2),
+        8000,
+      );
+      expect(first.sent.some((m) => m.data.snapshot?.graph?.commits.length === 2)).toBe(false);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it('scans the configured roots (repoRoots) instead of the default repo siblings', async () => {
+    const r = makeRoot();
+    const other = realpathSync(tmp('agg-other-root-'));
+    const zeta = join(other, 'zeta');
+    mkdirSync(zeta);
+    git(zeta, 'init', '-q', '-b', 'main');
+    commit(zeta, 'z1');
+    const p = await startPlugin(r.alpha, 0, { repoRoots: [other] });
+    try {
+      const names = (await p.repos()).json().repos.map((x: { name: string }) => x.name);
+      expect(names).toEqual(['alpha', 'zeta']);
+      expect((await p.snapshotOf(repoIdFor(r.beta))).status).toBe(404); // 不在範圍內
+    } finally {
+      await p.close();
+    }
+  });
+});
+
+describe('discoverRepos', () => {
+  it('finds repos (incl. worktrees and bare *.git) without following symlinks or descending into repos', async () => {
+    const base = realpathSync(tmp('agg-discover-'));
+    const init = (rel: string) => {
+      const dir = join(base, rel);
+      mkdirSync(dir, { recursive: true });
+      git(dir, 'init', '-q', '-b', 'main');
+      commit(dir, rel);
+      return dir;
+    };
+    const a = init('a');
+    init('a/nested'); // repo 裡面的 repo（submodule 等）不列
+    const deep = init('x/y/deep');
+    init('x/y/z/too-deep'); // 第 4 層：超過預設深度 3
+    init('node_modules/pkg');
+    init('.hidden/repo');
+    init('dist/out');
+    const outside = realpathSync(tmp('agg-discover-outside-'));
+    git(outside, 'init', '-q', '-b', 'main');
+    symlinkSync(outside, join(base, 'link-to-outside'));
+    symlinkSync(base, join(base, 'x', 'loop'));
+    git(base, 'clone', '-q', '--bare', a, join(base, 'srv', 'b.git'));
+    git(a, 'worktree', 'add', '-q', join(base, 'wt'), '-b', 'wt-branch');
+    mkdirSync(join(base, 'not-a-repo', 'empty'), { recursive: true });
+    const build = init('build'); // 名字在略過清單裡，但它本身就是 repo：要列出來（只是不往裡面找）
+    init('build/inner');
+
+    const { repos, truncated } = await discoverRepos([base]);
+    expect(truncated).toBe(false);
+    expect(repos).toEqual([a, build, deep, join(base, 'srv', 'b.git'), join(base, 'wt')].sort());
+
+    expect((await discoverRepos([base], { maxDepth: 4 })).repos).toContain(
+      join(base, 'x/y/z/too-deep'),
+    );
+    const limited = await discoverRepos([base], { maxDirs: 2 });
+    expect(limited.truncated).toBe(true);
+    expect((await discoverRepos([base], { maxRepos: 1 })).repos).toHaveLength(1);
+    // 根目錄本身就是 repo
+    expect((await discoverRepos([a])).repos).toEqual([a]);
+    // 不存在的根目錄、整個磁碟的根：略過
+    expect((await discoverRepos([join(base, 'missing'), '/'])).repos).toEqual([]);
+  });
+});
+
+describe('isSameOrigin', () => {
+  const req = (headers: Record<string, string>) =>
+    ({ headers: { host: 'localhost:4200', ...headers } }) as never;
+  it('trusts fetch metadata first, then Origin, and allows direct requests only when asked', () => {
+    expect(isSameOrigin(req({ 'sec-fetch-site': 'same-origin' }), false)).toBe(true);
+    expect(isSameOrigin(req({ 'sec-fetch-site': 'none' }), true)).toBe(true);
+    expect(isSameOrigin(req({ 'sec-fetch-site': 'none' }), false)).toBe(false);
+    expect(isSameOrigin(req({ 'sec-fetch-site': 'same-site' }), true)).toBe(false);
+    expect(isSameOrigin(req({ 'sec-fetch-site': 'cross-site' }), true)).toBe(false);
+    expect(isSameOrigin(req({ origin: 'http://localhost:4200' }), false)).toBe(true);
+    expect(isSameOrigin(req({ origin: 'http://localhost:4201' }), true)).toBe(false);
+    expect(isSameOrigin(req({ origin: 'null' }), true)).toBe(false);
+    expect(isSameOrigin(req({}), true)).toBe(true);
+    expect(isSameOrigin(req({}), false)).toBe(false);
+  });
+});
+
+describe('findGit', () => {
+  it('only uses absolute PATH entries, so a git binary planted in the selected repo is never executed', async () => {
+    const saved = process.env['PATH'];
+    const real = findGit();
+    expect(real && isAbsolute(real)).toBe(true);
+    const repo = realpathSync(tmp('agg-planted-'));
+    git(repo, 'init', '-q', '-b', 'main');
+    commit(repo, 'one');
+    const marker = join(repo, 'PWNED');
+    writeFileSync(join(repo, 'git'), `#!/bin/sh\ntouch '${marker}'\n`);
+    chmodSync(join(repo, 'git'), 0o755);
+    try {
+      // 空字串與 `.` 在 POSIX 都代表 cwd（也就是被選到的 repo）
+      process.env['PATH'] = ['', '.', 'relative/bin', dirname(real!)].join(delimiter);
+      expect(findGit()).toBe(real);
+      expect((await readGitSnapshot(repo)).graph!.commits).toHaveLength(1);
+      expect(existsSync(marker)).toBe(false);
+      process.env['PATH'] = ['', '.'].join(delimiter);
+      expect(findGit()).toBeNull();
+      const snap = await readGitSnapshot(repo);
+      expect(snap.error).toBe('git is not installed');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      process.env['PATH'] = saved;
+    }
+    expect(findGit()).toBe(real);
+  });
+});
+
+describe('defaultStateFile', () => {
+  it('lives in the user state dir (never inside the project Vite serves), one file per project', () => {
+    const saved = process.env['XDG_STATE_HOME'];
+    process.env['XDG_STATE_HOME'] = '/state-home';
+    try {
+      const a = defaultStateFile('/work/app-a') as string;
+      expect(a.startsWith('/state-home/adorable-git-graph/local-repos-')).toBe(
+        process.platform !== 'win32',
+      );
+      expect(a).not.toContain('/work/app-a');
+      expect(defaultStateFile('/work/app-b')).not.toBe(a);
+      expect(defaultStateFile('/work/app-a/')).toBe(a);
+      // 相對的 XDG_STATE_HOME 不算（會變成相對於 cwd = Vite 的 root）：退回家目錄底下
+      process.env['XDG_STATE_HOME'] = '.local/state';
+      const fallback = defaultStateFile('/work/app-a') as string;
+      expect(isAbsolute(fallback)).toBe(true);
+      expect(fallback.startsWith(homedir())).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env['XDG_STATE_HOME'];
+      else process.env['XDG_STATE_HOME'] = saved;
+    }
+  });
+});
+
+describe('snapshot error codes', () => {
+  it('tags failures so the page can show a localised explanation', async () => {
+    expect((await readGitSnapshot(join(tmpdir(), 'agg-definitely-missing'))).code).toBe(
+      'missing_dir',
+    );
+    expect((await readGitSnapshot(tmp('agg-nogit-code-'))).code).toBe('not_git');
   });
 });

@@ -1,6 +1,9 @@
 import { isValidRepoSegment, parseGitHubRemote } from '@adorable/graph-core';
+import { DEFAULT_REPO, isRepoId } from './protocol';
 
-export type Source = { kind: 'local' } | { kind: 'github'; owner: string; repo: string };
+/** `local.id`：dev server 清單裡的本機 repo（省略 = 啟動時指定的預設 repo）。 */
+export type Source =
+  { kind: 'local'; id?: string } | { kind: 'github'; owner: string; repo: string };
 
 export interface RepoName {
   owner: string;
@@ -33,14 +36,22 @@ export function parseRepoInput(input: string): RepoName | null {
   return m ? validated(m[1]!, m[2]!) : null;
 }
 
+/** `?repo=owner/name` → GitHub；`?local=<id>` → 本機清單裡的某個 repo；其他 → 預設的本機 repo。 */
 export function sourceFromSearch(search: string): Source {
-  const value = new URLSearchParams(search).get('repo');
+  const params = new URLSearchParams(search);
+  const value = params.get('repo');
   const parsed = value ? parseRepoInput(value) : null;
-  return parsed ? { kind: 'github', ...parsed } : { kind: 'local' };
+  if (parsed) return { kind: 'github', ...parsed };
+  const id = params.get('local');
+  return id && id !== DEFAULT_REPO && isRepoId(id) ? { kind: 'local', id } : { kind: 'local' };
 }
 
 export function searchFromSource(source: Source): string {
-  return source.kind === 'github'
-    ? `?repo=${encodeURIComponent(`${source.owner}/${source.repo}`).replace('%2F', '/')}`
-    : '';
+  if (source.kind === 'github')
+    return `?repo=${encodeURIComponent(`${source.owner}/${source.repo}`).replace('%2F', '/')}`;
+  return source.id && source.id !== DEFAULT_REPO ? `?local=${source.id}` : '';
 }
+
+/** 同一個本機 repo 一律用同一種寫法（預設 repo 不帶 id），比較與網址才不會分岔。 */
+export const localSource = (id: string | undefined): Source =>
+  id && id !== DEFAULT_REPO ? { kind: 'local', id } : { kind: 'local' };

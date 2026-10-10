@@ -23,7 +23,7 @@ import { chromium } from 'playwright-core';
 import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
 import { fakeGithubPage } from '../../../tools/e2e/fake-github-page.mjs';
 import { colorDistance, inkRatio, samplePixels } from '../../../tools/e2e/pixels.mjs';
-import { SPECS, seen, sha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
+import { SPECS, latency, seen, sha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const artifacts = resolve(root, 'e2e/.artifacts');
@@ -1466,13 +1466,20 @@ try {
       assert.ok(before.scrollTop > 100, `scrolled down before refreshing (${before.scrollTop})`);
       assert.equal(before.selected, sha('m6'));
       const requests = seen.paths.length;
-      await page.getByRole('button', { name: L.refresh }).click();
-      await waitUntil(() => seen.paths.length > requests, 15_000, 'refresh hits the API again');
-      await waitUntil(
-        () => page.evaluate(() => window.__aggRefreshLog.includes('aria-busy=null')),
-        20_000,
-        'the refresh spinner stops',
-      );
+      // API 回應太快時，React 會把「開始重新整理」和「完成」合併成同一次 render，轉圈根本不會出現：
+      // 讓每個回應慢一點，轉圈一定看得到（要驗證的是「轉圈而列表不卸載」，不是網路有多快）
+      latency.ms = 150;
+      try {
+        await page.getByRole('button', { name: L.refresh }).click();
+        await waitUntil(() => seen.paths.length > requests, 15_000, 'refresh hits the API again');
+        await waitUntil(
+          () => page.evaluate(() => window.__aggRefreshLog.includes('aria-busy=null')),
+          20_000,
+          'the refresh spinner stops',
+        );
+      } finally {
+        latency.ms = 0;
+      }
       await settle(500);
       const after = await ui((r) => {
         const sc = r.querySelector('.agg-scroll');
