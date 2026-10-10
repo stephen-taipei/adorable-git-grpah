@@ -11,16 +11,30 @@
 //   · 即時更新（git commit / 一次進來好幾筆 / branch / checkout / tag / 刪 branch）：不重新整理、只有新的 commit 彈出來、
 //     捲動錨定（捲下去時畫面最上面的 commit 不動、選取不丟、不重播）
 //   · GitHub 來源（輸入驗證、404、rate limit、loading、深連結與快取、token 只以 Bearer header 送出且不進 DOM / URL / 快取）
-//   · 安全性（cross-origin 讀不到 dev endpoint、快照與 bundle 沒有 commit 本文 / email）→ 主題記憶 → zh-TW → 其他本機 repo
-//     （沒有 remote / 空的 / 不是 git）→ 本機 build + preview。
+//   · 安全性（cross-origin 讀不到 dev endpoint、快照與 bundle 沒有 commit 本文 / email）→ 主題記憶 → zh-TW
+//   · 本機 repo 選擇器（AGG_REPO_ROOTS 指向專用的暫時資料夾：清單內容 / 略過的資料夾 / 不跟隨 symlink、切換與上一頁 / 下一頁、
+//     深連結、非預設 repo 的即時更新、不認得的 id、輸入路徑（錯誤訊息 / Esc / 記在 localStorage、dev server 重新啟動後仍打得開）、
+//     跨來源讀不到也加不進 repo、偽造 Host 被 Vite 擋下、手機寬度沒有橫向溢位、與 GitHub 來源來回切換）
+//   → 其他本機 repo（沒有 remote / 空的 / 不是 git）→ 本機 build + preview。
 // 軟體 WebGL（SwiftShader）在 CPU 吃緊時很慢：一律等「狀態」（data-replay、定位器、輪詢），不用固定 sleep 當判斷依據；
 // 像素判斷失敗時會重截幾次才判定；逾時乘上 E2E_TIMEOUT_SCALE（預設 2）。截圖輸出到 e2e/.artifacts。
 //   用法：pnpm e2e        （環境變數 CHROME_PATH 可指定 Chrome）
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
@@ -113,6 +127,57 @@ function makeRepo() {
   return dir; // 88 commits, 3 branches, 1 tag, 1 merge
 }
 
+/**
+ * 本機 repo 選擇器的掃描範圍（AGG_REPO_ROOTS）：專用的暫時資料夾，清單才是確定的
+ * （沒有設定時，掃描的是預設 repo 的上一層，也就是 /tmp，裡面什麼都有）。
+ *   roots/beta/                 一般 repo：30 個 commit（捲得動），說明都以 beta: 開頭，另有一條 branch
+ *   roots/group/gamma/          第 2 層的 repo
+ *   roots/node_modules/hidden/  略過的資料夾裡的 repo：不能出現在清單裡
+ *   roots/.hidden/repo/         `.` 開頭的資料夾裡的 repo：不能出現在清單裡
+ *   roots/linked → outside/far-away   指到範圍外的 symlink：不跟隨，不能出現在清單裡
+ *   roots/plain/                不是 git repo 的資料夾
+ *   outside/far-away/           範圍外的 repo：只能用「開啟其他路徑…」輸入絕對路徑打開
+ *   outside/sneaky/             跨來源的 POST 想偷偷加進清單的 repo
+ */
+function makeRepoRoots() {
+  const rootsDir = mkdtempSync(resolve(tmpdir(), 'agg-web-e2e-roots-'));
+  const outsideDir = mkdtempSync(resolve(tmpdir(), 'agg-web-e2e-outside-'));
+  const init = (dir) => {
+    mkdirSync(dir, { recursive: true });
+    git(dir, 'init', '-q', '-b', 'main');
+    return dir;
+  };
+  const beta = init(resolve(rootsDir, 'beta'));
+  for (let i = 1; i <= 26; i++) commit(beta, `beta: lantern ${i}`, 'Dan');
+  git(beta, 'checkout', '-q', '-b', 'beta-side');
+  commit(beta, 'beta: side path one', 'Eve');
+  commit(beta, 'beta: side path two', 'Eve');
+  git(beta, 'checkout', '-q', 'main');
+  commit(beta, 'beta: lantern 27', 'Dan');
+  commit(beta, 'beta: lantern 28', 'Dan');
+  const gamma = init(resolve(rootsDir, 'group', 'gamma'));
+  commit(gamma, 'gamma: nested one', 'Dan');
+  commit(gamma, 'gamma: nested two', 'Dan');
+  for (const hidden of [
+    resolve(rootsDir, 'node_modules', 'hidden'),
+    resolve(rootsDir, '.hidden', 'repo'),
+  ]) {
+    init(hidden);
+    commit(hidden, 'hidden: must not be listed');
+  }
+  const plain = resolve(rootsDir, 'plain');
+  mkdirSync(plain);
+  writeFileSync(resolve(plain, 'notes.txt'), 'not a repository\n');
+  const far = init(resolve(outsideDir, 'far-away'));
+  commit(far, 'far: postcard one', 'Dan');
+  commit(far, 'far: postcard two', 'Dan');
+  commit(far, 'far: postcard three', 'Dan');
+  symlinkSync(far, resolve(rootsDir, 'linked'), 'dir');
+  const sneaky = init(resolve(outsideDir, 'sneaky'));
+  commit(sneaky, 'sneaky: should never be added cross-origin', 'Dan');
+  return { rootsDir, outsideDir, beta, gamma, plain, far, sneaky };
+}
+
 // ───────────────────────── helpers ─────────────────────────
 
 const freePort = () =>
@@ -126,6 +191,14 @@ const freePort = () =>
   });
 
 const dirBase = (d) => d.split('/').pop();
+/** 與 dev server 相同的 repo id：realpath 的 sha256 前 12 碼（瀏覽器只會拿到這個，不會拿到路徑）。 */
+const repoIdOf = (d) => createHash('sha256').update(realpathSync(d)).digest('hex').slice(0, 12);
+/** 與 dev server 相同的顯示位置：家目錄縮寫成 ~。 */
+const repoLabelOf = (d) => {
+  const real = realpathSync(d);
+  const home = homedir();
+  return real === home ? '~' : real.startsWith(`${home}/`) ? `~${real.slice(home.length)}` : real;
+};
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 function startVite(args, env) {
@@ -274,10 +347,12 @@ rmSync(artifacts, { recursive: true, force: true });
 mkdirSync(artifacts, { recursive: true });
 
 const repoDir = makeRepo();
+const fx = makeRepoRoots();
 const mock = await startMock();
 const apiBase = `http://127.0.0.1:${mock.address().port}`;
 const port = await freePort();
-const env = { AGG_REPO_DIR: repoDir, VITE_GITHUB_API_BASE: apiBase };
+// AGG_REPO_ROOTS：本機 repo 清單只掃描專用的暫時資料夾（預設 repo 仍是 AGG_REPO_DIR 的 88 個 commit）
+const env = { AGG_REPO_DIR: repoDir, VITE_GITHUB_API_BASE: apiBase, AGG_REPO_ROOTS: fx.rootsDir };
 
 let dev;
 let preview;
@@ -1887,8 +1962,12 @@ try {
       await tagScroller();
       const before = await scrollTopNow();
       assert.ok(before >= 800, `scrolled down (${before})`);
+      // 預設 repo 的快照：GET /__agg/git-snapshot?repo=default
       const [req] = await Promise.all([
-        page.waitForRequest((r) => r.url().endsWith('/__agg/git-snapshot')),
+        page.waitForRequest((r) => {
+          const u = new URL(r.url());
+          return u.pathname === '/__agg/git-snapshot' && u.searchParams.get('repo') === 'default';
+        }),
         page.getByRole('button', { name: /^(重新整理|Refresh)$/ }).click(),
       ]);
       assert.equal(req.method(), 'GET');
@@ -2676,7 +2755,7 @@ try {
   await step(
     'theme toggle cycles auto → day → night, persists across reloads, and the graph follows',
     async () => {
-      const toggle = page.locator('.web-icon');
+      const toggle = page.locator('.web-theme');
       await replayDone();
       const dayBg = (await graphSync('day theme')).samples[0].bg;
       await toggle.click(); // day
@@ -2946,4 +3025,6 @@ try {
   preview?.proc.kill();
   mock.close();
   rmSync(repoDir, { recursive: true, force: true });
+  rmSync(fx.rootsDir, { recursive: true, force: true });
+  rmSync(fx.outsideDir, { recursive: true, force: true });
 }
