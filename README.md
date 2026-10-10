@@ -29,8 +29,10 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
   另有每 2 秒比對 ref 清單的安全網；git 暫時出錯時保留上一張好的圖，不會讓 dev server 掛掉。
 - **選擇本機 repo**（只有 dev server）：`📍 本機` 旁的選單列出預設 repo（★）與它**同層資料夾**裡的 git repo
   （往下找 3 層；一般 repo、worktree、`*.git` bare repo 都算；略過 `node_modules`、`.` 開頭、`dist` / `build` 等資料夾，不跟隨 symlink、不往 repo 裡面找）。
-  選了之後網址變成 `/?local=<id>`（可加書籤、上一頁 / 下一頁可用），那個 repo 一樣即時更新（最多同時監看 4 個非預設 repo，最久沒看的會先停，再選到時重新開始）。
-  清單外的 repo：選「＋ 開啟其他路徑…」輸入**絕對路徑**（可用 `~`，repo 裡的子資料夾也可以）；輸入過的路徑記在這個瀏覽器，dev server 重開後會自動重新登記。
+  選了之後網址變成 `/?local=<id>`（可加書籤、上一頁 / 下一頁可用），那個 repo 一樣即時更新
+  （最多同時監看 4 個非預設 repo，最久沒看的先停；10 分鐘沒人看的也會停，再選到時重新開始）。
+  清單外的 repo：選「＋ 開啟其他路徑…」輸入**絕對路徑**（可用 `~`，repo 裡的子資料夾也可以）；
+  加入過的路徑由 dev server 記在 `apps/web/node_modules/.cache/adorable-git-graph/local-repos.json`（`AGG_LOCAL_REPOS_FILE` 可改位置），重開後仍在清單裡；要移除就編輯或刪掉這個檔案。
   回到這個分頁時清單會重新掃描（剛 `git clone` 的 repo 會出現）。
 - 標題列下方的 `📍 本機 | 🐙 GitHub`：切到 GitHub 後輸入 `owner/repo` 或 GitHub 網址（也可直接開 `/?repo=owner/repo`），
   從瀏覽器直接呼叫 GitHub REST API（與 extension 同一套 `fetchGitHubGraph`），結果快取 10 分鐘。
@@ -48,8 +50,13 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
 > 但 subject、作者名與 branch / tag 名稱仍是公開資訊：**不要把私有 repo 的建置結果公開部署**。
 > dev server 預設只綁 `localhost`；`/__agg/git-snapshot`、`/__agg/repos` 只存在於 dev、只回應同源請求（其他 localhost 埠上的頁面讀不到，e2e 有驗證），不會出現在 build 中。
 > 偽造的 `Host`（DNS rebinding）會先被 Vite 自己的 host 檢查擋掉。瀏覽器選 repo 時只送出 server 算出的 id（realpath 的雜湊），不會送路徑；
-> 唯一的例外是「開啟其他路徑」：那是使用者自己輸入的路徑，server 只接受同源頁面送來的 `application/json` POST（跨站表單 / no-cors 請求送不出，fetch 會被 CORS preflight 擋下）。
+> 唯一的例外是「開啟其他路徑」：那是使用者自己輸入的路徑，server 只接受同源頁面送來的 `application/json` POST（跨站表單 / no-cors 請求送不出，fetch 會被 CORS preflight 擋下），
+> 不接受 Windows 的 UNC / 裝置路徑，路徑也不存放在瀏覽器（`localhost:<port>` 這個 origin 會被其他專案的 dev server 共用）。
+> repo 清單、手動加入路徑與「預設以外」的 repo 只回應**這台電腦**的連線：`pnpm start -- --host` 讓手機連進來時，其他裝置只看得到預設 repo（它本來就在 bundle 裡）；
+> HMR 會廣播給所有連線，所以其他 repo 的更新只送「有變」的通知，內容要經由只回應本機的 endpoint 拿。
 > 掃描只檢查資料夾裡有沒有 `.git`，不會在清單上的每個 repo 執行 git；只有你選了某個 repo，dev server 才會在那裡執行唯讀的 git 指令（等同你自己在那裡打 `git log`）。
+> git 一律以 PATH 裡的**絕對路徑**執行：repo 裡放了一個 `git` / `git.exe` 也不會被執行（Windows 會先在工作目錄找執行檔，所以不能直接用 `git` 這個名字）。
+> repo id 沒有加密鹽：知道你某個 repo 完整路徑的網站，可以把你導向 `/?local=<id>` 讓 dev server 開始監看那個 repo（讀不到內容，只會多跑幾個唯讀的 git 指令）。
 > 靜態版沒有後端可重讀 git，因此不顯示重新整理按鈕。
 > `pnpm build` 不使用 Nx 快取 web（快照是建置當下的 git 狀態，不是檔案內容的函數）。
 
