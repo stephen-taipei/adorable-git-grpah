@@ -14,18 +14,24 @@ import {
   LAYOUT,
   anchoredScrollTop,
   computeMetrics,
+  detailWidthFor,
   stableMetrics,
   visibleRows,
 } from '../scene/geometry';
-import type { LogMetrics } from '../scene/geometry';
+import type { DetailSize, LogMetrics } from '../scene/geometry';
 import { CommitDetail } from './CommitDetail';
 import { ColumnHeader, CommitRow, rowDomId } from './CommitList';
 import { GitGraphCanvas } from './GitGraphCanvas';
 import type { GitGraphCanvasHandle } from './GitGraphCanvas';
+import { HistoryFooter } from './HistoryFooter';
+import { isAppendOnly } from './history';
+import type { HistoryState } from './history';
 import { Mascot } from './Mascot';
 import { Toolbar } from './Toolbar';
 import { useElementSize, usePrefersDark, usePrefersReducedMotion } from './hooks';
 import { GearIcon, PlayIcon, RefreshIcon, CloseIcon, TopIcon } from './icons';
+
+export type { HistoryFooterState, HistoryState } from './history';
 
 export type ViewerState =
   | { kind: 'loading' }
@@ -54,6 +60,23 @@ export interface GitGraphViewerProps {
   headerExtra?: ReactNode;
   /** 資料來源的識別（例如 `local` / `github`）。同名 repo 換來源時不會被當成「剛 commit 了一筆」的增量更新。 */
   sourceKey?: string;
+  /**
+   * 更早的歷史（infinite scroll）：列表尾端接近可視範圍（下緣再往下約 1.5 個視窗高）時呼叫。
+   * 使用端把更早的 commit 接在 layout 後面（同一個 sourceKey + title ⇒ 場景走增量、不重播；捲動 / 選取 / 搜尋都保留）。
+   * 沒給 onLoadMore 時維持原本的「更早的歷史已省略 / 最初的 commit 在這裡」頁尾。
+   */
+  onLoadMore?: () => void;
+  /** 更早的歷史的狀態：`more` 還有更早的、`loading` 載入中、`error` 失敗（顯示「再試一次」，不自動重試）。 */
+  history?: HistoryState;
+  /**
+   * 詳情面板的大小（面板右上角的按鈕切換）。給了就是 controlled（要配合 onDetailSizeChange）；
+   * 沒給就由 viewer 自己記（預設 'normal'）。寬螢幕並排時 'wide' 約為 viewer 的一半（380–720px），
+   * 中等寬度的浮動抽屜也跟著加寬；窄螢幕的底部面板本來就是全寬，不顯示按鈕。
+   */
+  detailSize?: DetailSize;
+  onDetailSizeChange?: (size: DetailSize) => void;
+  /** 詳情面板裡額外的內容（放在面板底部的動作列，「在 GitHub 開啟」旁邊），例如 web app 的 tag 動作。 */
+  renderDetailExtra?: (node: GraphNode) => ReactNode;
 }
 
 function IconButton({
@@ -104,6 +127,11 @@ export function GitGraphViewer({
   onOpenCommit,
   headerExtra,
   sourceKey,
+  onLoadMore,
+  history,
+  detailSize: detailSizeProp,
+  onDetailSizeChange,
+  renderDetailExtra,
 }: GitGraphViewerProps) {
   const loc = locale ?? detectLocale();
   const t = getMessages(loc);
@@ -124,6 +152,14 @@ export function GitGraphViewer({
   const [cursor, setCursor] = useState(-1);
   const [focusBranch, setFocusBranch] = useState<string | null>(null);
   const [scrollbarW, setScrollbarW] = useState(0);
+  const [ownDetailSize, setOwnDetailSize] = useState<DetailSize>('normal');
+  const detailSize = detailSizeProp ?? ownDetailSize;
+  const controlledDetailSize = detailSizeProp !== undefined;
+  const toggleDetailSize = useCallback(() => {
+    const next: DetailSize = detailSize === 'wide' ? 'normal' : 'wide';
+    if (!controlledDetailSize) setOwnDetailSize(next);
+    onDetailSizeChange?.(next);
+  }, [detailSize, controlledDetailSize, onDetailSizeChange]);
 
   const layout = state.kind === 'ready' ? state.layout : null;
   const hasRows = Boolean(layout && layout.nodes.length > 0);
@@ -150,11 +186,18 @@ export function GitGraphViewer({
   const metricsPrev = useRef<LogMetrics | null>(null);
   const metrics = stableMetrics(
     metricsPrev.current,
-    computeMetrics(rootWidth || 1200, layout?.laneCount ?? 1, Boolean(selectedNode)),
+    computeMetrics(rootWidth || 1200, layout?.laneCount ?? 1, Boolean(selectedNode), detailSize),
   );
   metricsPrev.current = metrics;
 
-  const now = useMemo(() => Date.now(), [layout]);
+  // 相對時間的「現在」：每次拿到新資料（重新整理、剛 commit）就更新；
+  // 只是在後面接上更早的歷史時沿用，既有的幾千列不用因為 now 變了而整批重繪
+  const nowRef = useRef<{ layout: GraphLayout | null; now: number } | null>(null);
+  if (!nowRef.current || nowRef.current.layout !== layout) {
+    const keep = nowRef.current && isAppendOnly(nowRef.current.layout, layout);
+    nowRef.current = { layout, now: keep ? nowRef.current!.now : Date.now() };
+  }
+  const now = nowRef.current.now;
 
   const branchSet = useMemo(
     () => (focusBranch && derived ? (derived.reach.get(focusBranch) ?? null) : null),
@@ -311,7 +354,8 @@ export function GitGraphViewer({
         active !== root &&
         (Boolean(active.disabled) || active.getClientRects().length === 0));
     if (lost) root.focus({ preventScroll: true });
-  }, [selectedNode?.sha]);
+    // 尺寸等級改變時詳情面板的加寬按鈕可能被移除（窄螢幕不顯示）
+  }, [selectedNode?.sha, metrics.size]);
 
   const onRowSelect = useCallback(
     (sha: string) => setSelectedSha((cur) => (cur === sha ? null : sha)),
@@ -460,6 +504,7 @@ export function GitGraphViewer({
       data-size={metrics.size}
       data-cols={metrics.cols}
       data-detail={selectedNode ? '' : undefined}
+      data-detail-size={detailSize}
       tabIndex={-1}
       style={
         {
@@ -469,7 +514,7 @@ export function GitGraphViewer({
           '--agg-graph-w': `${webglFailed ? 12 : metrics.graphW}px`,
           '--agg-sbw': `${scrollbarW}px`,
           '--agg-body-pad': `${LAYOUT.bodyPad[metrics.size]}px`,
-          '--agg-detail-w': `${LAYOUT.detailW}px`,
+          '--agg-detail-w': `${detailWidthFor(rootWidth || 1200, detailSize)}px`,
           '--agg-col-author': `${LAYOUT.col[metrics.cols].author}px`,
           '--agg-col-date': `${LAYOUT.col[metrics.cols].date}px`,
           '--agg-col-sha': `${LAYOUT.col[metrics.cols].sha}px`,
@@ -594,9 +639,16 @@ export function GitGraphViewer({
                     onSelect={onRowSelect}
                   />
                 ))}
-                <div className="agg-footer">
-                  {layout.truncated ? `… ${t.truncated}` : t.startOfHistory}
-                </div>
+                <HistoryFooter
+                  // 換 repo / 來源：重新掛載，「這個數量已經自動載入過」的記錄跟著重設
+                  key={identity}
+                  t={t}
+                  scrollerRef={scrollerRef}
+                  truncated={layout.truncated}
+                  count={layout.nodes.length}
+                  history={history}
+                  onLoadMore={onLoadMore}
+                />
                 {!webglFailed && (
                   <GitGraphCanvas
                     layout={layout}
@@ -629,6 +681,10 @@ export function GitGraphViewer({
             onGoto={(sha) => select(sha, 'nearest')}
             onOpenCommit={openCommit}
             onSearch={onQuery}
+            detailSize={detailSize}
+            // 窄螢幕的底部面板本來就是全寬：不給加寬按鈕
+            onToggleSize={metrics.size === 'narrow' ? undefined : toggleDetailSize}
+            extra={renderDetailExtra?.(selectedNode)}
           />
         )}
 

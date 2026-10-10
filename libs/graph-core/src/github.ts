@@ -1,3 +1,4 @@
+import { appendCommits, missingParents } from './history.ts';
 import type { CommitInput, GraphData, RefInput } from './types.ts';
 
 export type GitHubErrorCode =
@@ -13,12 +14,15 @@ export class GitHubError extends Error {
   readonly code: GitHubErrorCode;
   /** rate limit 重置時間（ms epoch） */
   readonly resetAt?: number;
+  /** GitHub 回應的 HTTP 狀態碼（網路錯誤、輸入驗證失敗時沒有） */
+  readonly status?: number;
 
-  constructor(code: GitHubErrorCode, message: string, resetAt?: number) {
+  constructor(code: GitHubErrorCode, message: string, resetAt?: number, status?: number) {
     super(message);
     this.name = 'GitHubError';
     this.code = code;
     this.resetAt = resetAt;
+    this.status = status;
   }
 }
 
@@ -103,21 +107,37 @@ export function mapApiCommit(c: ApiCommit): CommitInput {
   };
 }
 
-export async function fetchGitHubGraph(
-  owner: string,
-  repo: string,
-  opts: GitHubGraphOptions = {},
-): Promise<GraphData> {
+/** 呼叫 GitHub REST API 的共用設定（fetchGitHubGraph / fetchGitHubCommitsFrom 共用）。 */
+interface RequestOptions {
+  token?: string;
+  apiBase?: string;
+  fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
+}
+
+/** `/repos/<owner>/<repo>`；名稱不合法時在碰網路之前就丟 invalid_repo。 */
+function repoPathOf(owner: string, repo: string): string {
   if (!isValidRepoSegment(owner) || !isValidRepoSegment(repo)) {
     throw new GitHubError('invalid_repo', `Invalid repository: ${owner}/${repo}`);
   }
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+}
+
+/** 每頁筆數：預設 60，限制在 1–100（GitHub 的 per_page 上限）。 */
+function clampPerPage(n: number | undefined): number {
+  const v = Math.floor(n ?? 60);
+  return Number.isFinite(v) ? Math.min(Math.max(v, 1), 100) : 60;
+}
+
+/** GET 一個 API 路徑並解析 JSON；HTTP / 網路失敗一律轉成 GitHubError（呼叫端主動 abort 除外）。 */
+function githubGetter(opts: RequestOptions) {
   const base = (opts.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
   const doFetch = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  const perBranch = Math.min(Math.max(opts.maxCommitsPerBranch ?? 60, 1), 100);
-  const maxBranches = Math.max(opts.maxBranches ?? 5, 1);
-  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
-  async function get<T>(path: string, query: Record<string, string | number> = {}): Promise<T> {
+  return async function get<T>(
+    path: string,
+    query: Record<string, string | number> = {},
+  ): Promise<T> {
     const url = new URL(base + path);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
     const headers: Record<string, string> = {
@@ -146,17 +166,33 @@ export async function fetchGitHubGraph(
       }
     }
 
+    const status = res.status;
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = Number(res.headers.get('x-ratelimit-reset')) * 1000 || undefined;
-    if (res.status === 429 || (res.status === 403 && remaining === '0')) {
-      throw new GitHubError('rate_limited', 'GitHub API rate limit exceeded', reset);
+    if (status === 429 || (status === 403 && remaining === '0')) {
+      throw new GitHubError('rate_limited', 'GitHub API rate limit exceeded', reset, status);
     }
-    if (res.status === 401) throw new GitHubError('unauthorized', 'Bad credentials');
-    if (res.status === 404) throw new GitHubError('not_found', 'Repository not found');
-    if (res.status === 403) throw new GitHubError('unauthorized', 'Forbidden');
-    if (res.status === 409) throw new GitHubError('empty_repo', 'Repository is empty');
-    throw new GitHubError('unknown', `GitHub API error ${res.status}`);
-  }
+    if (status === 401) throw new GitHubError('unauthorized', 'Bad credentials', undefined, status);
+    if (status === 404) {
+      throw new GitHubError('not_found', 'Repository not found', undefined, status);
+    }
+    if (status === 403) throw new GitHubError('unauthorized', 'Forbidden', undefined, status);
+    if (status === 409) {
+      throw new GitHubError('empty_repo', 'Repository is empty', undefined, status);
+    }
+    throw new GitHubError('unknown', `GitHub API error ${status}`, undefined, status);
+  };
+}
+
+export async function fetchGitHubGraph(
+  owner: string,
+  repo: string,
+  opts: GitHubGraphOptions = {},
+): Promise<GraphData> {
+  const repoPath = repoPathOf(owner, repo);
+  const get = githubGetter(opts);
+  const perBranch = clampPerPage(opts.maxCommitsPerBranch);
+  const maxBranches = Math.max(opts.maxBranches ?? 5, 1);
 
   const repoInfo = await get<ApiRepo>(repoPath);
   const defaultBranch = repoInfo.default_branch;
@@ -203,9 +239,8 @@ export async function fetchGitHubGraph(
     kind: 'branch',
     isDefault: name === defaultBranch,
   }));
-  for (const t of tags) {
-    if (commits.has(t.commit.sha)) refs.push({ name: t.name, sha: t.commit.sha, kind: 'tag' });
-  }
+  // tag 全部留著：指向還沒載入的 commit 的 tag，等 infinite scroll 把那段歷史載入之後就會出現（layout 只畫載入範圍內的 ref）
+  for (const t of tags) refs.push({ name: t.name, sha: t.commit.sha, kind: 'tag' });
 
   const truncated = [...commits.values()].some((c) => c.parents.some((p) => !commits.has(p)));
 
@@ -221,4 +256,68 @@ export async function fetchGitHubGraph(
     truncated,
     fetchedAt: Date.now(),
   };
+}
+
+export interface GitHubMoreOptions {
+  token?: string;
+  /** 預設 https://api.github.com */
+  apiBase?: string;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  /** 每個起點抓幾筆（一頁）。預設 60（上限 100）。 */
+  perPage?: number;
+  /** 最多從幾個起點往回抓（每個起點一個請求）。預設 5。 */
+  maxStarts?: number;
+}
+
+const SHA_RE = /^[0-9a-f]{40}$/i;
+
+/**
+ * 從每個 missing parent 往回抓一頁（最多 maxStarts 個起點，平行請求）：`GET /commits?sha=<sha>&per_page=<n>`。
+ * 回傳各頁 commit 的聯集（sha 去重，依起點順序）。sha 必須是 40 位 hex，否則在碰網路之前就丟錯。
+ * GitHub 已經不認得的起點（404 / 422，例如 force push 之後被回收的 commit）視為「這個起點沒有更早的」，不讓整批失敗；
+ * 其他錯誤（rate limit、網路、token…）照常丟出 GitHubError。
+ */
+export async function fetchGitHubCommitsFrom(
+  owner: string,
+  repo: string,
+  shas: readonly string[],
+  opts: GitHubMoreOptions = {},
+): Promise<CommitInput[]> {
+  const repoPath = repoPathOf(owner, repo);
+  const bad = shas.find((s) => typeof s !== 'string' || !SHA_RE.test(s));
+  if (bad !== undefined) throw new GitHubError('unknown', `Invalid commit SHA: ${String(bad)}`);
+  const perPage = clampPerPage(opts.perPage);
+  const maxStarts = Math.max(1, Math.floor(opts.maxStarts ?? 5) || 1);
+  const starts = [...new Set(shas.map((s) => s.toLowerCase()))].slice(0, maxStarts);
+  if (starts.length === 0) return [];
+
+  const get = githubGetter(opts);
+  const pages = await Promise.all(
+    starts.map((sha) =>
+      get<ApiCommit[]>(`${repoPath}/commits`, { sha, per_page: perPage }).catch((err: unknown) => {
+        if (err instanceof GitHubError && (err.status === 404 || err.status === 422)) return [];
+        throw err;
+      }),
+    ),
+  );
+
+  const out = new Map<string, CommitInput>();
+  for (const page of pages) {
+    for (const c of page) if (!out.has(c.sha)) out.set(c.sha, mapApiCommit(c));
+  }
+  return [...out.values()];
+}
+
+/** missingParents → fetchGitHubCommitsFrom → appendCommits。沒有缺的 parent 就原樣回傳。 */
+export async function fetchMoreGitHubHistory(
+  owner: string,
+  repo: string,
+  data: GraphData,
+  opts: GitHubMoreOptions = {},
+): Promise<GraphData> {
+  const missing = missingParents(data);
+  if (missing.length === 0) return data;
+  const older = await fetchGitHubCommitsFrom(owner, repo, missing, opts);
+  return appendCommits(data, older);
 }

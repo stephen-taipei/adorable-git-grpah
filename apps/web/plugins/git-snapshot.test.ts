@@ -10,6 +10,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -20,9 +22,16 @@ import {
   discoverRepos,
   findGit,
   gitSnapshot,
+  isLocalHost,
   isSameOrigin,
+  parseGitAction,
+  parseStashList,
+  parseStatusV2,
+  parseWorktreeList,
   readGitSnapshot,
+  readRepoStatus,
   repoIdFor,
+  sanitizeGitOutput,
   snapshotKey,
   watchGitRefs,
 } from './git-snapshot.ts';
@@ -479,6 +488,8 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       scanDepth?: number;
       stateFile?: string | false;
       idleMs?: number;
+      maxCommits?: number;
+      actionTimeoutMs?: number;
     } = {},
   ) {
     return startWith(gitSnapshot({ repoDir, pollMs, stateFile: false, ...extra }), repoDir);
@@ -551,6 +562,20 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
         },
         body: JSON.stringify({ path }),
       });
+    const status = (repo = 'default', headers: Record<string, string> = {}) =>
+      call({ path: '/__agg/status', url: `/?repo=${encodeURIComponent(repo)}`, headers });
+    /** 本機同源頁面送出的 git 動作（headers 可以蓋掉來測試拒絕的情況） */
+    const act = (repo: string, action: unknown, headers: Record<string, string> = {}) =>
+      call({
+        path: '/__agg/git',
+        method: 'POST',
+        headers: {
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({ repo, action }),
+      });
     return {
       plugin,
       sent,
@@ -560,6 +585,8 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       snapshotOf,
       repos,
       addPath,
+      status,
+      act,
       invalidated: () => invalidated,
       close: () => server.close(),
     };
@@ -1094,6 +1121,1015 @@ describe('gitSnapshot plugin (dev server behaviour)', () => {
       await p.close();
     }
   });
+
+  // ───────────── infinite scroll（depth）、repo 狀態與 git 動作 ─────────────
+  // git 子行程很多（測試平行跑時更慢）：給寬一點的時限
+  describe('infinite scroll, repo status and git actions', { timeout: 30_000 }, () => {
+    /** 本機的 bare「遠端」（檔案路徑）與兩個 clone：mine（dev server 看的）與 theirs（模擬別人推送）。 */
+    function makeRemote() {
+      const base = realpathSync(tmp('agg-remote-'));
+      const hub = join(base, 'hub.git');
+      git(base, 'init', '-q', '--bare', '-b', 'main', hub);
+      const seed = join(base, 'seed');
+      mkdirSync(seed);
+      git(seed, 'init', '-q', '-b', 'main');
+      writeFileSync(join(seed, 'f.txt'), 'one\n');
+      git(seed, 'add', '-A');
+      commit(seed, 'one');
+      git(seed, 'push', '-q', hub, 'main');
+      rmSync(seed, { recursive: true, force: true });
+      const clone = (name: string) => {
+        const dir = join(base, name);
+        git(base, 'clone', '-q', hub, dir);
+        return dir;
+      };
+      const mine = clone('mine');
+      const theirs = clone('theirs');
+      /** theirs 改 f.txt 並推上去 */
+      const theyPush = (content: string) => {
+        writeFileSync(join(theirs, 'f.txt'), content);
+        git(theirs, 'add', '-A');
+        commit(theirs, `theirs: ${content.trim()}`);
+        git(theirs, 'push', '-q', 'origin', 'HEAD');
+      };
+      return { base, hub, mine, theirs, theyPush };
+    }
+
+    /** 會失敗的 git 指令（不要把錯誤訊息印到測試輸出） */
+    const gitFails = (cwd: string, ...args: string[]) => {
+      try {
+        execFileSync('git', args, { cwd, env: env(), stdio: 'pipe' });
+        return false;
+      } catch {
+        return true;
+      }
+    };
+
+    /** /proc/<pid>/stat 的 session id（comm 可能含空白：從最後一個 `)` 之後算） */
+    const sessionOf = (stat: string) => stat.slice(stat.lastIndexOf(')') + 2).split(' ')[3];
+
+    it('depth: loads older history on request, keeps it for later reads, HMR pushes and the virtual module, rejects malformed values', async () => {
+      const dir = realpathSync(tmp('agg-depth-'));
+      git(dir, 'init', '-q', '-b', 'main');
+      for (let i = 0; i < 20; i++) commit(dir, `c${i}`);
+      const p = await startPlugin(dir, 0, { repoRoots: [dir], maxCommits: 5 });
+      const graphAt = async (url: string) => {
+        const res = await p.call({ url });
+        expect(res.status, url).toBe(200);
+        return res.json().graph as { commits: Array<{ message: string }>; truncated: boolean };
+      };
+      try {
+        const first = await graphAt('/');
+        expect(first.commits).toHaveLength(5);
+        expect(first.truncated).toBe(true);
+        const deeper = await graphAt('/?repo=default&depth=12');
+        expect(deeper.commits).toHaveLength(12);
+        expect(deeper.truncated).toBe(true);
+        expect((await graphAt('/')).commits).toHaveLength(12); // 之後沒帶 depth 也維持
+        expect((await graphAt('/?depth=3')).commits).toHaveLength(12); // 只增不減
+        expect((await graphAt('/?depth=0')).commits).toHaveLength(12); // 夾到 1
+        // 新 commit 的 HMR 推送也是 12 筆（最新的一定在裡面）
+        commit(dir, 'c20');
+        const pushed = () =>
+          p.sent.find((m) =>
+            (m.data.snapshot?.graph?.commits as Array<{ message: string }> | undefined)?.some(
+              (c) => c.message === 'c20',
+            ),
+          );
+        await waitFor(() => pushed() !== undefined, 8000);
+        expect(pushed()!.data.snapshot!.graph!.commits).toHaveLength(12);
+        // 重新整理頁面拿到的 virtual module 也是
+        const mod = (await p.plugin.load('\0virtual:git-snapshot'))!;
+        expect(
+          JSON.parse(mod.replace(/^export default /, '').replace(/;$/, '')).graph.commits,
+        ).toHaveLength(12);
+        // 上限是 MAX_DEPTH（5000）：超過的數字夾到上限
+        const all = await graphAt('/?depth=99999999999');
+        expect(all.commits).toHaveLength(21);
+        expect(all.truncated).toBe(false);
+        for (const bad of ['abc', '-1', '1.5', '', '1e3', '%205', '0x10', '1'.repeat(40)]) {
+          const res = await p.call({ url: `/?depth=${bad}` });
+          expect([res.status, res.json().error], bad).toEqual([400, 'invalid_depth']);
+        }
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('depth is kept per repository (LAN clients may page the default repo, never the others)', async () => {
+      const r = makeRoot();
+      const p = await startPlugin(r.alpha, 0, { maxCommits: 1 });
+      try {
+        const beta = repoIdFor(r.beta);
+        expect((await p.snapshotOf(beta)).json().graph.commits).toHaveLength(1);
+        expect((await p.call({ url: `/?repo=${beta}&depth=2` })).json().graph.commits).toHaveLength(
+          2,
+        );
+        expect((await p.snapshotOf(beta)).json().graph.commits).toHaveLength(2);
+        expect((await p.request()).json().graph.commits).toHaveLength(1); // 預設 repo 不受影響
+        const lan = '192.168.1.23';
+        expect((await p.call({ url: '/?depth=2', remote: lan })).json().graph.commits).toHaveLength(
+          2,
+        );
+        expect((await p.call({ url: `/?repo=${beta}&depth=3`, remote: lan })).status).toBe(403);
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('status: branch, upstream, ahead / behind, changes, stashes, remotes and worktrees (which become openable by id)', async () => {
+      const r = makeRemote();
+      r.theyPush('two\n');
+      git(r.mine, 'fetch', '-q');
+      commit(r.mine, 'mine: local');
+      writeFileSync(join(r.mine, 'stashed.txt'), 's\n');
+      git(r.mine, 'add', 'stashed.txt');
+      git(r.mine, 'stash', 'push', '-q', '-m', 'wip: one');
+      writeFileSync(join(r.mine, 'new.txt'), 'n\n');
+      git(r.mine, 'add', 'new.txt'); // staged
+      writeFileSync(join(r.mine, 'f.txt'), 'changed\n'); // unstaged
+      writeFileSync(join(r.mine, 'loose.txt'), 'u\n'); // untracked
+      // 不在掃描範圍裡的 worktree：一個 locked、一個資料夾已經不見（prunable）
+      const away = realpathSync(tmp('agg-wt-away-'));
+      const wt = join(away, 'linked');
+      git(r.mine, 'worktree', 'add', '-q', '-b', 'wt-branch', wt);
+      git(r.mine, 'worktree', 'lock', wt);
+      const gone = join(away, 'gone');
+      git(r.mine, 'worktree', 'add', '-q', '--detach', gone);
+      rmSync(gone, { recursive: true, force: true });
+      const head = git(r.mine, 'rev-parse', 'HEAD');
+      const wtId = repoIdFor(wt);
+
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      try {
+        const res = await p.status('default', { 'sec-fetch-site': 'same-origin' });
+        expect(res.status).toBe(200);
+        const s = res.json();
+        expect(s).toMatchObject({
+          branch: 'main',
+          head,
+          upstream: 'origin/main',
+          ahead: 1,
+          behind: 1,
+          changes: { staged: 1, unstaged: 1, untracked: 1, conflicted: 0 },
+          remotes: ['origin'],
+          operation: null,
+          bare: false,
+        });
+        expect(s.stashes).toEqual([
+          {
+            index: 0,
+            message: 'On main: wip: one',
+            date: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+          },
+        ]);
+        // 主 worktree 一定是第一個，其餘的順序由 git 決定
+        expect(s.worktrees[0].id).toBe('default');
+        expect(s.worktrees).toHaveLength(3);
+        expect(s.worktrees).toEqual(
+          expect.arrayContaining([
+            {
+              id: 'default',
+              label: expect.stringContaining('mine'),
+              branch: 'main',
+              head,
+              current: true,
+              main: true,
+              locked: false,
+              prunable: false,
+            },
+            {
+              id: wtId,
+              label: expect.stringContaining('linked'),
+              branch: 'wt-branch',
+              head,
+              current: false,
+              main: false,
+              locked: true,
+              prunable: false,
+            },
+            expect.objectContaining({ branch: null, current: false, main: false, prunable: true }),
+          ]),
+        );
+        // 狀態裡看到的 worktree 可以用 id 開啟，也會出現在清單裡（但不會被記住）
+        const opened = await p.snapshotOf(wtId);
+        expect(opened.status).toBe(200);
+        expect(opened.json().graph.refs.some((x: { name: string }) => x.name === 'wt-branch')).toBe(
+          true,
+        );
+        expect((await p.repos()).json().repos.map((x: { id: string }) => x.id)).toContain(wtId);
+        // 從 worktree 看：current 換成它自己，主 worktree 是 default
+        const fromWt = (await p.status(wtId)).json();
+        expect(fromWt.branch).toBe('wt-branch');
+        const flags = fromWt.worktrees.map((w: { id: string; current: boolean; main: boolean }) => [
+          w.id,
+          w.current,
+          w.main,
+        ]);
+        expect(flags[0]).toEqual(['default', false, true]);
+        expect(flags).toContainEqual([wtId, true, false]);
+      } finally {
+        await p.close();
+      }
+      // dev server 重新啟動後直接打開 worktree 的 `?local=<id>`：從已知 repo 的 worktree 清單找回來
+      const again = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      try {
+        expect((await again.snapshotOf(wtId)).status).toBe(200);
+      } finally {
+        await again.close();
+      }
+    });
+
+    it('status: merge / rebase / cherry-pick / revert / bisect in progress, conflicts, detached, unborn and bare repositories', async () => {
+      /** main 與 other 都改了 f.txt */
+      const diverged = () => {
+        const dir = realpathSync(tmp('agg-op-'));
+        git(dir, 'init', '-q', '-b', 'main');
+        writeFileSync(join(dir, 'f.txt'), 'base\n');
+        git(dir, 'add', '-A');
+        commit(dir, 'base');
+        git(dir, 'checkout', '-q', '-b', 'other');
+        writeFileSync(join(dir, 'f.txt'), 'other\n');
+        commit(dir, 'other', '-a');
+        git(dir, 'checkout', '-q', 'main');
+        writeFileSync(join(dir, 'f.txt'), 'main\n');
+        commit(dir, 'main', '-a');
+        return dir;
+      };
+      const statusOf = async (dir: string) => (await readRepoStatus(dir))!.status;
+
+      const merging = diverged();
+      expect(gitFails(merging, 'merge', 'other')).toBe(true);
+      expect(await statusOf(merging)).toMatchObject({
+        operation: 'merge',
+        branch: 'main',
+        changes: { conflicted: 1 },
+      });
+      const rebasing = diverged();
+      expect(gitFails(rebasing, 'rebase', 'other')).toBe(true);
+      expect((await statusOf(rebasing)).operation).toBe('rebase');
+      const picking = diverged();
+      expect(gitFails(picking, 'cherry-pick', 'other')).toBe(true);
+      expect((await statusOf(picking)).operation).toBe('cherry-pick');
+      const reverting = diverged();
+      writeFileSync(join(reverting, 'f.txt'), 'later\n');
+      commit(reverting, 'later', '-a');
+      expect(gitFails(reverting, 'revert', '--no-edit', 'HEAD~1')).toBe(true);
+      expect((await statusOf(reverting)).operation).toBe('revert');
+      const bisecting = diverged();
+      git(bisecting, 'bisect', 'start');
+      expect((await statusOf(bisecting)).operation).toBe('bisect');
+
+      const detached = diverged();
+      git(detached, 'checkout', '-q', '--detach');
+      expect(await statusOf(detached)).toMatchObject({
+        branch: null,
+        head: git(detached, 'rev-parse', 'HEAD'),
+        upstream: null,
+        operation: null,
+      });
+      const unborn = realpathSync(tmp('agg-unborn-'));
+      git(unborn, 'init', '-q', '-b', 'main');
+      expect(await statusOf(unborn)).toMatchObject({
+        branch: 'main',
+        head: null,
+        stashes: [],
+        remotes: [],
+        changes: { staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
+      });
+      const bare = join(realpathSync(tmp('agg-bare-status-')), 'b.git');
+      git(dirname(bare), 'clone', '-q', '--bare', detached, bare);
+      const b = await readRepoStatus(bare);
+      expect(b!.status).toMatchObject({ bare: true, branch: 'main', head: expect.any(String) });
+      expect(b!.worktrees).toEqual([expect.objectContaining({ path: bare, bare: true })]);
+      expect(await readRepoStatus(tmp('agg-not-a-repo-'))).toBeNull();
+    });
+
+    it('the status and git endpoints only answer same-origin requests from this machine (LAN / cross-site / forged Host / CSRF)', async () => {
+      const dir = realpathSync(tmp('agg-guard-'));
+      git(dir, 'init', '-q', '-b', 'main');
+      commit(dir, 'one');
+      const p = await startPlugin(dir, 0, { repoRoots: [dir] });
+      try {
+        // 狀態：同源或直接開啟（網址列 / curl）可以
+        expect((await p.status()).status).toBe(200);
+        expect((await p.status('default', { 'sec-fetch-site': 'none' })).status).toBe(200);
+        const statusRefusals: Array<Record<string, string>> = [
+          { 'sec-fetch-site': 'cross-site' },
+          { 'sec-fetch-site': 'same-site' },
+          { origin: 'http://localhost:9999' },
+          { host: 'evil.example:4200' },
+          { host: 'evil.example:4200', origin: 'http://evil.example:4200' },
+        ];
+        for (const headers of statusRefusals) {
+          expect((await p.status('default', headers)).status, JSON.stringify(headers)).toBe(403);
+        }
+        const lanStatus = await p.call({ path: '/__agg/status', url: '/', remote: '192.168.1.23' });
+        expect([lanStatus.status, lanStatus.json().error]).toEqual([403, 'local_only']);
+        expect((await p.call({ path: '/__agg/status', method: 'POST' })).status).toBe(405);
+        expect((await p.status('../x')).status).toBe(400);
+        expect((await p.status('0123456789ab')).status).toBe(404);
+
+        // git 動作：只接受本機同源頁面送來的 JSON POST
+        const tag = (name: string) => ({ type: 'tag-create', name, target: 'HEAD' });
+        expect((await p.act('default', tag('ok-1'))).json()).toMatchObject({ ok: true });
+        const refusals: Array<[Record<string, string>, number]> = [
+          [{ 'sec-fetch-site': 'cross-site' }, 403],
+          [{ 'sec-fetch-site': 'same-site' }, 403],
+          [{ 'sec-fetch-site': 'none' }, 403], // 網址列 / 書籤
+          [{ 'sec-fetch-site': '' }, 403], // 沒有 fetch metadata 也沒有 Origin
+          [{ 'sec-fetch-site': '', origin: 'http://evil.example' }, 403],
+          [{ 'sec-fetch-site': '', origin: 'null' }, 403],
+          [{ host: 'evil.example:4200' }, 403], // DNS rebinding：瀏覽器眼中同源，但 Host 不是這台電腦
+          [
+            { host: 'evil.example:4200', origin: 'http://evil.example:4200', 'sec-fetch-site': '' },
+            403,
+          ],
+          [{ 'content-type': 'text/plain' }, 415], // 跨站的 form / no-cors fetch 只能送這些
+          [{ 'content-type': 'application/x-www-form-urlencoded' }, 415],
+          [{ 'content-type': 'multipart/form-data; boundary=x' }, 415],
+        ];
+        for (const [headers, code] of refusals) {
+          expect(
+            (await p.act('default', tag('nope'), headers)).status,
+            JSON.stringify(headers),
+          ).toBe(code);
+        }
+        const viaOrigin = await p.act('default', tag('ok-2'), {
+          'sec-fetch-site': '',
+          origin: 'http://localhost:4200',
+        });
+        expect(viaOrigin.status).toBe(200);
+        const viaIp = await p.act('default', tag('ok-3'), { host: '127.0.0.1:4200' });
+        expect(viaIp.status).toBe(200);
+        const lan = await p.call({
+          path: '/__agg/git',
+          method: 'POST',
+          remote: '192.168.1.23',
+          headers: { origin: 'http://localhost:4200', 'content-type': 'application/json' },
+          body: JSON.stringify({ repo: 'default', action: tag('nope') }),
+        });
+        expect([lan.status, lan.json().error]).toEqual([403, 'local_only']);
+        // 網址（GET）永遠不會觸發動作
+        expect(
+          (await p.call({ path: '/__agg/git', url: '/?repo=default&type=fetch' })).status,
+        ).toBe(405);
+        const post = { path: '/__agg/git', method: 'POST' };
+        const json = { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
+        const big = await p.call({
+          ...post,
+          headers: json,
+          body: JSON.stringify({ repo: 'default', action: tag('nope'), pad: 'x'.repeat(10_000) }),
+        });
+        expect(big.status).toBe(413);
+        const garbage = await p.call({ ...post, headers: json, body: '{nope' });
+        expect([garbage.status, garbage.json().code]).toEqual([400, 'invalid']);
+        expect((await p.act('../etc', tag('nope'))).status).toBe(400);
+        expect((await p.act(dir, tag('nope'))).status).toBe(400); // 路徑永遠不會被接受
+        const unknown = await p.act('0123456789ab', tag('nope'));
+        expect([unknown.status, unknown.json().error]).toEqual([404, 'unknown_repo']);
+        expect((await p.act('default', { type: 'rm -rf' })).status).toBe(400);
+        expect((await p.act('default', null)).status).toBe(400);
+        expect((await p.act('default', [tag('nope')])).status).toBe(400);
+        // 會丟資料或改到遠端的動作，沒有 confirm: true 一律拒絕
+        for (const action of [
+          { type: 'push' },
+          { type: 'push', confirm: 'yes' },
+          { type: 'stash-drop', index: 0 },
+          { type: 'tag-delete', name: 'ok-1' },
+          { type: 'worktree-remove', id: '0123456789ab' },
+        ]) {
+          const res = await p.act('default', action);
+          expect([res.status, res.json()], JSON.stringify(action)).toEqual([
+            400,
+            expect.objectContaining({ ok: false, code: 'invalid' }),
+          ]);
+        }
+        expect(git(dir, 'tag', '--list').split('\n')).toEqual(['ok-1', 'ok-2', 'ok-3']);
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('fetch and fast-forward-only pull from a local bare remote; a diverged or dirty pull changes nothing', async () => {
+      const r = makeRemote();
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      try {
+        expect((await p.act('default', { type: 'fetch' })).json()).toMatchObject({
+          ok: true,
+          code: 'nothing',
+        });
+        r.theyPush('two\n');
+        const fetched = (await p.act('default', { type: 'fetch' })).json();
+        expect(fetched).toMatchObject({ ok: true });
+        expect(fetched.code).toBeUndefined();
+        expect(fetched.output).toMatch(/main\s+-> origin\/main/);
+        expect((await p.status()).json()).toMatchObject({ ahead: 0, behind: 1 });
+
+        const before = p.sent.length;
+        const pulled = (await p.act('default', { type: 'pull' })).json();
+        expect(pulled).toMatchObject({ ok: true });
+        expect(pulled.output).toMatch(/Fast-forward/);
+        expect(git(r.mine, 'rev-parse', 'HEAD')).toBe(git(r.theirs, 'rev-parse', 'HEAD'));
+        // 回應之前就已經推送了新的快照（圖馬上更新，不必等監看）
+        expect(
+          p.sent.slice(before).some((m) => m.data.repo === 'default' && m.data.snapshot?.graph),
+        ).toBe(true);
+        expect((await p.status()).json()).toMatchObject({ ahead: 0, behind: 0 });
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: true,
+          code: 'nothing',
+        });
+
+        // 分岔：不 merge、不 rebase，什麼都不動（branch.<name>.rebase 也蓋不過 --no-rebase）
+        git(r.mine, 'config', 'branch.main.rebase', 'true');
+        r.theyPush('three\n');
+        commit(r.mine, 'mine: local');
+        const local = git(r.mine, 'rev-parse', 'HEAD');
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: false,
+          code: 'not_ff',
+        });
+        expect(git(r.mine, 'rev-parse', 'HEAD')).toBe(local);
+        expect(git(r.mine, 'rev-list', '--merges', '--count', 'HEAD')).toBe('0');
+        expect((await p.status()).json()).toMatchObject({ ahead: 1, behind: 1, operation: null });
+
+        // 本機的修改會被蓋掉：拒絕（不會自動 stash），修改原封不動
+        git(r.mine, 'reset', '-q', '--hard', 'origin/main');
+        git(r.mine, 'config', 'merge.autoStash', 'true');
+        r.theyPush('four\n');
+        writeFileSync(join(r.mine, 'f.txt'), 'my edit\n');
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: false,
+          code: 'dirty',
+        });
+        expect(readFileSync(join(r.mine, 'f.txt'), 'utf8')).toBe('my edit\n');
+        expect(git(r.mine, 'stash', 'list')).toBe('');
+        git(r.mine, 'checkout', '-q', '--', 'f.txt');
+
+        // 進行中的 merge
+        writeFileSync(join(r.mine, '.git', 'MERGE_HEAD'), `${git(r.mine, 'rev-parse', 'HEAD')}\n`);
+        expect((await p.status()).json().operation).toBe('merge');
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: false,
+          code: 'operation_in_progress',
+        });
+        rmSync(join(r.mine, '.git', 'MERGE_HEAD'));
+
+        git(r.mine, 'checkout', '-q', '-b', 'lonely');
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: false,
+          code: 'no_upstream',
+        });
+        git(r.mine, 'checkout', '-q', '--detach');
+        expect((await p.act('default', { type: 'pull' })).json()).toMatchObject({
+          ok: false,
+          code: 'no_branch',
+        });
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('push: only the current branch, never forced (a non-fast-forward is rejected), set-upstream when there is none', async () => {
+      const r = makeRemote();
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      const hubAt = (ref = 'main') => git(r.hub, 'rev-parse', ref);
+      try {
+        commit(r.mine, 'mine: two');
+        git(r.mine, 'branch', 'other'); // 不是目前的 branch：不會被推
+        expect((await p.status()).json().ahead).toBe(1);
+        expect((await p.act('default', { type: 'push', confirm: true })).json()).toMatchObject({
+          ok: true,
+        });
+        expect(hubAt()).toBe(git(r.mine, 'rev-parse', 'HEAD'));
+        expect(git(r.hub, 'branch', '--list')).not.toContain('other');
+        expect((await p.status()).json().ahead).toBe(0);
+        expect((await p.act('default', { type: 'push', confirm: true })).json()).toMatchObject({
+          ok: true,
+          code: 'nothing',
+        });
+
+        // 別人先推了：被拒絕，絕不 force（遠端維持別人的版本）
+        git(r.theirs, 'pull', '-q', '--ff-only');
+        r.theyPush('theirs\n');
+        const remoteTip = hubAt();
+        commit(r.mine, 'mine: three');
+        const rejected = (await p.act('default', { type: 'push', confirm: true })).json();
+        expect(rejected).toMatchObject({ ok: false, code: 'rejected' });
+        expect(rejected.output).toMatch(/\[rejected\]/);
+        expect(hubAt()).toBe(remoteTip);
+
+        // 沒有 upstream：要明確指定 remote
+        git(r.mine, 'checkout', '-q', '-b', 'feature/x');
+        expect((await p.act('default', { type: 'push', confirm: true })).json()).toMatchObject({
+          ok: false,
+          code: 'no_upstream',
+        });
+        const toNowhere = { type: 'push', confirm: true, setUpstream: { remote: 'nope' } };
+        expect((await p.act('default', toNowhere)).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        for (const remote of ['--force', '-f', 'a b', '', 3]) {
+          const res = await p.act('default', {
+            type: 'push',
+            confirm: true,
+            setUpstream: { remote },
+          });
+          expect(res.status, String(remote)).toBe(400);
+        }
+        const up = { type: 'push', confirm: true, setUpstream: { remote: 'origin' } };
+        expect((await p.act('default', up)).json()).toMatchObject({ ok: true });
+        expect(hubAt('feature/x')).toBe(git(r.mine, 'rev-parse', 'HEAD'));
+        expect((await p.status()).json()).toMatchObject({
+          branch: 'feature/x',
+          upstream: 'origin/feature/x',
+          ahead: 0,
+        });
+
+        git(r.mine, 'checkout', '-q', '--detach');
+        expect((await p.act('default', { type: 'push', confirm: true })).json()).toMatchObject({
+          ok: false,
+          code: 'no_branch',
+        });
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('stash: save (message, untracked) / nothing to save / apply / pop / drop, with range checks and conflicts', async () => {
+      const dir = realpathSync(tmp('agg-stash-'));
+      git(dir, 'init', '-q', '-b', 'main');
+      writeFileSync(join(dir, 'f.txt'), 'base\n');
+      git(dir, 'add', '-A');
+      commit(dir, 'base');
+      const p = await startPlugin(dir, 0, { repoRoots: [dir] });
+      const current = async () => (await p.status()).json();
+      try {
+        expect((await p.act('default', { type: 'stash-save' })).json()).toMatchObject({
+          ok: true,
+          code: 'nothing',
+        });
+        writeFileSync(join(dir, 'f.txt'), 'edit\n');
+        writeFileSync(join(dir, 'new.txt'), 'untracked\n');
+        const saved = { type: 'stash-save', message: 'wip one', includeUntracked: true };
+        expect((await p.act('default', saved)).json()).toMatchObject({ ok: true });
+        expect((await current()).changes).toEqual({
+          staged: 0,
+          unstaged: 0,
+          untracked: 0,
+          conflicted: 0,
+        });
+        expect((await current()).stashes.map((s: { message: string }) => s.message)).toEqual([
+          'On main: wip one',
+        ]);
+        for (const message of ['two\nlines', 'x'.repeat(201), 'nul\u0000', 'esc\u001b[2J', 42]) {
+          expect((await p.act('default', { type: 'stash-save', message })).status).toBe(400);
+        }
+        expect(
+          (await p.act('default', { type: 'stash-save', includeUntracked: 'yes' })).status,
+        ).toBe(400);
+
+        expect((await p.act('default', { type: 'stash-apply', index: 0 })).json()).toMatchObject({
+          ok: true,
+        });
+        expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('edit\n');
+        expect(existsSync(join(dir, 'new.txt'))).toBe(true);
+        expect((await current()).stashes).toHaveLength(1); // apply 不會刪掉
+        git(dir, 'checkout', '-q', '--', 'f.txt');
+        rmSync(join(dir, 'new.txt'));
+        expect((await p.act('default', { type: 'stash-pop', index: 0 })).json()).toMatchObject({
+          ok: true,
+        });
+        expect((await current()).stashes).toEqual([]);
+        expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('edit\n');
+
+        // 範圍與型別
+        expect(
+          (await p.act('default', { type: 'stash-save', message: 'second' })).json(),
+        ).toMatchObject({
+          ok: true,
+        });
+        for (const index of [-1, 1.5, '0', null, 1e9]) {
+          expect(
+            (await p.act('default', { type: 'stash-apply', index })).status,
+            String(index),
+          ).toBe(400);
+        }
+        expect((await p.act('default', { type: 'stash-apply', index: 3 })).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        const dropMissing = { type: 'stash-drop', index: 3, confirm: true };
+        expect((await p.act('default', dropMissing)).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+
+        // 套回去會衝突：pop 回報 conflict，stash 留著
+        writeFileSync(join(dir, 'f.txt'), 'committed\n');
+        commit(dir, 'conflicting', '-a');
+        expect((await p.act('default', { type: 'stash-pop', index: 0 })).json()).toMatchObject({
+          ok: false,
+          code: 'conflict',
+        });
+        expect((await current()).stashes).toHaveLength(1);
+        expect((await current()).changes.conflicted).toBe(1);
+        git(dir, 'reset', '-q', '--hard');
+        // 會蓋掉還沒 commit 的修改：dirty，修改原封不動
+        writeFileSync(join(dir, 'f.txt'), 'uncommitted\n');
+        expect((await p.act('default', { type: 'stash-apply', index: 0 })).json()).toMatchObject({
+          ok: false,
+          code: 'dirty',
+        });
+        expect(readFileSync(join(dir, 'f.txt'), 'utf8')).toBe('uncommitted\n');
+        git(dir, 'checkout', '-q', '--', 'f.txt');
+
+        const drop = { type: 'stash-drop', index: 0, confirm: true };
+        expect((await p.act('default', drop)).json()).toMatchObject({ ok: true });
+        expect((await current()).stashes).toEqual([]);
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('tags: create (lightweight / annotated) on any commit, refuse invalid names and existing tags, push without force, delete locally (needs confirm)', async () => {
+      const r = makeRemote();
+      commit(r.mine, 'mine: two');
+      git(r.mine, 'push', '-q');
+      const first = git(r.mine, 'rev-parse', 'HEAD~1');
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      const create = (name: unknown, target: unknown = 'HEAD', extra: object = {}) =>
+        p.act('default', { type: 'tag-create', name, target, ...extra });
+      try {
+        expect((await create('v1', first)).json()).toMatchObject({ ok: true });
+        expect(git(r.mine, 'rev-parse', 'v1')).toBe(first);
+        const graph = (await p.snapshotOf('default')).json().graph;
+        expect(
+          graph.refs.some(
+            (x: { kind: string; name: string }) => x.kind === 'tag' && x.name === 'v1',
+          ),
+        ).toBe(true);
+        expect(
+          (await create('v2', 'HEAD', { message: 'Release 2\n\n- notes' })).json(),
+        ).toMatchObject({
+          ok: true,
+        });
+        expect(git(r.mine, 'cat-file', '-t', 'v2')).toBe('tag');
+        expect(git(r.mine, 'tag', '-l', '--format=%(contents)', 'v2')).toContain('- notes');
+        expect((await create('v1')).json()).toMatchObject({ ok: false, code: 'exists' });
+        expect(git(r.mine, 'rev-parse', 'v1')).toBe(first);
+
+        for (const name of [
+          '-x',
+          '--delete',
+          'a..b',
+          'bad name',
+          '',
+          'x.lock',
+          'a@{1}',
+          'trailing/',
+          '.hidden',
+          'a//b',
+          'ctl\u0001',
+          'nul\u0000',
+          'star*',
+          'x'.repeat(300),
+          7,
+        ]) {
+          const res = await create(name);
+          expect([res.status, res.json().code], JSON.stringify(name)).toEqual([400, 'invalid']);
+        }
+        expect((await create('v9', '--all')).status).toBe(400);
+        expect((await create('v9', 'no-such-commit')).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        expect((await create('v9', 'HEAD', { message: 'bell\u0007' })).status).toBe(400);
+        expect(git(r.mine, 'tag', '--list').split('\n')).toEqual(['v1', 'v2']);
+
+        expect((await p.act('default', { type: 'tag-push', name: 'v1' })).json()).toMatchObject({
+          ok: true,
+        });
+        expect(git(r.hub, 'rev-parse', 'refs/tags/v1')).toBe(first);
+        expect((await p.act('default', { type: 'tag-push', name: 'nope' })).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        expect((await create('v3', 'HEAD', { push: true })).json()).toMatchObject({ ok: true });
+        expect(git(r.hub, 'rev-parse', 'refs/tags/v3')).toBe(git(r.mine, 'rev-parse', 'HEAD'));
+
+        expect((await p.act('default', { type: 'tag-delete', name: 'v1' })).status).toBe(400);
+        const del = { type: 'tag-delete', name: 'v1', confirm: true };
+        expect((await p.act('default', del)).json()).toMatchObject({ ok: true });
+        expect(git(r.mine, 'tag', '--list', 'v1')).toBe('');
+        expect(git(r.hub, 'rev-parse', 'refs/tags/v1')).toBe(first); // 只刪本機
+        expect((await p.act('default', del)).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+
+        // 遠端已經有同名但不同的 tag：被拒絕，不會 force
+        git(r.mine, 'tag', 'v1', 'HEAD');
+        expect((await p.act('default', { type: 'tag-push', name: 'v1' })).json()).toMatchObject({
+          ok: false,
+          code: 'rejected',
+        });
+        expect(git(r.hub, 'rev-parse', 'refs/tags/v1')).toBe(first);
+
+        git(r.mine, 'remote', 'remove', 'origin');
+        expect((await p.act('default', { type: 'tag-push', name: 'v2' })).json()).toMatchObject({
+          ok: false,
+          code: 'no_upstream',
+        });
+        expect((await create('v4', 'HEAD', { push: true })).json()).toMatchObject({
+          ok: false,
+          code: 'no_upstream',
+        });
+        expect(git(r.mine, 'tag', '--list', 'v4')).toBe(''); // 推不出去就不建立
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('worktrees: add (new branch / existing branch / detached) and open the new one by id; refuse taken paths; remove only when clean, never the main one', async () => {
+      const r = makeRemote();
+      commit(r.mine, 'mine: two');
+      git(r.mine, 'branch', 'spare');
+      // 掃描不到新 worktree 的位置：證明是動作本身把它登記成可開啟的 repo
+      const p = await startPlugin(r.mine, 0, { repoRoots: [join(r.base, 'nothing-here')] });
+      const add = (action: object) => p.act('default', { type: 'worktree-add', ...action });
+      try {
+        const wt = join(r.base, 'mine-wt'); // 相對路徑 = repo 的兄弟資料夾
+        const added = (await add({ path: 'mine-wt', newBranch: 'wt/one', base: 'HEAD~1' })).json();
+        expect(added).toMatchObject({
+          ok: true,
+          repo: { id: repoIdFor(wt), name: 'mine-wt', isDefault: false },
+        });
+        expect(git(wt, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('wt/one');
+        expect(git(wt, 'rev-parse', 'HEAD')).toBe(git(r.mine, 'rev-parse', 'HEAD~1'));
+        const id = added.repo.id;
+        const opened = await p.snapshotOf(id);
+        expect(opened.status).toBe(200);
+        expect(opened.json().graph.refs.some((x: { name: string }) => x.name === 'wt/one')).toBe(
+          true,
+        );
+        expect((await p.status()).json().worktrees.map((w: { id: string }) => w.id)).toEqual([
+          'default',
+          id,
+        ]);
+
+        // 已經有東西的路徑 / 已經存在的 branch / 被別的 worktree 用掉的 branch / 不存在的 branch 或 commit
+        expect((await add({ path: wt })).json()).toMatchObject({ ok: false, code: 'exists' });
+        const x = (n: number) => join(r.base, `x${n}`);
+        expect((await add({ path: x(1), newBranch: 'wt/one' })).json()).toMatchObject({
+          ok: false,
+          code: 'exists',
+        });
+        expect((await add({ path: x(2), branch: 'main' })).json()).toMatchObject({
+          ok: false,
+          code: 'exists',
+        });
+        expect((await add({ path: x(3), branch: 'nope' })).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        expect((await add({ path: x(4), base: 'nope' })).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        for (const action of [
+          { path: '//attacker/share' },
+          { path: '\\\\attacker\\share' },
+          { path: '~someone/x' },
+          { path: '' },
+          { path: '  ' },
+          { path: 'a\nb' },
+          { path: 5 },
+          { path: x(5), newBranch: 'bad name' },
+          { path: x(6), newBranch: '-b' },
+          { path: x(7), branch: 'spare', newBranch: 'n' },
+          { path: x(8), base: '--orphan' },
+          { path: x(9), newBranch: 'HEAD' },
+          { path: x(10), branch: 'spare', base: 'HEAD' },
+        ]) {
+          const res = await add(action);
+          expect([res.status, res.json().code], JSON.stringify(action)).toEqual([400, 'invalid']);
+        }
+        for (let n = 1; n <= 10; n++) expect(existsSync(x(n)), x(n)).toBe(false);
+
+        // 既有的 branch（放進空的資料夾也可以）
+        const empty = join(r.base, 'empty');
+        mkdirSync(empty);
+        expect((await add({ path: empty, branch: 'spare' })).json()).toMatchObject({ ok: true });
+        expect(git(empty, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('spare');
+        // 沒指定 branch：detached，不會依資料夾名稱自動建立 branch
+        const detachedDir = join(r.base, 'detached');
+        const detached = (await add({ path: detachedDir })).json();
+        expect(detached).toMatchObject({ ok: true, repo: { id: repoIdFor(detachedDir) } });
+        expect(git(detachedDir, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
+        expect(git(r.mine, 'branch', '--list', 'detached')).toBe('');
+
+        // 移除：要 confirm；有修改就拒絕（不會 --force）
+        expect((await p.act('default', { type: 'worktree-remove', id })).status).toBe(400);
+        writeFileSync(join(wt, 'scratch.txt'), 'keep me\n');
+        const remove = (wtId: string, repo = 'default') =>
+          p.act(repo, { type: 'worktree-remove', id: wtId, confirm: true });
+        expect((await remove(id)).json()).toMatchObject({ ok: false, code: 'dirty' });
+        expect(readFileSync(join(wt, 'scratch.txt'), 'utf8')).toBe('keep me\n');
+        rmSync(join(wt, 'scratch.txt'));
+        expect((await remove(id)).json()).toMatchObject({ ok: true });
+        expect(existsSync(wt)).toBe(false);
+        expect(git(r.mine, 'branch', '--list', 'wt/one')).toContain('wt/one'); // branch 留著
+        expect((await p.snapshotOf(id)).status).toBe(404);
+        expect((await remove('default')).json()).toMatchObject({ ok: false, code: 'invalid' });
+        expect((await remove('0123456789ab')).json()).toMatchObject({
+          ok: false,
+          code: 'not_found',
+        });
+        expect((await remove('../../x')).status).toBe(400);
+
+        // 正在看的 worktree 自己也可以移除（從主 worktree 執行）
+        expect((await remove(detached.repo.id, detached.repo.id)).json()).toMatchObject({
+          ok: true,
+        });
+        expect(existsSync(detachedDir)).toBe(false);
+        expect((await p.status()).json().worktrees.map((w: { id: string }) => w.id)).toEqual([
+          'default',
+          repoIdFor(empty),
+        ]);
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('runs one action at a time per repository, across its worktrees too (busy → 409)', async () => {
+      const r = makeRemote();
+      const marker = join(r.base, 'hook-started');
+      const hook = join(r.mine, '.git', 'hooks', 'pre-push');
+      writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\nsleep 2\n`);
+      chmodSync(hook, 0o755);
+      const wt = join(r.base, 'busy-wt');
+      git(r.mine, 'worktree', 'add', '-q', '--detach', wt);
+      commit(r.mine, 'mine: two');
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      try {
+        const slow = p.act('default', { type: 'push', confirm: true });
+        await waitFor(() => existsSync(marker), 8000);
+        const second = await p.act('default', { type: 'fetch' });
+        expect([second.status, second.json().code]).toEqual([409, 'busy']);
+        const viaWorktree = await p.act(repoIdFor(wt), {
+          type: 'tag-create',
+          name: 'during',
+          target: 'HEAD',
+        });
+        expect([viaWorktree.status, viaWorktree.json().code]).toEqual([409, 'busy']);
+        expect((await slow).json()).toMatchObject({ ok: true });
+        expect((await p.act('default', { type: 'fetch' })).status).toBe(200);
+        expect(git(r.mine, 'tag', '--list')).toBe('');
+      } finally {
+        await p.close();
+      }
+    });
+
+    it('network actions never prompt and never hang: an auth-requiring HTTP remote and a stuck ssh fail fast', async () => {
+      const dir = realpathSync(tmp('agg-net-'));
+      git(dir, 'init', '-q', '-b', 'main');
+      commit(dir, 'one');
+      const server = createServer((_req, res) => {
+        res.writeHead(401, { 'www-authenticate': 'Basic realm="private"' });
+        res.end();
+      });
+      await new Promise<void>((ok) => server.listen(0, '127.0.0.1', ok));
+      const port = (server.address() as AddressInfo).port;
+      git(dir, 'remote', 'add', 'origin', `http://127.0.0.1:${port}/private.git`);
+      git(dir, 'config', 'remote.origin.proxy', ''); // 不經過 http(s)_proxy
+      // 跑 dev server 的環境不保證有（或沒有）這些：拿掉，證明是 plugin 自己讓 git 不互動
+      const keys = [
+        'GIT_TERMINAL_PROMPT',
+        'GIT_ASKPASS',
+        'SSH_ASKPASS',
+        'GCM_INTERACTIVE',
+        'DISPLAY',
+        'GIT_SSH',
+        'GIT_SSH_COMMAND',
+      ];
+      const savedEnv = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+      for (const k of keys) delete process.env[k];
+      const p = await startPlugin(dir, 0, { repoRoots: [dir], actionTimeoutMs: 4000 });
+      try {
+        let t = Date.now();
+        const fetched = (await p.act('default', { type: 'fetch' })).json();
+        expect(fetched).toMatchObject({ ok: false, code: 'auth' });
+        expect(fetched.output).toMatch(/terminal prompts disabled|could not read Username/);
+        expect(Date.now() - t).toBeLessThan(3500); // 馬上失敗，不是等到時限（4 秒）
+        t = Date.now();
+        const up = { type: 'push', confirm: true, setUpstream: { remote: 'origin' } };
+        expect((await p.act('default', up)).json()).toMatchObject({ ok: false, code: 'auth' });
+        expect(Date.now() - t).toBeLessThan(3500);
+
+        // 卡住的 ssh（等密碼、網路不通…）：時限一到連同子行程一起結束。它沒有 controlling tty、看得到不互動的設定
+        const fake = join(dir, 'fake-ssh.sh');
+        const report = join(dir, 'ssh-report');
+        writeFileSync(
+          fake,
+          `#!/bin/sh
+  {
+    echo "prompt=$GIT_TERMINAL_PROMPT gcm=$GCM_INTERACTIVE"
+    if ( : </dev/tty ) 2>/dev/null; then echo tty=yes; else echo tty=no; fi
+    if [ -r /proc/$$/stat ]; then echo "sid=$(sed 's/.*) //' /proc/$$/stat | cut -d' ' -f4)"; fi
+  } > '${report}'
+  echo $$ > '${report}.pid'
+  exec sleep 30
+  `,
+        );
+        chmodSync(fake, 0o755);
+        git(dir, 'remote', 'set-url', 'origin', 'ssh://git@unreachable.invalid/x.git');
+        git(dir, 'config', 'core.sshCommand', fake);
+        git(dir, 'config', 'ssh.variant', 'simple');
+        t = Date.now();
+        const stuck = (await p.act('default', { type: 'fetch' })).json();
+        expect(stuck).toMatchObject({ ok: false, code: 'timeout' });
+        expect(Date.now() - t).toBeLessThan(12_000);
+        const seen = readFileSync(report, 'utf8');
+        expect(seen).toContain('prompt=0 gcm=never');
+        expect(seen).toContain('tty=no');
+        const sid = /sid=(\d+)/.exec(seen)?.[1];
+        if (sid && existsSync(`/proc/${process.pid}/stat`)) {
+          // detached：不在 dev server 的 session 裡（也就拿不到它的終端機）
+          expect(sid).not.toBe(sessionOf(readFileSync(`/proc/${process.pid}/stat`, 'utf8')));
+        }
+        const pid = Number(readFileSync(`${report}.pid`, 'utf8'));
+        await waitFor(() => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch {
+            return true;
+          }
+        }, 5000);
+
+        writeFileSync(
+          fake,
+          '#!/bin/sh\necho "git@unreachable.invalid: Permission denied (publickey)." >&2\nexit 255\n',
+        );
+        expect((await p.act('default', { type: 'fetch' })).json()).toMatchObject({
+          ok: false,
+          code: 'auth',
+        });
+      } finally {
+        await p.close();
+        server.close();
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+
+    it('returns sanitized git output: no ANSI, no trace output, credentials redacted, only the last 4 KB', async () => {
+      const r = makeRemote();
+      const hook = join(r.mine, '.git', 'hooks', 'pre-push');
+      writeFileSync(
+        hook,
+        `#!/bin/sh\nprintf '\\033[31mred alert\\033[0m\\n' >&2\necho "mirror: https://bob:hunter2@example.com/x.git ssh://deploy:tok3n@host/y" >&2\nexit 1\n`,
+      );
+      chmodSync(hook, 0o755);
+      commit(r.mine, 'mine: two');
+      const p = await startPlugin(r.mine, 0, { repoRoots: [r.base] });
+      const savedTrace = process.env['GIT_TRACE'];
+      try {
+        // GIT_TRACE（GIT_TRACE_CURL 會印出 Authorization header）不能混進回傳的輸出
+        process.env['GIT_TRACE'] = '1';
+        const res = (await p.act('default', { type: 'push', confirm: true })).json();
+        if (savedTrace === undefined) delete process.env['GIT_TRACE'];
+        else process.env['GIT_TRACE'] = savedTrace;
+        expect(res).toMatchObject({ ok: false, code: 'rejected' });
+        expect(res.output).toContain('red alert');
+        expect(res.output).not.toContain('\x1b');
+        expect(res.output).not.toContain('trace:');
+        expect(res.output).toContain('https://***@example.com/x.git');
+        expect(res.output).toContain('ssh://***@host/y');
+        expect(res.output).not.toMatch(/hunter2|tok3n|bob:/);
+
+        writeFileSync(
+          hook,
+          `#!/bin/sh\ni=0\nwhile [ $i -lt 3000 ]; do echo "noise line $i" >&2; i=$((i+1)); done\necho "the last words" >&2\nexit 1\n`,
+        );
+        const long = (await p.act('default', { type: 'push', confirm: true })).json();
+        expect(long.output.length).toBeLessThanOrEqual(4096);
+        expect(long.output.startsWith('…\n')).toBe(true);
+        expect(long.output).toContain('the last words');
+        expect(long.output).not.toMatch(/^noise line 0$/m);
+        expect(git(r.hub, 'rev-parse', 'main')).not.toBe(git(r.mine, 'rev-parse', 'HEAD'));
+      } finally {
+        if (savedTrace === undefined) delete process.env['GIT_TRACE'];
+        else process.env['GIT_TRACE'] = savedTrace;
+        await p.close();
+      }
+    });
+  });
 });
 
 describe('discoverRepos', () => {
@@ -1216,5 +2252,277 @@ describe('snapshot error codes', () => {
       'missing_dir',
     );
     expect((await readGitSnapshot(tmp('agg-nogit-code-'))).code).toBe('not_git');
+  });
+});
+
+describe('sanitizeGitOutput', () => {
+  it('strips terminal escapes and control characters, keeps the last progress state and redacts credentials in URLs', () => {
+    const raw = [
+      '\x1b]8;;https://x\x07link\x1b]8;;\x07 \x1b[1;31mbold red\x1b[0m',
+      'Receiving objects:  10% (1/10)\rReceiving objects: 100% (10/10), done.\r',
+      'bell\x07 nul\x00 c1\u009b31m bidi\u202eevil',
+      'https://user:pa%40ss@github.com/o/r.git and http://token@host:8080/x and ssh://git@github.com/o/r',
+      'mail bob@example.com and scp-like git@github.com:o/r stay',
+      '',
+      '',
+      '',
+      'end   ',
+    ].join('\n');
+    expect(sanitizeGitOutput(raw)).toBe(
+      [
+        'link bold red',
+        'Receiving objects: 100% (10/10), done.',
+        'bell nul c131m bidievil',
+        'https://***@github.com/o/r.git and http://***@host:8080/x and ssh://***@github.com/o/r',
+        'mail bob@example.com and scp-like git@github.com:o/r stay',
+        '',
+        'end',
+      ].join('\n'),
+    );
+  });
+
+  it('keeps only the tail, starting at a whole line', () => {
+    const raw = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join('\n');
+    const out = sanitizeGitOutput(raw, 100);
+    expect(out.length).toBeLessThanOrEqual(100);
+    expect(out.startsWith('…\nline ')).toBe(true);
+    expect(out.endsWith('line 999')).toBe(true);
+    expect(
+      out
+        .split('\n')
+        .slice(1)
+        .every((l) => /^line \d+$/.test(l)),
+    ).toBe(true);
+    expect(sanitizeGitOutput('short')).toBe('short');
+    expect(sanitizeGitOutput('')).toBe('');
+  });
+});
+
+describe('git output parsers', () => {
+  const sha = 'a'.repeat(40);
+  it('parseStatusV2 counts staged / unstaged / untracked / conflicted entries and reads the branch headers', () => {
+    const h = 'b'.repeat(40);
+    const text = [
+      `# branch.oid ${sha}`,
+      '# branch.head feat/x',
+      '# branch.upstream origin/feat/x',
+      '# branch.ab +2 -3',
+      `1 M. N... 100644 100644 100644 ${h} ${h} staged.txt`,
+      `1 .M N... 100644 100644 100644 ${h} ${h} unstaged.txt`,
+      `1 MM N... 100644 100644 100644 ${h} ${h} both.txt`,
+      `2 R. N... 100644 100644 100644 ${h} ${h} R100 new name.txt`,
+      'old name.txt', // -z：rename 的原路徑是下一個欄位
+      `2 R. N... 100644 100644 100644 ${h} ${h} R100 renamed`,
+      '# branch.head looks-like-a-header', // 原路徑剛好長得像標頭
+      `u UU N... 100644 100644 100644 100644 ${h} ${h} ${h} conflict.txt`,
+      '? untracked.txt',
+      '? # hash.txt',
+      '! ignored.txt',
+      '',
+    ].join('\0');
+    expect(parseStatusV2(text)).toEqual({
+      branch: 'feat/x',
+      head: sha,
+      upstream: 'origin/feat/x',
+      ahead: 2,
+      behind: 3,
+      changes: { staged: 4, unstaged: 2, untracked: 2, conflicted: 1 },
+    });
+    expect(parseStatusV2('# branch.oid (initial)\0# branch.head (detached)\0')).toEqual({
+      branch: null,
+      head: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      changes: { staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
+    });
+    // upstream 已經不在（沒有 branch.ab）
+    expect(parseStatusV2('# branch.head main\0# branch.upstream origin/gone\0')).toMatchObject({
+      upstream: 'origin/gone',
+      ahead: 0,
+      behind: 0,
+    });
+  });
+
+  it('parseWorktreeList reads bare / detached / locked / prunable entries, with -z or newlines', () => {
+    const records = [
+      ['worktree /srv/hub.git', 'bare'],
+      ['worktree /w/a', `HEAD ${sha}`, 'branch refs/heads/feat/a', 'locked'],
+      [
+        'worktree /w/with space',
+        `HEAD ${sha}`,
+        'detached',
+        'locked because reasons',
+        'prunable gitdir file points to non-existent location',
+      ],
+    ];
+    const expected = [
+      { path: '/srv/hub.git', head: '', branch: null, bare: true, locked: false, prunable: false },
+      { path: '/w/a', head: sha, branch: 'feat/a', bare: false, locked: true, prunable: false },
+      { path: '/w/with space', head: sha, branch: null, bare: false, locked: true, prunable: true },
+    ];
+    const z = `${records.map((r) => `${r.join('\0')}\0`).join('\0')}\0`;
+    expect(parseWorktreeList(z)).toEqual(expected);
+    const lines = `${records.map((r) => r.join('\n')).join('\n\n')}\n`;
+    expect(parseWorktreeList(lines, '\n')).toEqual(expected);
+    expect(parseWorktreeList('')).toEqual([]);
+  });
+
+  it('parseStashList numbers entries in order and cannot be shifted by separators inside a message', () => {
+    const text =
+      '2026-01-02T03:04:05+00:00\x1fOn main: a\x1fb\0' +
+      '2026-01-01T00:00:00+09:00\x1fWIP on x: 1234567 msg\x01\0';
+    expect(parseStashList(text)).toEqual([
+      { index: 0, message: 'On main: a b', date: '2026-01-02T03:04:05+00:00' },
+      { index: 1, message: 'WIP on x: 1234567 msg ', date: '2026-01-01T00:00:00+09:00' },
+    ]);
+    expect(parseStashList('')).toEqual([]);
+  });
+});
+
+describe('parseGitAction', () => {
+  const ok = (input: unknown) => {
+    const parsed = parseGitAction(input);
+    if ('error' in parsed) throw new Error(`${JSON.stringify(input)}: ${parsed.error}`);
+    return parsed.action;
+  };
+  const bad = (input: unknown) => 'error' in parseGitAction(input);
+
+  it('accepts every action and returns only the known fields', () => {
+    expect(ok({ type: 'fetch', extra: 1 })).toEqual({ type: 'fetch' });
+    expect(ok({ type: 'pull' })).toEqual({ type: 'pull' });
+    expect(ok({ type: 'push', confirm: true, force: true })).toEqual({
+      type: 'push',
+      confirm: true,
+    });
+    expect(ok({ type: 'push', confirm: true, setUpstream: { remote: 'origin', x: 1 } })).toEqual({
+      type: 'push',
+      confirm: true,
+      setUpstream: { remote: 'origin' },
+    });
+    expect(ok({ type: 'stash-save', message: '  wip  ', includeUntracked: true })).toEqual({
+      type: 'stash-save',
+      message: 'wip',
+      includeUntracked: true,
+    });
+    expect(ok({ type: 'stash-save', message: '', includeUntracked: false })).toEqual({
+      type: 'stash-save',
+    });
+    expect(ok({ type: 'stash-apply', index: 0 })).toEqual({ type: 'stash-apply', index: 0 });
+    expect(ok({ type: 'stash-pop', index: 2 })).toEqual({ type: 'stash-pop', index: 2 });
+    expect(ok({ type: 'stash-drop', index: 1, confirm: true })).toEqual({
+      type: 'stash-drop',
+      index: 1,
+      confirm: true,
+    });
+    expect(
+      ok({ type: 'tag-create', name: 'v1.0', target: 'HEAD~2', message: 'a\n\tb', push: true }),
+    ).toEqual({
+      type: 'tag-create',
+      name: 'v1.0',
+      target: 'HEAD~2',
+      message: 'a\n\tb',
+      push: true,
+    });
+    expect(ok({ type: 'tag-delete', name: 'v1', confirm: true })).toEqual({
+      type: 'tag-delete',
+      name: 'v1',
+      confirm: true,
+    });
+    expect(ok({ type: 'tag-push', name: 'v1' })).toEqual({ type: 'tag-push', name: 'v1' });
+    expect(
+      ok({ type: 'worktree-add', path: ' ../wt ', newBranch: 'feat/a', base: 'main' }),
+    ).toEqual({
+      type: 'worktree-add',
+      path: '../wt',
+      newBranch: 'feat/a',
+      base: 'main',
+    });
+    expect(ok({ type: 'worktree-add', path: '/x', branch: 'main' })).toEqual({
+      type: 'worktree-add',
+      path: '/x',
+      branch: 'main',
+    });
+    expect(ok({ type: 'worktree-remove', id: '0123456789ab', confirm: true })).toEqual({
+      type: 'worktree-remove',
+      id: '0123456789ab',
+      confirm: true,
+    });
+  });
+
+  it('rejects wrong shapes, option-like values, control characters and missing confirmations', () => {
+    for (const input of [
+      undefined,
+      null,
+      'fetch',
+      [],
+      {},
+      { type: 'gc' },
+      { type: 'push' },
+      { type: 'push', confirm: 1 },
+      { type: 'push', confirm: true, setUpstream: 'origin' },
+      { type: 'push', confirm: true, setUpstream: { remote: '-o' } },
+      { type: 'stash-save', message: 'a\nb' },
+      { type: 'stash-save', message: 'x'.repeat(201) },
+      { type: 'stash-save', includeUntracked: 1 },
+      { type: 'stash-apply' },
+      { type: 'stash-apply', index: -1 },
+      { type: 'stash-apply', index: 0.5 },
+      { type: 'stash-apply', index: '0' },
+      { type: 'stash-drop', index: 0 },
+      { type: 'tag-create', name: '-d', target: 'HEAD' },
+      { type: 'tag-create', name: 'a b', target: 'HEAD' },
+      { type: 'tag-create', name: 'a~1', target: 'HEAD' },
+      { type: 'tag-create', name: 'v1', target: '--all' },
+      { type: 'tag-create', name: 'v1', target: 'HEAD\n' },
+      { type: 'tag-create', name: 'v1', target: 'HEAD', message: 'x'.repeat(2001) },
+      { type: 'tag-create', name: 'v1', target: 'HEAD', message: 'cr\r' },
+      { type: 'tag-create', name: 'v1', target: 'HEAD', push: 'yes' },
+      { type: 'tag-delete', name: 'v1' },
+      { type: 'tag-push', name: '' },
+      { type: 'worktree-add' },
+      { type: 'worktree-add', path: '' },
+      { type: 'worktree-add', path: 'x'.repeat(4097) },
+      { type: 'worktree-add', path: 'a\u0000b' },
+      { type: 'worktree-add', path: '/x', branch: '-b' },
+      { type: 'worktree-add', path: '/x', newBranch: 'a:b' },
+      { type: 'worktree-add', path: '/x', base: '-' },
+      { type: 'worktree-add', path: '/x', branch: 'a', newBranch: 'b' },
+      { type: 'worktree-add', path: '/x', branch: 'a', base: 'HEAD' },
+      { type: 'worktree-remove', id: '0123456789ab' },
+      { type: 'worktree-remove', id: '/etc', confirm: true },
+    ]) {
+      expect(bad(input), JSON.stringify(input)).toBe(true);
+    }
+  });
+});
+
+describe('isLocalHost', () => {
+  const req = (host?: string) => ({ headers: host === undefined ? {} : { host } }) as never;
+  it('accepts only names of this machine', () => {
+    for (const host of [
+      'localhost',
+      'localhost:4200',
+      'app.localhost:4200',
+      '127.0.0.1:4200',
+      '127.1.2.3',
+      '[::1]:4200',
+    ])
+      expect(isLocalHost(req(host)), host).toBe(true);
+    for (const host of [
+      undefined,
+      '',
+      'evil.example',
+      'evil.example:4200',
+      'localhost.evil.example',
+      '192.168.1.2:4200',
+      '0.0.0.0:4200',
+      '127.0.0.1.evil.example',
+      'evil.example@localhost',
+      'localhost/x',
+      'localhost:4200@evil',
+      'a b',
+    ])
+      expect(isLocalHost(req(host)), String(host)).toBe(false);
   });
 });

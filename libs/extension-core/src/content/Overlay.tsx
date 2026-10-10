@@ -10,7 +10,7 @@ function githubTheme(): 'day' | 'night' | 'auto' {
 }
 
 export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void }) {
-  const { state, refresh } = useGraph(repo);
+  const { state, refresh, loadMore, history } = useGraph(repo);
   const panelRef = useRef<HTMLDivElement>(null);
   const downOnBackdrop = useRef(false);
 
@@ -101,6 +101,8 @@ export function Overlay({ repo, onClose }: { repo: RepoRef; onClose: () => void 
             state={state}
             theme={githubTheme()}
             onRefresh={refresh}
+            onLoadMore={loadMore}
+            history={history}
             onClose={onClose}
             onOpenSettings={() => void sendToBackground({ type: 'open-options' })}
           />

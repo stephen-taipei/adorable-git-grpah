@@ -1,6 +1,8 @@
+import type { ReactNode } from 'react';
 import type { GraphBranch, GraphLayout, GraphNode } from '@adorable/graph-core';
 import { formatRelative } from '../i18n';
 import type { Locale, Messages } from '../i18n';
+import type { DetailSize } from '../scene/geometry';
 import { Avatar } from './Avatar';
 import { RefBadges } from './RefBadges';
 import { copyText, formatAbsolute } from './format';
@@ -10,7 +12,9 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   CloseIcon,
+  CollapseIcon,
   CopyIcon,
+  ExpandIcon,
   ExternalIcon,
   MergeIcon,
 } from './icons';
@@ -30,6 +34,12 @@ export interface CommitDetailProps {
   onOpenCommit?: (node: GraphNode) => void;
   /** 點作者名稱＝以作者搜尋 */
   onSearch?: (query: string) => void;
+  /** 面板目前的大小（加寬按鈕的 aria-pressed） */
+  detailSize?: DetailSize;
+  /** 切換面板大小。沒給就不顯示按鈕（窄螢幕的底部面板本來就是全寬） */
+  onToggleSize?: () => void;
+  /** 使用端的額外內容（例如 web app 的 tag 動作），放在面板底部的動作列 */
+  extra?: ReactNode;
 }
 
 function CopyButton({ text, label, t }: { text: string; label: string; t: Messages }) {
@@ -86,6 +96,9 @@ export function CommitDetail({
   onGoto,
   onOpenCommit,
   onSearch,
+  detailSize = 'normal',
+  onToggleSize,
+  extra,
 }: CommitDetailProps) {
   const parents = [...new Set(node.parents)];
   const body = node.message.split('\n').slice(1).join('\n').trim();
@@ -120,6 +133,18 @@ export function CommitDetail({
           >
             <ChevronDownIcon />
           </button>
+          {onToggleSize && (
+            <button
+              type="button"
+              className="agg-btn agg-btn--sm agg-detail-size"
+              onClick={onToggleSize}
+              aria-pressed={detailSize === 'wide'}
+              title={detailSize === 'wide' ? t.detailCollapse : t.detailExpand}
+              aria-label={detailSize === 'wide' ? t.detailCollapse : t.detailExpand}
+            >
+              {detailSize === 'wide' ? <CollapseIcon /> : <ExpandIcon />}
+            </button>
+          )}
           <button
             type="button"
             className="agg-btn agg-btn--sm agg-btn--danger"
@@ -233,6 +258,7 @@ export function CommitDetail({
             {t.openCommit}
           </button>
         )}
+        {extra != null && extra !== false && <div className="agg-detail-extra">{extra}</div>}
       </footer>
     </aside>
   );

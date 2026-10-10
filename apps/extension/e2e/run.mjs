@@ -13,6 +13,8 @@
 //   - RWD：wide / medium / narrow（無橫向溢位、窄螢幕底部面板不蓋住選取列、寬螢幕詳情不壓到列表、欄位標題對齊）
 //   - 重新整理會保留捲動 / 選取（同一個 scroller 不被重建）、Esc 一次收一層、overlay 開著時背後頁面不能捲動、
 //     鍵盤事件不會漏給 GitHub 頁面（shadow host 擋下）、點背景關閉
+//   - 更早的歷史（infinite scroll，demo/long-history、每條 branch 一頁 25 筆）：捲到底就從 missing parent 往回載入下一批
+//     （sha=<40 位 hex> 的請求）、列只接在後面、畫面不跳、場景不重播、線圖保持同步、頁尾的 載入中 / 失敗→再試一次 / 歷史起點
 // 注意：WebGL 走 SwiftShader 軟體繪圖，CPU 吃緊時很慢，所以全部以「等狀態」為主、timeout 開得很寬。
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -23,7 +25,17 @@ import { chromium } from 'playwright-core';
 import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
 import { fakeGithubPage } from '../../../tools/e2e/fake-github-page.mjs';
 import { colorDistance, inkRatio, samplePixels } from '../../../tools/e2e/pixels.mjs';
-import { SPECS, latency, seen, sha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
+import {
+  LONG,
+  SPECS,
+  faults,
+  gate,
+  latency,
+  releaseHeld,
+  seen,
+  sha,
+  startMock,
+} from '../../../tools/e2e/mock-github-api.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const artifacts = resolve(root, 'e2e/.artifacts');
@@ -99,6 +111,11 @@ const L = {
   openCommit: /(在 GitHub 開啟|Open on GitHub)/,
   noMatches: /(沒有符合的 commit|No matching commits)/,
   initialCommit: /(最初的 commit|Initial commit)/,
+  retry: /^(再試一次|Try again)$/,
+  loadingMore: /(正在載入更早的歷史|Loading older history)/,
+  loadedMore: /(已載入 \d+ 個更早的 commit|Loaded \d+ older commits?)/,
+  loadMoreFailed: /(更早的歷史載入失敗|Could not load older history)/,
+  startOfHistory: /(最初的 commit 在這裡|the first commit lives here)/,
 };
 
 // ───────────────────────── mock 資料的預期值 ─────────────────────────
@@ -1945,6 +1962,271 @@ try {
         'token must never appear in a resource URL',
       );
       await closeOverlay();
+    },
+  );
+
+  // ───────────── 更早的歷史（infinite scroll） ─────────────
+  // demo/long-history（見 mock 的 LONG）：每條 branch 只抓一頁（25 筆）時，第一批只有最新的一段，
+  // 其餘要捲到底、由 content script → background 的 fetch-more 從 missing parent 往回抓（/commits?sha=<40 位 hex>）。
+
+  const LONG_URL = `https://github.com/${LONG.owner}/${LONG.name}`;
+  const LONG_PER_PAGE = 25;
+  const longSpecs = LONG.specs.map(([id, parents, , , hours]) => ({
+    id,
+    sha: sha(id),
+    parents: parents.map(sha),
+    hours,
+  }));
+  const longBySha = new Map(longSpecs.map((s) => [s.sha, s]));
+  /** 全部載入之後畫面上由上到下的 sha（時間都不同，直接依時間倒序）。 */
+  const LONG_ROWS = [...longSpecs].sort((a, b) => b.hours - a.hours).map((s) => s.sha);
+  const isMoreRequest = (p) =>
+    p.startsWith(`/repos/${LONG.owner}/${LONG.name}/commits?`) && /[?&]sha=[0-9a-f]{40}\b/.test(p);
+  /** 從 seen.paths 的第 `from` 筆之後，「從 commit sha 往回抓」的請求。 */
+  const moreRequests = (from) =>
+    seen.paths
+      .slice(from)
+      .filter(isMoreRequest)
+      .map((p) => {
+        const q = new URL(p, 'http://x').searchParams;
+        return { sha: q.get('sha'), per: q.get('per_page') };
+      });
+  const footerNow = () =>
+    ui((r) => {
+      const f = r.querySelector('.agg-footer');
+      return { state: f.dataset.state, text: f.innerText.trim() };
+    });
+  const rowShas = () =>
+    ui((r) => [...r.querySelectorAll('.agg-commit')].map((el) => el.dataset.sha));
+  /** 某一列相對於捲動容器上緣的位置（沒指定就取第一個完整可見的列）＋目前的 scrollTop。 */
+  const rowAnchor = (shaHex) =>
+    ui((r, want) => {
+      const sc = r.querySelector('.agg-scroll');
+      const top = sc.getBoundingClientRect().top;
+      const els = [...r.querySelectorAll('.agg-commit')];
+      const el = want
+        ? els.find((e) => e.dataset.sha === want)
+        : els.find((e) => e.getBoundingClientRect().top >= top - 0.5);
+      return {
+        sha: el.dataset.sha,
+        offset: el.getBoundingClientRect().top - top,
+        scrollTop: sc.scrollTop,
+      };
+    }, shaHex);
+  /** 頁尾連續 `ms` 毫秒都不是 loading（一批載入回來之後，頁尾仍在附近時會馬上接著載下一批，要等整串都停下來）。 */
+  async function footerSettled(ms = 1500, timeout = 60_000) {
+    const t = Date.now();
+    let since = Date.now();
+    for (;;) {
+      const f = await footerNow();
+      if (f.state === 'loading') since = Date.now();
+      else if (Date.now() - since >= ms) return f;
+      if (Date.now() - t > timeout) assert.fail(`the footer kept loading: ${JSON.stringify(f)}`);
+      await sleep(100);
+    }
+  }
+  const setPerPage = (per) =>
+    sw.evaluate(async (n) => {
+      const cur = (await chrome.storage.local.get('settings')).settings ?? {};
+      await chrome.storage.local.set({ settings: { ...cur, maxCommitsPerBranch: n } });
+    }, per);
+
+  await step(
+    'infinite scroll: scrolling to the bottom loads older commits page by page (no jump, no replay, graph in sync)',
+    async () => {
+      await closeOverlay();
+      const saved = await sw.evaluate(
+        async () => (await chrome.storage.local.get('settings')).settings ?? null,
+      );
+      await setPerPage(LONG_PER_PAGE);
+      try {
+        const from = seen.paths.length;
+        // GitHub 是 SPA：同一個文件裡換到另一個 repo（content script 偵測網址變化）
+        await page.evaluate((p) => history.pushState({}, '', p), new URL(LONG_URL).pathname);
+        await page.waitForTimeout(2000); // repoStore polling
+        await openOverlay({ replay: true });
+        assert.equal(await page.locator('.agg-title-text').innerText(), 'demo/long-history');
+        // 第一批：每條 branch 一頁（設定的 25 筆）
+        const branchReqs = seen.paths
+          .slice(from)
+          .filter((p) => p.startsWith(`/repos/demo/${LONG.name}/commits?`) && !isMoreRequest(p));
+        assert.deepStrictEqual(
+          branchReqs.map((p) => new URL(p, 'http://x').searchParams.get('per_page')),
+          branchReqs.map(() => String(LONG_PER_PAGE)),
+          `the first batch uses the per-branch page size: ${branchReqs}`,
+        );
+        // 第一頁不夠填滿「可視範圍 + 1.5 個視窗高」時會直接接著載入（不用捲動）；起點一定是 main 第一頁之前的 L123
+        let f = await footerSettled();
+        assert.equal(f.state, 'idle', `more history can be loaded: ${JSON.stringify(f)}`);
+        const auto = moreRequests(from);
+        if (auto.length)
+          assert.equal(auto[0].sha, sha('L123'), 'the first start is the missing parent');
+        const opened = (await rowShas()).length;
+        assert.ok(opened < LONG.total, `only part of the history is loaded at first (${opened})`);
+        console.log(
+          `  opened with ${opened} rows (${auto.length} start(s) auto-loaded before scrolling)`,
+        );
+
+        // 場景不能重播（data-replay 不會再變成 playing）；捲動容器不能被重建
+        await page.evaluate((id) => {
+          const sr = document.getElementById(id).shadowRoot;
+          const cv = sr.querySelector('.agg-canvas');
+          window.__aggReplayLog = [];
+          new MutationObserver(() => window.__aggReplayLog.push(cv.dataset.replay)).observe(cv, {
+            attributes: true,
+            attributeFilter: ['data-replay'],
+          });
+          sr.querySelector('.agg-scroll').__aggSame = true;
+        }, HOST_ID);
+
+        let batches = 0;
+        let failed = false;
+        for (let i = 0; i < 15; i++) {
+          f = await footerSettled();
+          if (f.state === 'end') break;
+          assert.equal(f.state, 'idle', `footer before batch ${batches + 1}: ${JSON.stringify(f)}`);
+          if (batches > 0) assert.match(f.text, L.loadedMore, 'the footer reports the last batch');
+          const before = await rowShas();
+          const reqFrom = seen.paths.length;
+          const injectFailure = batches === 1 && !failed;
+          if (injectFailure) faults.more = 1;
+          // 這一批的請求先擋在 mock 裡：量「載入中」的頁尾與畫面位置時，那一批一定還沒回來
+          gate.hold = true;
+
+          if (batches === 0) {
+            // 第一次用真的滾輪捲到底
+            const box = await page.locator('.agg-scroll').boundingBox();
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            for (let k = 0; k < 30; k++) {
+              const g = await geom();
+              if (g.scrollTop >= g.maxScroll - 1) break;
+              await page.mouse.wheel(0, 1500);
+              await sleep(60);
+            }
+          } else {
+            await scrollTo(1e6);
+          }
+          await page.locator('.agg-footer[data-state="loading"]').waitFor({ timeout: 10_000 });
+          await waitUntil(() => gate.queue.length > 0, 20_000, 'the batch request reaches the API');
+          await scrollSettled();
+          const anchor = await rowAnchor();
+          assert.equal((await rowShas()).length, before.length, 'the batch is still on hold');
+          if (batches === 0) {
+            assert.match((await footerNow()).text, L.loadingMore, 'the footer says it is loading');
+            await shot(page, '12-infinite-scroll-loading.png');
+          }
+          releaseHeld();
+
+          if (injectFailure) {
+            await page.locator('.agg-footer[data-state="error"]').waitFor({ timeout: 30_000 });
+            assert.match((await footerNow()).text, L.loadMoreFailed);
+            const n = moreRequests(reqFrom).length;
+            await sleep(2500);
+            assert.equal(
+              moreRequests(reqFrom).length,
+              n,
+              'a failed batch is never retried automatically',
+            );
+            assert.deepStrictEqual(await rowShas(), before, 'a failed batch changes nothing');
+            await shot(page, '12-infinite-scroll-error.png');
+            await page.locator('.agg-footer').getByRole('button', { name: L.retry }).click();
+            failed = true;
+          }
+
+          await eventually(
+            async () => (await rowShas()).length > before.length,
+            true,
+            `batch ${batches + 1} adds rows`,
+            60_000,
+          );
+          await footerSettled();
+          const after = await rowShas();
+          assert.deepStrictEqual(
+            after.slice(0, before.length),
+            before,
+            'older commits are appended below; the existing rows keep their order',
+          );
+          // 每個請求都是「已載入的 commit 的 parent、本身還沒載入」，每頁筆數 = 設定值
+          const reqs = moreRequests(reqFrom);
+          assert.ok(reqs.length > 0, 'the batch was fetched from commit shas');
+          for (const r of reqs) {
+            assert.equal(r.per, String(LONG_PER_PAGE), 'per_page follows the setting');
+            assert.ok(!before.includes(r.sha), `start ${r.sha} was not loaded yet`);
+            assert.ok(after.includes(r.sha), `start ${r.sha} is loaded by its own page`);
+            assert.ok(
+              after.some((s) => longBySha.get(s).parents.includes(r.sha)),
+              `start ${r.sha} is a parent of a loaded commit`,
+            );
+          }
+          // 畫面沒有跳：同一列還在同一個位置
+          const now = await rowAnchor(anchor.sha);
+          assert.ok(
+            Math.abs(now.offset - anchor.offset) <= 1 &&
+              Math.abs(now.scrollTop - anchor.scrollTop) <= 1,
+            `the view jumped: ${JSON.stringify(anchor)} → ${JSON.stringify(now)}`,
+          );
+          assert.equal(await page.locator('.agg-canvas').getAttribute('data-replay'), 'done');
+          await assertGraphSync(`after batch ${batches + 1}`);
+          batches++;
+        }
+
+        f = await footerSettled();
+        assert.equal(f.state, 'end', `all history loaded: ${JSON.stringify(f)}`);
+        assert.match(f.text, L.startOfHistory, 'the footer marks the start of history');
+        assert.ok(failed, 'the failure / retry path was exercised');
+        assert.ok(batches >= 2, `several scroll-triggered batches (${batches})`);
+        assert.deepStrictEqual(await rowShas(), LONG_ROWS, 'every commit, newest first');
+        const replayLog = await page.evaluate(() => window.__aggReplayLog);
+        assert.ok(!replayLog.includes('playing'), `the scene replayed: ${replayLog}`);
+        assert.ok(
+          await ui((r) => r.querySelector('.agg-scroll').__aggSame === true),
+          'the scroller was not re-created',
+        );
+        // 往回載入之後，指向舊 commit 的 tag 也出現了（畫面外的列有 content-visibility: auto，innerText 是空的，所以讀 textContent）
+        const tagsAt = (id) => rowLoc(id).locator('.agg-ref--tag .agg-ref-name').allTextContents();
+        assert.deepStrictEqual(await tagsAt('L40'), ['v1.0']);
+        assert.deepStrictEqual(await tagsAt('L148'), ['v2.0']);
+        const chips = await page.locator('.agg-stats .agg-chip').allInnerTexts();
+        assert.match(chips[0], new RegExp(`^${LONG.total} commits?|^${LONG.total} 個`));
+        await scrollTo(1e6);
+        await assertGraphSync('end of history');
+        await shot(page, '12-infinite-scroll-end.png');
+        // 到底之後不會再發請求
+        const total = moreRequests(from).length;
+        await scrollTo(1e6 - 1);
+        await sleep(1500);
+        assert.equal(moreRequests(from).length, total, 'no requests after the start of history');
+        console.log(
+          `  ${batches} scroll-triggered batch(es), ${total} sha= request(s), ${LONG.total} rows`,
+        );
+
+        // 重新整理 = 回到第一批
+        await scrollTo(0);
+        await page.getByRole('button', { name: L.refresh }).click();
+        await eventually(
+          async () => (await rowShas()).length < LONG.total,
+          true,
+          'refresh goes back to the first batch',
+          30_000,
+        );
+        f = await footerSettled();
+        assert.equal(
+          f.state,
+          'idle',
+          `after a refresh more history can be loaded again: ${f.state}`,
+        );
+      } finally {
+        faults.more = 0;
+        releaseHeld();
+        await sw.evaluate(async (s) => {
+          if (s) await chrome.storage.local.set({ settings: s });
+          else await chrome.storage.local.remove('settings');
+        }, saved);
+      }
+      await closeOverlay();
+      await page.evaluate((u) => history.pushState({}, '', new URL(u).pathname), REPO_URL);
+      await page.waitForTimeout(2000);
+      await page.locator('.agg-fab').waitFor({ timeout: 10_000 });
     },
   );
 

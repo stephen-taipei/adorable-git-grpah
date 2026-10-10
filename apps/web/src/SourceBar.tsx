@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { FormEvent, KeyboardEvent } from 'react';
+import type { FormEvent, KeyboardEvent, ReactNode } from 'react';
 import { localSource, parseRepoInput } from './source';
 import type { Source } from './source';
 import { DEFAULT_REPO } from './protocol';
@@ -25,6 +25,7 @@ export function SourceBar({
   onNavigate,
   theme,
   onThemeChange,
+  extra,
 }: {
   source: Source;
   /** 最近一次看的本機 repo：從 GitHub 切回「本機」時回到它，而不是預設 repo */
@@ -32,6 +33,8 @@ export function SourceBar({
   onNavigate: (s: Source) => void;
   theme: ThemeSetting;
   onThemeChange: (t: ThemeSetting) => void;
+  /** 接在同一排最後面的內容（本機 repo 的 git 動作列）：寬螢幕靠右，放不下時換行 */
+  extra?: ReactNode;
 }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(
@@ -120,6 +123,8 @@ export function SourceBar({
       >
         {THEME_ICON[theme]}
       </button>
+
+      {extra}
     </div>
   );
 }
@@ -178,6 +183,14 @@ function LocalPicker({ current, onPick }: { current: string; onPick: (id: string
   useEffect(() => {
     if (adding) inputRef.current?.focus();
   }, [adding]);
+
+  // 切到清單裡還沒有的 repo（例如剛新增、從 worktree 清單開啟的 worktree）：重新拿一次清單，選單才顯示得出名字
+  const listed = list ? list.repos.some((r) => r.id === current) : true;
+  useEffect(() => {
+    if (!listed && current !== DEFAULT_REPO) void reload();
+    // 只在換了 repo 時檢查（清單回來後仍不在裡面就維持「不在清單中」，不會一直重抓）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current]);
 
   const commit = (value: string) => {
     window.clearTimeout(settle.current);

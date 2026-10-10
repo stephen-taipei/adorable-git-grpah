@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import snapshot from 'virtual:git-snapshot';
-import { GitHubError, buildLayout, fetchGitHubGraph } from '@adorable/graph-core';
+import {
+  GitHubError,
+  buildLayout,
+  fetchGitHubGraph,
+  fetchMoreGitHubHistory,
+  missingParents,
+} from '@adorable/graph-core';
 import type { GraphData } from '@adorable/graph-core';
-import type { ViewerState } from '@adorable/graph-ui';
+import type { HistoryState, ViewerState } from '@adorable/graph-ui';
 import { DEFAULT_REPO, HMR_EVENT, isRepoId, snapshotKey } from './protocol';
 import type { GitSnapshot, SnapshotEvent } from './protocol';
 import type { Source } from './source';
 import { LOCAL_ONLY, fetchLocalSnapshot } from './localRepos';
+import { hasMore, nextDepth, settled } from './history';
+import type { PagingState } from './history';
 import { t } from './i18n';
 
 const GH_CACHE_MS = 10 * 60_000;
@@ -28,6 +36,14 @@ function useLocalSnapshot(id: string, selection: unknown) {
   }));
   /** 'unknown'：dev server 不認得這個 id；'offline'：連不上；LOCAL_ONLY：不是從這台電腦開的畫面 */
   const [missing, setMissing] = useState<Record<string, Missing>>({});
+  /** 更早的歷史（infinite scroll）的載入狀態，每個 repo 各自記 */
+  const [paging, setPaging] = useState<Record<string, PagingState>>({});
+  /** 每個 repo 要過的深度（commit 數）：之後的每一次讀取都帶著，dev server 忘了（閒置被停掉、重新啟動）也補得回來 */
+  const wanted = useRef<Record<string, number>>({});
+  const snapsRef = useRef(snaps);
+  snapsRef.current = snaps;
+  const pagingRef = useRef(paging);
+  pagingRef.current = paging;
   const current = useRef(id);
   current.current = id;
 
@@ -54,7 +70,7 @@ function useLocalSnapshot(id: string, selection: unknown) {
 
   const load = useCallback(
     async (repo: string) => {
-      const result = await fetchLocalSnapshot(repo);
+      const result = await fetchLocalSnapshot(repo, wanted.current[repo]);
       if (result === 'unknown' || result === LOCAL_ONLY) {
         setMissing((prev) => ({ ...prev, [repo]: result }));
       } else if (result === null) setMissing((prev) => ({ ...prev, [repo]: 'offline' }));
@@ -63,17 +79,66 @@ function useLocalSnapshot(id: string, selection: unknown) {
     [accept],
   );
 
+  /** 這個快照比畫面要過的還淺（dev server 忘了深度）：不要拿它把已經載入的更早歷史截掉 */
+  const tooShallow = (repo: string, snap: GitSnapshot): boolean => {
+    const graph = snap.graph;
+    const want = wanted.current[repo];
+    if (!graph || !want) return false;
+    const count = graph.commits.length;
+    return count < want && hasMore(graph.truncated, count, pagingRef.current[repo]);
+  };
+
+  const setRepoPaging = useCallback((repo: string, next: PagingState) => {
+    setPaging((prev) => ({ ...prev, [repo]: next }));
+  }, []);
+
+  /** 往前多讀一頁：向 dev server 要更深的快照（同一個 repo 之後的讀取與 HMR 推送也都會是這個深度） */
+  const loadMore = useCallback(
+    async (repo: string) => {
+      const graph = snapsRef.current[repo]?.graph;
+      if (!graph || pagingRef.current[repo]?.loading) return;
+      const before = graph.commits.length;
+      const depth = nextDepth(before);
+      wanted.current[repo] = Math.max(wanted.current[repo] ?? 0, depth);
+      pagingRef.current = { ...pagingRef.current, [repo]: { loading: true } };
+      setRepoPaging(repo, { loading: true });
+      const result = await fetchLocalSnapshot(repo, depth);
+      if (result && typeof result === 'object') {
+        accept(repo, result);
+        setRepoPaging(repo, settled(before, result.graph?.commits.length ?? before));
+        return;
+      }
+      if (result === 'unknown' || result === LOCAL_ONLY)
+        setMissing((prev) => ({ ...prev, [repo]: result }));
+      setRepoPaging(repo, {
+        loading: false,
+        error:
+          result === 'unknown'
+            ? t.localUnknown
+            : result === LOCAL_ONLY
+              ? t.localOnly
+              : t.loadMoreFailed,
+      });
+    },
+    [accept, setRepoPaging],
+  );
+
   useEffect(() => {
     const hot = import.meta.hot;
     if (!hot) return;
     const onEvent = (e: SnapshotEvent | undefined) => {
       if (!e || typeof e.repo !== 'string' || !isRepoId(e.repo)) return;
       // 預設 repo 直接帶著快照；其他 repo 只通知有變，正在看的才去拿（其他的切回來時本來就會重抓）
-      if (e.snapshot) accept(e.repo, e.snapshot);
-      else if (e.repo === current.current && e.repo !== DEFAULT_REPO) void load(e.repo);
+      // 帶著的快照比畫面要過的淺（dev server 重新啟動、忘了深度）：帶著深度重抓，不要先縮回去再長回來
+      if (e.snapshot) {
+        if (tooShallow(e.repo, e.snapshot)) void load(e.repo);
+        else accept(e.repo, e.snapshot);
+      } else if (e.repo === current.current && e.repo !== DEFAULT_REPO) void load(e.repo);
     };
     hot.on(HMR_EVENT, onEvent);
     return () => hot.off(HMR_EVENT, onEvent);
+    // tooShallow 只讀 ref
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accept, load]);
 
   // 非預設 repo：每次選到（包含切回來）都向 dev server 要最新快照——它也會因此（重新）開始監看這個 repo。
@@ -94,7 +159,8 @@ function useLocalSnapshot(id: string, selection: unknown) {
   }, [id, selection, load, forget]);
 
   const refresh = useCallback(() => load(id), [id, load]);
-  return { snap: snaps[id], missing: missing[id], refresh };
+  const more = useCallback(() => void loadMore(id), [id, loadMore]);
+  return { snap: snaps[id], missing: missing[id], refresh, loadMore: more, paging: paging[id] };
 }
 
 type Remote =
@@ -151,10 +217,19 @@ function useGitHubGraph(source: Source, token: string) {
   const remoteRef = useRef(remote);
   remoteRef.current = remote;
   const force = useRef(false);
+  /** 更早的歷史（從缺的 parent 往回抓）：換 repo / token、重新整理時重設 */
+  const [paging, setPaging] = useState<PagingState | undefined>(undefined);
+  const pagingRef = useRef(paging);
+  pagingRef.current = paging;
+  const moreCtrl = useRef<AbortController | null>(null);
 
   const key = source.kind === 'github' ? `${source.owner}/${source.repo}`.toLowerCase() : '';
 
   useEffect(() => {
+    // 載入中的更早歷史是針對舊的圖：換 repo / token、重新整理都放掉
+    moreCtrl.current?.abort();
+    moreCtrl.current = null;
+    setPaging(undefined);
     if (source.kind !== 'github') return;
     const forced = force.current;
     force.current = false;
@@ -206,7 +281,50 @@ function useGitHubGraph(source: Source, token: string) {
     setNonce((n) => n + 1);
   }, []);
 
-  return { remote, refresh, refreshing, refreshError };
+  useEffect(() => () => moreCtrl.current?.abort(), []);
+
+  const owner = source.kind === 'github' ? source.owner : '';
+  const name = source.kind === 'github' ? source.repo : '';
+  const loadMore = useCallback(() => {
+    const cur = remoteRef.current;
+    if (cur.kind !== 'ready' || pagingRef.current?.loading || !owner) return;
+    const ctrl = new AbortController();
+    moreCtrl.current?.abort();
+    moreCtrl.current = ctrl;
+    const before = cur.graph.commits.length;
+    pagingRef.current = { loading: true };
+    setPaging({ loading: true });
+    fetchMoreGitHubHistory(owner, name, cur.graph, {
+      token: token || undefined,
+      apiBase: API_BASE,
+      signal: ctrl.signal,
+    }).then(
+      (graph) => {
+        if (ctrl.signal.aborted) return;
+        moreCtrl.current = null;
+        // 等待期間圖換掉了（重新整理完成）：這批是接在舊圖後面的，丟掉
+        const now = remoteRef.current;
+        if (now.kind !== 'ready' || now.graph !== cur.graph) return setPaging(undefined);
+        writeGhCache(key, graph, Boolean(token));
+        if (graph !== cur.graph) setRemote({ kind: 'ready', graph });
+        setPaging(settled(before, graph.commits.length));
+      },
+      (err: unknown) => {
+        if (ctrl.signal.aborted) return;
+        moreCtrl.current = null;
+        // 錯誤代碼（rate_limited、network…）：viewer 會顯示翻譯過的說明與「再試一次」
+        const code =
+          err instanceof GitHubError
+            ? err.code
+            : err instanceof Error && err.message
+              ? err.message
+              : 'unknown';
+        setPaging({ loading: false, error: code });
+      },
+    );
+  }, [owner, name, key, token]);
+
+  return { remote, refresh, refreshing, refreshError, loadMore, paging };
 }
 
 export interface GraphSource {
@@ -215,6 +333,11 @@ export interface GraphSource {
   refresh: (() => void) | undefined;
   /** 標題列顯示用 */
   repoName?: { owner: string; name: string };
+  /** 目前顯示的圖（git 動作的對話框要用：tag / branch 清單）；快照沒變時是同一個物件 */
+  graph: GraphData | null;
+  /** 更早的歷史（infinite scroll）。靜態建置的本機快照沒有（只有建置當下的那一份）。 */
+  loadMore?: () => void;
+  history?: HistoryState;
 }
 
 export function useGraphSource(source: Source, token: string): GraphSource {
@@ -237,6 +360,27 @@ export function useGraphSource(source: Source, token: string): GraphSource {
   const layout = useMemo(
     () => (graph ? buildLayout(graph, { maxCommits: Math.max(graph.commits.length, 1) }) : null),
     [graph],
+  );
+
+  // 還有沒有更早的：本機看 dev server 說的 truncated；GitHub 還要真的有「被引用、但沒載入」的 parent
+  const ghMissing = useMemo(
+    () => (source.kind === 'github' && graph ? missingParents(graph).length : 0),
+    [source.kind, graph],
+  );
+  const paging = source.kind === 'github' ? gh.paging : local.paging;
+  const count = graph?.commits.length ?? 0;
+  const canPage =
+    Boolean(graph) && (source.kind === 'github' || (import.meta.env.DEV && Boolean(localSnap)));
+  const more =
+    canPage &&
+    hasMore(graph?.truncated, count, paging) &&
+    (source.kind !== 'github' || ghMissing > 0);
+  const loading = Boolean(paging?.loading);
+  const pagingError = paging?.error;
+  // 同樣的狀態就給同一個物件：viewer 的頁尾不必因為 App 重繪（例如 git 狀態更新）而跟著重算
+  const history = useMemo<HistoryState | undefined>(
+    () => (canPage ? { more, loading, ...(pagingError ? { error: pagingError } : {}) } : undefined),
+    [canPage, more, loading, pagingError],
   );
 
   let state: ViewerState;
@@ -277,5 +421,8 @@ export function useGraphSource(source: Source, token: string): GraphSource {
           ? () => void local.refresh()
           : undefined,
     repoName: graph ? { owner: graph.repo.owner, name: graph.repo.name } : undefined,
+    graph,
+    loadMore: canPage ? (source.kind === 'github' ? gh.loadMore : local.loadMore) : undefined,
+    history,
   };
 }

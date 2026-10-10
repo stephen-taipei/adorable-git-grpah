@@ -1,4 +1,4 @@
-import { REPOS_ENDPOINT, SNAPSHOT_ENDPOINT, isRepoId } from './protocol';
+import { MAX_DEPTH, REPOS_ENDPOINT, SNAPSHOT_ENDPOINT, isRepoId } from './protocol';
 import type { GitSnapshot, LocalRepo, ReposResponse } from './protocol';
 
 /**
@@ -62,12 +62,18 @@ export async function fetchLocalRepos(): Promise<ReposResponse | typeof LOCAL_ON
 /**
  * `'unknown'`：dev server 不認得這個 id（repo 已移走、或重新啟動後不在清單裡）。
  * `LOCAL_ONLY`：不是從這台電腦開的畫面。`null`：連不上 / 其他錯誤。
+ * `depth`：至少讀這麼多筆 commit（infinite scroll）。每次都帶上目前要的深度：dev server 停掉閒置的 repo、
+ * 或重新啟動後會忘記，下一次讀取（含 HMR 通知後的重抓）才不會把已經載入的更早歷史又截掉。
  */
 export async function fetchLocalSnapshot(
   id: string,
+  depth?: number,
 ): Promise<GitSnapshot | 'unknown' | typeof LOCAL_ONLY | null> {
+  const query = new URLSearchParams({ repo: id });
+  if (depth !== undefined && Number.isSafeInteger(depth) && depth > 0)
+    query.set('depth', String(Math.min(depth, MAX_DEPTH)));
   try {
-    const res = await fetch(`${SNAPSHOT_ENDPOINT}?repo=${encodeURIComponent(id)}`, {
+    const res = await fetch(`${SNAPSHOT_ENDPOINT}?${query}`, {
       cache: 'no-store',
     });
     if (res.status === 404) return 'unknown';

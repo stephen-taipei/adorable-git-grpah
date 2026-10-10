@@ -1,17 +1,25 @@
 import type { Locale } from '../i18n';
 
+// Intl.DateTimeFormat 建立很貴（幾千列各建一個會卡），按語系快取
+const dtfCache = new Map<Locale, Intl.DateTimeFormat>();
+
 /** 「9 Oct 2026, 02:00」這種絕對時間（使用者的語系與時區）。 */
 export function formatAbsolute(iso: string, locale: Locale): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) return '';
-  return new Intl.DateTimeFormat(locale, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(ms);
+  let dtf = dtfCache.get(locale);
+  if (!dtf) {
+    dtf = new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    dtfCache.set(locale, dtf);
+  }
+  return dtf.format(ms);
 }
 
 export interface ParsedSubject {

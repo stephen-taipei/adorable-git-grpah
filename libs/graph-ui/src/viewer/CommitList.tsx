@@ -8,6 +8,7 @@ import { useCopy } from './hooks';
 import { RefBadges } from './RefBadges';
 import { CheckIcon, CopyIcon, MergeIcon } from './icons';
 import { copyText, formatAbsolute, parseSubject } from './format';
+import { sameRowNode } from './history';
 
 export const rowDomId = (sha: string) => `agg-row-${sha}`;
 
@@ -64,6 +65,18 @@ export interface CommitRowProps {
   now: number;
   onSelect: (sha: string) => void;
 }
+
+/** node 物件換新但列上顯示的內容都一樣時不重繪（載入更早的歷史會重新排版，幾千列整批重繪會卡）。 */
+const sameRowProps = (a: CommitRowProps, b: CommitRowProps) =>
+  a.t === b.t &&
+  a.locale === b.locale &&
+  a.size === b.size &&
+  a.selected === b.selected &&
+  a.dim === b.dim &&
+  a.currentBranch === b.currentBranch &&
+  a.now === b.now &&
+  a.onSelect === b.onSelect &&
+  sameRowNode(a.node, b.node);
 
 export const CommitRow = memo(function CommitRow({
   node,
@@ -138,4 +151,4 @@ export const CommitRow = memo(function CommitRow({
       </span>
     </div>
   );
-});
+}, sameRowProps);

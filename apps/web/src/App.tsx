@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { GitGraphViewer } from '@adorable/graph-ui';
+import type { DetailSize } from '@adorable/graph-ui';
 import { SourceBar, isThemeSetting } from './SourceBar';
 import { TokenDialog } from './TokenDialog';
-import { searchFromSource, sourceFromSearch } from './source';
+import { localSource, searchFromSource, sourceFromSearch } from './source';
 import type { Source } from './source';
 import { readStored, useStored, writeStored } from './storage';
 import { locale, t } from './i18n';
 import { clearGitHubCache, useGraphSource } from './useGraphSource';
+import { useGitControl } from './useGitControl';
+import { DetailGitActions, GitBar } from './GitBar';
+import { GitDialogs } from './GitDialogs';
 import { DEFAULT_REPO } from './protocol';
 
 const TOKEN_KEY = 'agg.github-token';
+const isDetailSize = (v: string): v is DetailSize => v === 'normal' || v === 'wide';
 
 function useSource(): [Source, (s: Source) => void] {
   const [source, setSource] = useState<Source>(() => sourceFromSearch(location.search));
@@ -36,7 +41,19 @@ export function App() {
   const [theme, setTheme] = useStored('agg.theme', 'auto', isThemeSetting);
   const [token, setToken] = useState(() => readStored(TOKEN_KEY) ?? '');
   const [tokenOpen, setTokenOpen] = useState(false);
-  const { state, refresh, repoName } = useGraphSource(source, token);
+  // 詳情面板的大小（面板右上角的按鈕）：記在這個瀏覽器，下次打開還是同一個大小
+  const [detailSize, setDetailSize] = useStored<DetailSize>(
+    'agg.detail-size',
+    'normal',
+    isDetailSize,
+  );
+  const { state, refresh, repoName, graph, loadMore, history } = useGraphSource(source, token);
+  // git 動作只有 dev server（pnpm start）的本機來源有；server 不回應狀態（區網的畫面等）時整個不顯示
+  const git = useGitControl(
+    import.meta.env.DEV && source.kind === 'local' ? (source.id ?? DEFAULT_REPO) : null,
+    source.kind === 'local' ? graph : null,
+  );
+  const gitReady = git.status !== null;
 
   const title = repoName
     ? repoName.owner === 'local'
@@ -65,6 +82,13 @@ export function App() {
         }
         onRefresh={refresh}
         onOpenSettings={() => setTokenOpen(true)}
+        onLoadMore={loadMore}
+        history={history}
+        detailSize={detailSize}
+        onDetailSizeChange={setDetailSize}
+        renderDetailExtra={
+          gitReady ? (node) => <DetailGitActions node={node} git={git} /> : undefined
+        }
         headerExtra={
           <SourceBar
             source={source}
@@ -72,9 +96,11 @@ export function App() {
             onNavigate={navigate}
             theme={theme}
             onThemeChange={setTheme}
+            extra={gitReady ? <GitBar git={git} /> : null}
           />
         }
       />
+      <GitDialogs git={git} graph={graph} onOpenRepo={(id) => navigate(localSource(id))} />
       {tokenOpen && (
         <TokenDialog
           token={token}

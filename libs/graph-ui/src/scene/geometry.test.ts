@@ -4,6 +4,7 @@ import {
   MAX_DEVICE_PX,
   anchoredScrollTop,
   computeMetrics,
+  detailWidthFor,
   fixedColumnsWidth,
   listWidthFor,
   planWindow,
@@ -37,23 +38,25 @@ describe('computeMetrics', () => {
     }
   });
 
-  it('always leaves room for the subject, at every width, lane count and detail state', () => {
+  it('always leaves room for the subject, at every width, lane count and detail state / size', () => {
     for (const width of [
       320, 360, 390, 414, 600, 639, 640, 700, 768, 820, 979, 980, 1024, 1100, 1280, 1440, 1920,
     ]) {
       for (const lanes of [1, 2, 4, 8, 12]) {
         for (const detailOpen of [false, true]) {
-          const m = computeMetrics(width, lanes, detailOpen);
-          const fixed =
-            m.size === 'narrow' ? LAYOUT.colGap + LAYOUT.rowPadRight : fixedColumnsWidth(m.cols);
-          const subject = listWidthFor(width, detailOpen) - m.graphW - fixed;
-          // 12 條 lane 在手機上會被 MIN_PITCH 撐到超出預算；其他情況說明欄至少要有 120px
-          const tooManyLanes = m.size === 'narrow' && lanes >= 8;
-          if (!tooManyLanes) {
-            expect(
-              subject,
-              `${width}px, ${lanes} lanes, detail ${detailOpen}`,
-            ).toBeGreaterThanOrEqual(120);
+          for (const detailSize of ['normal', 'wide'] as const) {
+            const m = computeMetrics(width, lanes, detailOpen, detailSize);
+            const fixed =
+              m.size === 'narrow' ? LAYOUT.colGap + LAYOUT.rowPadRight : fixedColumnsWidth(m.cols);
+            const subject = listWidthFor(width, detailOpen, detailSize) - m.graphW - fixed;
+            // 12 條 lane 在手機上會被 MIN_PITCH 撐到超出預算；其他情況說明欄至少要有 120px
+            const tooManyLanes = m.size === 'narrow' && lanes >= 8;
+            if (!tooManyLanes) {
+              expect(
+                subject,
+                `${width}px, ${lanes} lanes, detail ${detailOpen} (${detailSize})`,
+              ).toBeGreaterThanOrEqual(120);
+            }
           }
         }
       }
@@ -74,6 +77,22 @@ describe('computeMetrics', () => {
     expect(listWidthFor(1200, true)).toBe(listWidthFor(1200, false) - LAYOUT.detailW - LAYOUT.gap);
     expect(listWidthFor(800, true)).toBe(listWidthFor(800, false));
     expect(listWidthFor(390, true)).toBe(listWidthFor(390, false));
+    // 浮動抽屜 / 底部面板不管大小都不擠壓列表
+    expect(listWidthFor(800, true, 'wide')).toBe(listWidthFor(800, false));
+    expect(listWidthFor(390, true, 'wide')).toBe(listWidthFor(390, false));
+    // 詳情關著時面板大小沒有影響
+    expect(listWidthFor(1440, false, 'wide')).toBe(listWidthFor(1440, false));
+  });
+
+  it('a wide docked detail takes about half of the viewer and re-lays out the list', () => {
+    expect(listWidthFor(1440, true, 'wide')).toBe(
+      listWidthFor(1440, false) - detailWidthFor(1440, 'wide') - LAYOUT.gap,
+    );
+    expect(listWidthFor(1440, true, 'wide')).toBeLessThan(listWidthFor(1440, true, 'normal'));
+    // 列表變窄 → 欄位組合跟著收（normal 還放得下全部欄位）
+    expect(computeMetrics(1440, 3, true, 'normal').cols).toBe('full');
+    expect(computeMetrics(1440, 3, true, 'wide').cols).not.toBe('full');
+    expect(computeMetrics(1440, 3, false, 'wide')).toEqual(computeMetrics(1440, 3, false));
   });
 
   it('leaves headroom above the first row for the crown and beside lane 0 for the selection ring', () => {
@@ -94,6 +113,28 @@ describe('computeMetrics', () => {
     expect(m.lanePitch).toBeGreaterThanOrEqual(8);
     expect(Number.isFinite(m.graphW)).toBe(true);
     expect(Number.isFinite(computeMetrics(0, 3).graphW)).toBe(true);
+  });
+});
+
+describe('detailWidthFor', () => {
+  it('keeps the fixed width for the normal size', () => {
+    for (const w of [980, 1200, 1920]) expect(detailWidthFor(w)).toBe(LAYOUT.detailW);
+    expect(detailWidthFor(1920, 'normal')).toBe(LAYOUT.detailW);
+  });
+
+  it('is about half of the viewer for the wide size, clamped to [min, max] and an integer', () => {
+    const { min, max } = LAYOUT.detailWide;
+    expect(min).toBe(LAYOUT.detailW);
+    expect(detailWidthFor(980, 'wide')).toBe(490);
+    expect(detailWidthFor(1201, 'wide')).toBe(601);
+    expect(detailWidthFor(1440, 'wide')).toBe(max);
+    expect(detailWidthFor(2560, 'wide')).toBe(max);
+    expect(detailWidthFor(600, 'wide')).toBe(min);
+    for (let w = 980; w <= 1600; w += 7) {
+      const d = detailWidthFor(w, 'wide');
+      expect(Number.isInteger(d)).toBe(true);
+      expect(d).toBeGreaterThanOrEqual(detailWidthFor(w, 'normal'));
+    }
   });
 });
 

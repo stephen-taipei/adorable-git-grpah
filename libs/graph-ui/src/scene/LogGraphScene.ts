@@ -42,6 +42,22 @@ interface Extra {
   base: THREE.Vector3;
 }
 
+type Disposable = { dispose(): void };
+
+/** 一個 node 的 three.js 物件。列第一次進入 canvas 視窗時才建立（幾千列時不必一次建好幾千組 mesh）。 */
+interface ActorView {
+  group: THREE.Group;
+  hull: THREE.Mesh;
+  body: THREE.Mesh;
+  face: THREE.Group;
+  eyes: THREE.Mesh;
+  pupils: THREE.Mesh;
+  extras: Extra[];
+  ring: THREE.Mesh;
+  ringMat: THREE.MeshBasicMaterial;
+  disposables: Disposable[];
+}
+
 interface Actor {
   node: GraphNode;
   /** world 座標 */
@@ -51,16 +67,11 @@ interface Actor {
   px: number;
   py: number;
   radius: number;
-  group: THREE.Group;
-  hull: THREE.Mesh;
-  body: THREE.Mesh;
   bodyMat: THREE.Material;
-  face: THREE.Group;
-  eyes: THREE.Mesh;
-  pupils: THREE.Mesh;
-  extras: Extra[];
-  ring: THREE.Mesh;
-  ringMat: THREE.MeshBasicMaterial;
+  /** 還沒進過視窗的是 null */
+  view: ActorView | null;
+  /** view 目前掛在 world 底下（只有視窗內、已經出現的才掛：每個 frame 的 updateMatrixWorld / render 只走這些） */
+  attached: boolean;
   spawnAt: number;
   phase: number;
   nextBlink: number;
@@ -71,10 +82,19 @@ interface Actor {
   dimV: number;
 }
 
-interface EdgeActor {
+interface RibbonView {
   mesh: THREE.Mesh;
   material: THREE.ShaderMaterial;
   length: number;
+}
+
+interface EdgeActor {
+  /** world 座標的折線（mesh 在第一次進入視窗時才建立） */
+  points: Array<[number, number]>;
+  color: string;
+  view: RibbonView | null;
+  attached: boolean;
+  dimmed: boolean;
   /** 上方（較新）的 node：完整重播時由它決定何時長出來 */
   child: Actor;
   parent: Actor;
@@ -84,12 +104,11 @@ interface EdgeActor {
   baseColor: THREE.Color;
 }
 
+/** 歷史被截斷的 node 往下的虛線 + …（同樣在進入視窗時才建立） */
 interface Stub {
-  mesh: THREE.Mesh;
-  material: THREE.ShaderMaterial;
-  length: number;
   actor: Actor;
-  dots: THREE.Sprite;
+  view: (RibbonView & { dots: THREE.Sprite; dotsMat: THREE.SpriteMaterial }) | null;
+  attached: boolean;
 }
 
 const moodFor = (kind: GraphNode['kind']): { mouth: Mouth; scale: number } => {
@@ -148,7 +167,13 @@ export class LogGraphScene {
   private actorBySha = new Map<string, Actor>();
   private edgeActors: EdgeActor[] = [];
   private stubs: Stub[] = [];
-  private graphDisposables: Array<{ dispose(): void }> = [];
+  /** 目前掛在 world 底下的 actor（離開視窗時拿掉） */
+  private shown = new Set<Actor>();
+  /**
+   * 重建時換下來的 material / geometry：等新的畫過一次再 dispose。three.js 在最後一個用到某個 shader program 的
+   * material 被 dispose 時會刪掉那個 program，先 dispose 再畫就得整個重新編譯（每次載入更早的歷史都卡一下）。
+   */
+  private trash: Disposable[] = [];
 
   private metrics: LogMetrics = computeMetrics(1200, 1);
   /** 1 world unit = `u` CSS px */
@@ -315,7 +340,6 @@ export class LogGraphScene {
     this.actors.forEach((a, row) => {
       const inView = row >= first - 1 && row <= last + 1;
       a.spawnAt = animated && inView ? start + Math.max(0, row - first) * step : -1e6;
-      a.group.visible = a.spawnAt < 0;
       a.nextBlink = this.t + 1 + Math.random() * 3;
     });
     this.replayEnd = start + (animated ? count * step + 0.9 : 0);
@@ -328,6 +352,7 @@ export class LogGraphScene {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.clearGraph();
+    this.emptyTrash();
     for (const d of this.disposables) d.dispose();
     for (const m of this.bodyMats.values()) m.dispose();
     this.dimBodyMat.dispose();
@@ -406,6 +431,7 @@ export class LogGraphScene {
     this.updateActors(0);
     this.updateEdges();
     this.renderer.render(this.scene, this.camera);
+    this.emptyTrash();
   }
 
   // ───────────────────────── building ─────────────────────────
@@ -419,9 +445,14 @@ export class LogGraphScene {
     return m;
   }
 
-  private spriteMat(map: THREE.Texture, opacity = 1, depthTest = false): THREE.SpriteMaterial {
+  private spriteMat(
+    bag: Disposable[],
+    map: THREE.Texture,
+    opacity = 1,
+    depthTest = false,
+  ): THREE.SpriteMaterial {
     const m = new THREE.SpriteMaterial({ map, transparent: true, depthTest, opacity });
-    this.graphDisposables.push(m);
+    bag.push(m);
     return m;
   }
 
@@ -432,14 +463,24 @@ export class LogGraphScene {
     this.applyFocus();
   }
 
+  private emptyTrash() {
+    if (this.trash.length === 0) return;
+    for (const d of this.trash) d.dispose();
+    this.trash = [];
+  }
+
   private clearGraph() {
     this.hovered = null;
     this.selected = null;
     for (const child of [...this.world.children]) this.world.remove(child);
-    for (const d of this.graphDisposables) d.dispose();
-    this.graphDisposables = [];
+    for (const a of this.actors) if (a.view) this.trash.push(...a.view.disposables);
+    for (const r of [...this.edgeActors, ...this.stubs]) {
+      if (r.view) this.trash.push(r.view.mesh.geometry, r.view.material);
+    }
+    for (const st of this.stubs) if (st.view) this.trash.push(st.view.dotsMat);
     this.actors = [];
     this.actorBySha.clear();
+    this.shown.clear();
     this.edgeActors = [];
     this.stubs = [];
   }
@@ -472,32 +513,29 @@ export class LogGraphScene {
     return [(m.padLeft + lane * m.lanePitch) / this.u, -(m.topPad + (row + 0.5) * m.rowH) / this.u];
   }
 
+  /**
+   * 只建立「資料」：每個 node 的位置與動畫狀態、每條邊的折線。three.js 的 mesh 等列進入 canvas 視窗時才建
+   * （ensureActorView / ensureEdgeView / ensureStubView），所以載入幾千列或在後面接上更早的歷史時不會卡住。
+   */
   private buildGraph(layout: GraphLayout) {
     const rand = rng(layout.nodes.length * 31 + 5);
-    const m = this.metrics;
 
     for (const node of layout.nodes) {
       const actor = this.createActor(node, rand);
       this.actors.push(actor);
       this.actorBySha.set(node.sha, actor);
-      this.world.add(actor.group);
     }
 
     for (const e of layout.edges) {
       const parent = this.actorBySha.get(e.from);
       const child = this.actorBySha.get(e.to);
       if (!parent || !child) continue;
-      const pts = e.points.map(([lane, row]) => this.worldOf(lane, row));
-      const { geometry, length } = buildRibbon(pts, RIBBON_WIDTH, Z_RIBBON);
-      const material = createRibbonMaterial(this.shared, e.color);
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.frustumCulled = false;
-      this.world.add(mesh);
-      this.graphDisposables.push(geometry, material);
       this.edgeActors.push({
-        mesh,
-        material,
-        length,
+        points: e.points.map(([lane, row]) => this.worldOf(lane, row)),
+        color: e.color,
+        view: null,
+        attached: false,
+        dimmed: false,
         child,
         parent,
         rowFrom: child.node.row,
@@ -511,53 +549,54 @@ export class LogGraphScene {
     const straightDown = new Set(
       layout.edges.filter((e) => e.points[1]?.[0] === e.points[0]?.[0]).map((e) => e.to),
     );
-    const stubLen = (m.rowH * 0.85) / this.u;
     for (const node of layout.nodes) {
       if (!node.hasHiddenParents) continue;
       // 只有 first parent 被截掉才畫虛線尾巴；只是被 merge 進來的那條線的 parent 不在範圍內時，
       // 虛線會蓋在真正的 first-parent 邊上
       const first = node.parents[0];
       if ((first && this.actorBySha.has(first)) || straightDown.has(node.sha)) continue;
-      const actor = this.actorBySha.get(node.sha)!;
-      const x = actor.cx;
-      const y = actor.cy;
-      const { geometry, length } = buildRibbon(
-        [
-          [x, y],
-          [x, y - stubLen],
-        ],
-        RIBBON_WIDTH * 0.7,
-        Z_RIBBON,
-      );
-      const material = createRibbonMaterial(this.shared, node.color, {
-        chevron: false,
-        dash: true,
-      });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.frustumCulled = false;
-      this.world.add(mesh);
-      this.graphDisposables.push(geometry, material);
-
-      const dots = new THREE.Sprite(this.spriteMat(this.kit.dots, 0.8));
-      dots.scale.set(0.9, 0.3, 1);
-      dots.position.set(x, y - stubLen - 0.32, 0);
-      dots.renderOrder = 4;
-      this.world.add(dots);
-      this.stubs.push({ mesh, material, length, actor, dots });
+      this.stubs.push({ actor: this.actorBySha.get(node.sha)!, view: null, attached: false });
     }
   }
 
   private createActor(node: GraphNode, rand: () => number): Actor {
     const mood = moodFor(node.kind);
     const radius = BASE_RADIUS * mood.scale * (node.isHead ? 1.1 : 1);
-    const group = new THREE.Group();
     const [cx, cy] = this.worldOf(node.lane, node.row);
-    group.position.set(cx, cy, 0);
+    const m = this.metrics;
+    return {
+      node,
+      cx,
+      cy,
+      px: m.padLeft + node.lane * m.lanePitch,
+      py: m.topPad + (node.row + 0.5) * m.rowH,
+      radius,
+      bodyMat: this.bodyMaterial(node.color),
+      view: null,
+      attached: false,
+      spawnAt: -1e6,
+      phase: rand() * Math.PI * 2,
+      nextBlink: 1 + rand() * 3,
+      blinkStart: -10,
+      hover: { v: 0, vel: 0 },
+      look: { x: 0, y: 0 },
+      dim: false,
+      dimV: 0,
+    };
+  }
+
+  /** 第一次需要畫這個 node 時建立它的 three.js 物件（之後重複使用，直到下一次重建）。 */
+  private ensureActorView(a: Actor): ActorView {
+    if (a.view) return a.view;
+    const { node, radius } = a;
+    const mood = moodFor(node.kind);
+    const disposables: Disposable[] = [];
+    const group = new THREE.Group();
+    group.position.set(a.cx, a.cy, 0);
 
     const hull = new THREE.Mesh(this.sphere, this.hullMat);
     hull.scale.setScalar(radius * 1.13);
-    const bodyMat = this.bodyMaterial(node.color);
-    const body = new THREE.Mesh(this.sphere, bodyMat);
+    const body = new THREE.Mesh(this.sphere, a.bodyMat);
     body.scale.setScalar(radius);
     group.add(hull, body);
 
@@ -572,7 +611,7 @@ export class LogGraphScene {
         transparent: true,
         depthWrite: false,
       });
-      this.graphDisposables.push(mat);
+      disposables.push(mat);
       const mesh = new THREE.Mesh(this.plane, mat);
       mesh.scale.set(w, h, 1);
       mesh.position.set(0, y, z);
@@ -594,7 +633,7 @@ export class LogGraphScene {
       opacity: 0,
       depthWrite: false,
     });
-    this.graphDisposables.push(ringMat);
+    disposables.push(ringMat);
     const ring = new THREE.Mesh(this.ringGeo, ringMat);
     ring.position.z = -0.3;
     ring.visible = false;
@@ -609,7 +648,7 @@ export class LogGraphScene {
       x: number,
       y: number,
     ) => {
-      const sprite = new THREE.Sprite(this.spriteMat(tex));
+      const sprite = new THREE.Sprite(this.spriteMat(disposables, tex));
       sprite.scale.set(w, h, 1);
       sprite.position.set(x, y, 0.2);
       sprite.renderOrder = 6;
@@ -624,33 +663,71 @@ export class LogGraphScene {
     if (node.kind === 'fix')
       addExtra('sweat', this.kit.sweat, 0.24, 0.32, radius * 0.88, radius * 0.5);
 
-    const m = this.metrics;
-    return {
-      node,
-      cx,
-      cy,
-      px: m.padLeft + node.lane * m.lanePitch,
-      py: m.topPad + (node.row + 0.5) * m.rowH,
-      radius,
-      group,
-      hull,
-      body,
-      bodyMat,
-      face,
-      eyes,
-      pupils,
-      extras,
-      ring,
-      ringMat,
-      spawnAt: -1e6,
-      phase: rand() * Math.PI * 2,
-      nextBlink: 1 + rand() * 3,
-      blinkStart: -10,
-      hover: { v: 0, vel: 0 },
-      look: { x: 0, y: 0 },
-      dim: false,
-      dimV: 0,
-    };
+    a.view = { group, hull, body, face, eyes, pupils, extras, ring, ringMat, disposables };
+    this.applyActorFocus(a);
+    return a.view;
+  }
+
+  /** 掛到 world 底下（要畫）。 */
+  private showActor(a: Actor): ActorView {
+    const v = this.ensureActorView(a);
+    if (!a.attached) {
+      this.world.add(v.group);
+      a.attached = true;
+      this.shown.add(a);
+    }
+    v.group.visible = true;
+    return v;
+  }
+
+  /** 從 world 拿掉（視窗外 / 還沒輪到它出現）。 */
+  private hideActor(a: Actor) {
+    if (!a.attached) return;
+    this.world.remove(a.view!.group);
+    a.attached = false;
+    this.shown.delete(a);
+  }
+
+  private ensureEdgeView(e: EdgeActor): RibbonView {
+    if (e.view) return e.view;
+    const { geometry, length } = buildRibbon(e.points, RIBBON_WIDTH, Z_RIBBON);
+    const material = createRibbonMaterial(this.shared, e.color);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    e.view = { mesh, material, length };
+    this.applyEdgeFocus(e);
+    return e.view;
+  }
+
+  private ensureStubView(st: Stub): NonNullable<Stub['view']> {
+    if (st.view) return st.view;
+    const { actor } = st;
+    const x = actor.cx;
+    const y = actor.cy;
+    const stubLen = (this.metrics.rowH * 0.85) / this.u;
+    const { geometry, length } = buildRibbon(
+      [
+        [x, y],
+        [x, y - stubLen],
+      ],
+      RIBBON_WIDTH * 0.7,
+      Z_RIBBON,
+    );
+    const material = createRibbonMaterial(this.shared, actor.node.color, {
+      chevron: false,
+      dash: true,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+
+    const bag: Disposable[] = [];
+    const dotsMat = this.spriteMat(bag, this.kit.dots, 0.8);
+    const dots = new THREE.Sprite(dotsMat);
+    dots.scale.set(0.9, 0.3, 1);
+    dots.position.set(x, y - stubLen - 0.32, 0);
+    dots.renderOrder = 4;
+    st.view = { mesh, material, length, dots, dotsMat };
+    return st.view;
   }
 
   // ───────────────────────── focus / dimming ─────────────────────────
@@ -658,26 +735,38 @@ export class LogGraphScene {
   /** `snap`：重建後立刻套用（不要讓已淡化的 node 又從全尺寸慢慢縮回去）。 */
   private applyFocus(snap = false) {
     const { active, edges } = this.focus;
-    const dim = DIM[this.theme];
     for (const a of this.actors) {
       const dimmed = active !== null && !active.has(a.node.sha);
       a.dim = dimmed;
       if (snap) a.dimV = dimmed ? 1 : 0;
-      a.body.material = dimmed ? this.dimBodyMat : a.bodyMat;
-      a.hull.material = dimmed ? this.dimHullMat : this.hullMat;
-      a.face.visible = !dimmed;
-      for (const ex of a.extras) ex.sprite.visible = !dimmed;
+      this.applyActorFocus(a);
     }
     for (const e of this.edgeActors) {
-      const dimmed =
+      e.dimmed =
         active !== null &&
         edges &&
         !(active.has(e.child.node.sha) && active.has(e.parent.node.sha));
-      const u = e.material.uniforms;
-      (u['uColor']!.value as THREE.Color).set(dimmed ? dim.body : e.baseColor);
-      (u['uOutline']!.value as THREE.Color).set(dimmed ? dim.outline : OUTLINE_COLOR);
-      u['uChevron']!.value = dimmed ? 0 : 1;
+      this.applyEdgeFocus(e);
     }
+  }
+
+  /** 把 actor 的淡化狀態套到它的 mesh 上（還沒建立 mesh 的，建立時再套）。 */
+  private applyActorFocus(a: Actor) {
+    const v = a.view;
+    if (!v) return;
+    v.body.material = a.dim ? this.dimBodyMat : a.bodyMat;
+    v.hull.material = a.dim ? this.dimHullMat : this.hullMat;
+    v.face.visible = !a.dim;
+    for (const ex of v.extras) ex.sprite.visible = !a.dim;
+  }
+
+  private applyEdgeFocus(e: EdgeActor) {
+    if (!e.view) return;
+    const dim = DIM[this.theme];
+    const u = e.view.material.uniforms;
+    (u['uColor']!.value as THREE.Color).set(e.dimmed ? dim.body : e.baseColor);
+    (u['uOutline']!.value as THREE.Color).set(e.dimmed ? dim.outline : OUTLINE_COLOR);
+    u['uChevron']!.value = e.dimmed ? 0 : 1;
   }
 
   // ───────────────────────── animation ─────────────────────────
@@ -685,9 +774,12 @@ export class LogGraphScene {
   private updateIncrementally(previous: Set<string>) {
     const animated = !this.reduced;
     // 只讓可視範圍附近的新 commit 彈出來（由舊到新）；畫面外的立刻就位，不然要白等一長串看不到的動畫
+    // 接在最後面的是更早的歷史（infinite scroll 載入的），不是新的 commit：直接就位，不彈出來
     const { first, last } = this.visible();
+    let lastOld = -1;
+    for (const a of this.actors) if (previous.has(a.node.sha)) lastOld = a.node.row;
     const fresh = this.actors
-      .filter((a) => !previous.has(a.node.sha))
+      .filter((a) => !previous.has(a.node.sha) && a.node.row < lastOld)
       .filter((a) => a.node.row >= first - 2 && a.node.row <= last + 2)
       .reverse();
     const animate = new Set(animated ? fresh : []);
@@ -695,16 +787,12 @@ export class LogGraphScene {
     const step = clamp(2 / Math.max(fresh.length, 1), 0.03, 0.2);
     for (const a of this.actors) {
       a.nextBlink = this.t + 1 + Math.random() * 3;
-      if (!animate.has(a)) {
-        a.spawnAt = -1e6;
-        a.group.visible = true;
-      }
+      if (!animate.has(a)) a.spawnAt = -1e6;
     }
     let lastSpawn = this.t;
     fresh.forEach((a, k) => {
       if (!animate.has(a)) return;
       a.spawnAt = this.t + 0.25 + k * step;
-      a.group.visible = false;
       lastSpawn = a.spawnAt;
     });
     this.edgeTiming = 'incremental';
@@ -730,6 +818,7 @@ export class LogGraphScene {
     this.updateActors(dt);
     this.updateEdges();
     this.renderer.render(this.scene, this.camera);
+    this.emptyTrash();
   };
 
   /** 讓外部（測試 / 樣式）知道動畫是否播完：host[data-replay]。 */
@@ -759,13 +848,17 @@ export class LogGraphScene {
         ? view.first - 3 + (((this.t - this.waveStart) % period) / period) * span
         : -1e3;
 
-    for (let i = 0; i < this.actors.length; i++) {
+    // 離開視窗的從 world 拿掉；視窗內的才建立 / 更新（幾千列時每個 frame 只處理視窗內的幾十個）
+    for (const a of this.shown) {
+      if (a.node.row < r0 || a.node.row > r1) this.hideActor(a);
+    }
+    for (let i = r0; i <= r1; i++) {
       const a = this.actors[i]!;
-      if (i < r0 || i > r1 || this.t < a.spawnAt) {
-        a.group.visible = false;
+      if (this.t < a.spawnAt) {
+        this.hideActor(a);
         continue;
       }
-      a.group.visible = true;
+      const v = this.showActor(a);
       const age = this.t - a.spawnAt;
       const p = clamp01(age / 0.75);
       const pop = easeOutElastic(p);
@@ -784,12 +877,12 @@ export class LogGraphScene {
       const pulse = Math.exp(-(dr * dr) / 1.6);
       const breath = Math.sin(this.t * 2.1 + a.phase) * motion * (a.dim ? 0 : 1);
       const s = pop * dimScale * (1 + h.v * 0.3 + pulse * 0.16 * (a.dim ? 0 : 1));
-      a.group.scale.set(
+      v.group.scale.set(
         s * (1 - breath * 0.03 - h.v * 0.04),
         s * (1 + breath * 0.035 + h.v * 0.04),
         s,
       );
-      a.group.position.y =
+      v.group.position.y =
         a.cy +
         hop +
         Math.sin(this.t * 1.5 + a.phase) * 0.05 * motion * (a.dim ? 0 : 1) +
@@ -797,12 +890,12 @@ export class LogGraphScene {
 
       // 進場光環
       if (age < 0.6 && motion) {
-        a.ring.visible = true;
+        v.ring.visible = true;
         const r = clamp01(age / 0.6);
-        a.ring.scale.setScalar(a.radius * (1 + r * 1.4));
-        a.ringMat.opacity = (1 - r) * 0.75;
-      } else if (a.ring.visible) {
-        a.ring.visible = false;
+        v.ring.scale.setScalar(a.radius * (1 + r * 1.4));
+        v.ringMat.opacity = (1 - r) * 0.75;
+      } else if (v.ring.visible) {
+        v.ring.visible = false;
       }
 
       if (a.dim) continue;
@@ -814,8 +907,8 @@ export class LogGraphScene {
       }
       const bp = clamp01((this.t - a.blinkStart) / 0.17);
       const blink = bp < 1 ? 1 - Math.sin(bp * Math.PI) * 0.92 : 1;
-      a.eyes.scale.y = 0.4 * blink;
-      a.pupils.scale.y = 0.4 * blink;
+      v.eyes.scale.y = 0.4 * blink;
+      v.pupils.scale.y = 0.4 * blink;
 
       // 瞳孔看向游標；沒有游標時輕輕飄移
       let lx = Math.sin(this.t * 0.6 + a.phase) * 0.35 * motion;
@@ -830,10 +923,10 @@ export class LogGraphScene {
       }
       a.look.x += (lx - a.look.x) * damp(10, dt);
       a.look.y += (ly - a.look.y) * damp(10, dt);
-      a.pupils.position.x = a.look.x * 0.06;
-      a.pupils.position.y = 0.1 + a.look.y * 0.045;
+      v.pupils.position.x = a.look.x * 0.06;
+      v.pupils.position.y = 0.1 + a.look.y * 0.045;
 
-      for (const ex of a.extras) {
+      for (const ex of v.extras) {
         const w = Math.sin(this.t * 3 + a.phase) * motion;
         if (ex.kind === 'crown') {
           ex.sprite.position.y = ex.base.y + Math.abs(w) * 0.05;
@@ -852,9 +945,10 @@ export class LogGraphScene {
 
     // 選取環跟著被選取的 node（含它的彈跳）
     const sel = this.selected;
-    if (sel && sel.group.visible) {
+    const selGroup = sel?.attached ? sel.view?.group : undefined;
+    if (sel && selGroup) {
       this.selection.visible = true;
-      this.selection.position.set(sel.group.position.x, sel.group.position.y, -0.2);
+      this.selection.position.set(selGroup.position.x, selGroup.position.y, -0.2);
       const pulse = 1 + Math.sin(this.t * 4.2) * 0.05 * motion;
       this.selection.scale.setScalar(sel.radius * 1.4 * pulse);
     } else {
@@ -864,26 +958,48 @@ export class LogGraphScene {
 
   private updateEdges() {
     const win = this.win;
+    if (!win) return;
     const { rowH, topPad } = this.metrics;
-    const top = win ? Math.floor((win.top - topPad) / rowH) - 2 : -Infinity;
-    const bottom = win ? Math.ceil((win.top + win.height - topPad) / rowH) + 2 : Infinity;
+    const top = Math.floor((win.top - topPad) / rowH) - 2;
+    const bottom = Math.ceil((win.top + win.height - topPad) / rowH) + 2;
     for (const e of this.edgeActors) {
-      e.mesh.visible = e.rowTo >= top && e.rowFrom <= bottom;
-      if (!e.mesh.visible) continue;
+      // 視窗外的邊從 world 拿掉；第一次進入視窗時才建立 mesh
+      if (e.rowTo < top || e.rowFrom > bottom) {
+        if (e.attached) {
+          this.world.remove(e.view!.mesh);
+          e.attached = false;
+        }
+        continue;
+      }
+      const v = this.ensureEdgeView(e);
+      if (!e.attached) {
+        this.world.add(v.mesh);
+        e.attached = true;
+      }
       const start =
         this.edgeTiming === 'incremental'
           ? Math.max(e.child.spawnAt - 0.35, e.parent.spawnAt + 0.05)
           : e.child.spawnAt + 0.05;
       const p = clamp01((this.t - start) / 0.4);
-      e.material.uniforms['uReveal']!.value = p >= 1 ? e.length + 1 : easeInOutCubic(p) * e.length;
+      v.material.uniforms['uReveal']!.value = p >= 1 ? v.length + 1 : easeInOutCubic(p) * v.length;
     }
-    for (const s of this.stubs) {
-      const row = s.actor.node.row;
-      s.mesh.visible = s.dots.visible = row >= top && row <= bottom;
-      if (!s.mesh.visible) continue;
-      const p = clamp01((this.t - s.actor.spawnAt) / 0.4);
-      s.material.uniforms['uReveal']!.value = p >= 1 ? s.length + 1 : p * s.length;
-      s.dots.visible = p > 0.6;
+    for (const st of this.stubs) {
+      const row = st.actor.node.row;
+      if (row < top || row > bottom) {
+        if (st.attached) {
+          this.world.remove(st.view!.mesh, st.view!.dots);
+          st.attached = false;
+        }
+        continue;
+      }
+      const v = this.ensureStubView(st);
+      if (!st.attached) {
+        this.world.add(v.mesh, v.dots);
+        st.attached = true;
+      }
+      const p = clamp01((this.t - st.actor.spawnAt) / 0.4);
+      v.material.uniforms['uReveal']!.value = p >= 1 ? v.length + 1 : p * v.length;
+      v.dots.visible = p > 0.6;
     }
   }
 }

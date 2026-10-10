@@ -60,6 +60,22 @@ export const ExternalIcon = () =>
       <path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4" />
     </>,
   );
+/** 詳情面板「加寬」：往外的箭頭 */
+export const ExpandIcon = () =>
+  wrap(
+    <>
+      <path d="M14 4h6v6M20 4l-6 6" />
+      <path d="M10 20H4v-6M4 20l6-6" />
+    </>,
+  );
+/** 詳情面板「還原寬度」：往內的箭頭 */
+export const CollapseIcon = () =>
+  wrap(
+    <>
+      <path d="M20 10h-6V4M14 10l6-6" />
+      <path d="M4 14h6v6M10 14l-6 6" />
+    </>,
+  );
 export const ChevronUpIcon = () => wrap(<path d="M6 15l6-6 6 6" />);
 export const ChevronDownIcon = () => wrap(<path d="M6 9l6 6 6-6" />);
 export const CloudIcon = () =>

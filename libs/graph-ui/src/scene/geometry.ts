@@ -8,6 +8,14 @@
 
 export type SizeClass = 'wide' | 'medium' | 'narrow';
 
+/**
+ * 詳情面板的大小（使用者用面板右上角的按鈕切換）。
+ *   normal  寬螢幕並排時固定 `LAYOUT.detailW`
+ *   wide    寬螢幕並排時約為整個 viewer 的一半（見 `detailWidthFor`）；中等寬度的浮動抽屜也跟著變寬（CSS）
+ * 窄螢幕（底部面板）本來就是全寬，不分大小。
+ */
+export type DetailSize = 'normal' | 'wide';
+
 export const NARROW_MAX = 640;
 export const MEDIUM_MAX = 980;
 
@@ -46,8 +54,10 @@ export interface LogMetrics {
 export const LAYOUT = {
   bodyPad: { wide: 14, medium: 14, narrow: 8 } as Record<SizeClass, number>,
   cardBorder: { wide: 3, medium: 3, narrow: 2 } as Record<SizeClass, number>,
-  /** 寬螢幕時詳情面板的寬度；與列表之間的間距 */
+  /** 寬螢幕時詳情面板（normal）的寬度；與列表之間的間距 */
   detailW: 380,
+  /** 寬螢幕時詳情面板（wide）的寬度：viewer 寬度 × frac，夾在 [min, max] */
+  detailWide: { min: 380, frac: 0.5, max: 720 },
   gap: 12,
   /** 各欄位組合的欄寬（px）與欄距 / 右側 padding */
   col: {
@@ -90,20 +100,31 @@ export function stableMetrics(prev: LogMetrics | null, next: LogMetrics): LogMet
   return prev && sameMetrics(prev, next) ? prev : next;
 }
 
+/** 寬螢幕（並排）時詳情面板的寬度（px，整數）。同時是 CSS 的 `--agg-detail-w`。 */
+export function detailWidthFor(rootWidth: number, detailSize: DetailSize = 'normal'): number {
+  if (detailSize !== 'wide') return LAYOUT.detailW;
+  const { min, frac, max } = LAYOUT.detailWide;
+  return Math.round(Math.min(max, Math.max(min, rootWidth * frac)));
+}
+
 /** 列表（卡片內容區）的可用寬度。`detailOpen` 且為寬螢幕時詳情面板靠右並排，其餘尺寸是浮在上面的抽屜 / 底部面板。 */
-export function listWidthFor(rootWidth: number, detailOpen: boolean): number {
+export function listWidthFor(
+  rootWidth: number,
+  detailOpen: boolean,
+  detailSize: DetailSize = 'normal',
+): number {
   const size = sizeClassFor(rootWidth);
   const docked = detailOpen && size === 'wide';
   return (
     rootWidth -
     2 * LAYOUT.bodyPad[size] -
     2 * LAYOUT.cardBorder[size] -
-    (docked ? LAYOUT.detailW + LAYOUT.gap : 0)
+    (docked ? detailWidthFor(rootWidth, detailSize) + LAYOUT.gap : 0)
   );
 }
 
 /**
- * 依容器寬度、lane 數與詳情是否並排，決定列高、欄位組合、lane 間距與線圖欄寬。
+ * 依容器寬度、lane 數、詳情是否並排（與並排時的面板大小），決定列高、欄位組合、lane 間距與線圖欄寬。
  * 先看「列表真正剩多少寬度」選欄位組合（作者 / 日期放不下就收起來），再把線圖欄限制在不擠壞說明欄的範圍內；
  * lane 太多時壓縮間距，而不是讓線圖欄無限變寬。
  */
@@ -111,6 +132,7 @@ export function computeMetrics(
   rootWidth: number,
   laneCount: number,
   detailOpen = false,
+  detailSize: DetailSize = 'normal',
 ): LogMetrics {
   const size = sizeClassFor(rootWidth);
   const radius = RADIUS[size];
@@ -118,7 +140,7 @@ export function computeMetrics(
   const padSide = Math.ceil(radius * 1.9) + 1;
   const lanes = Math.max(1, Math.floor(laneCount));
   const maxPitch = MAX_PITCH[size];
-  const listW = listWidthFor(rootWidth, detailOpen);
+  const listW = listWidthFor(rootWidth, detailOpen, detailSize);
 
   const capW = Math.max(
     2 * padSide,

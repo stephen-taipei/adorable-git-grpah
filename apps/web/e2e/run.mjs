@@ -22,7 +22,18 @@
 //     跨來源讀不到也加不進 repo、太大的 POST 拿到 413、偽造 Host 被 Vite 擋下、
 //     `vite --host` 時非 loopback 的連線只拿得到預設 repo（403 local_only，頁面說明原因、沒有 ＋；沒有非 loopback 介面就略過這一步）、
 //     手機寬度沒有橫向溢位、與 GitHub 來源來回切換（GitHub → 本機 回到最後看的本機 repo，不是預設 repo））
-//   → 其他本機 repo（沒有 remote / 空的 / 不是 git）→ 本機 build + preview。
+//   → 其他本機 repo（沒有 remote / 空的 / 不是 git）→ 本機 build + preview（沒有 git 動作列、不打任何 /__agg/ endpoint）
+//   → 以下各自用自己的 dev server / 暫時 repo / browser context，不影響前面的步驟：
+//     · infinite scroll（本機：705 個 commit、AGG_MAX_COMMITS=100，捲到底向 dev server 要 ?depth=400 → 700 → 1000：
+//       往下接、畫面不動、不重播、選取 / 捲動容器不變、線圖同步、到「最初的 commit」為止；失敗時顯示錯誤 + 再試一次、不自動重試；
+//       之後的即時更新保留已載入的深度。GitHub 來源：mock 的 demo/long-history，從缺的 parent 往回抓 /commits?sha=）
+//     · 詳情面板大小（加寬 / 還原：aria-pressed、clamp(380px, 50%, 720px)、列表重排沒有溢位、記在 localStorage、
+//       中等寬度的抽屜跟著變寬、窄螢幕的底部面板沒有這個按鈕）
+//     · git 動作（本機的 bare remote + 另一個 clone 模擬隊友）：動作列（branch、↑↓、變更數、不能用的原因、手機寬度只留圖示）、
+//       fetch / pull（只 fast-forward）、push（先確認、被拒絕時不 force、分岔時 pull 拒絕、設定 upstream）、
+//       stash（存 / apply / pop / drop 二次確認）、tag（詳情面板的選取 commit / HEAD、名稱檢查、push、刪除）、
+//       worktree（新增 → 開啟 → 有未追蹤檔案時拒絕移除 → 移除）；結果一律以 git 本身為準
+//     · 安全性：其他來源 / 偽造 Host / 區網的裝置都讀不到 /__agg/status、執行不了 /__agg/git，區網的畫面沒有動作列。
 // 軟體 WebGL（SwiftShader）在 CPU 吃緊時很慢：一律等「狀態」（data-replay、定位器、輪詢），不用固定 sleep 當判斷依據；
 // 像素判斷失敗時會重截幾次才判定；逾時乘上 E2E_TIMEOUT_SCALE（預設 2）。截圖輸出到 e2e/.artifacts。
 //   用法：pnpm e2e        （環境變數 CHROME_PATH 可指定 Chrome）
@@ -47,7 +58,16 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import { findChrome } from '../../../tools/e2e/chrome-path.mjs';
-import { SPECS, seen, sha as mockSha, startMock } from '../../../tools/e2e/mock-github-api.mjs';
+import {
+  LONG,
+  SPECS,
+  faults,
+  gate,
+  releaseHeld,
+  seen,
+  sha as mockSha,
+  startMock,
+} from '../../../tools/e2e/mock-github-api.mjs';
 import { colorDistance, inkRatio, samplePixels } from '../../../tools/e2e/pixels.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -184,6 +204,92 @@ function makeRepoRoots() {
   const sneaky = init(resolve(outsideDir, 'sneaky'));
   commit(sneaky, 'sneaky: should never be added cross-origin', 'Dan');
   return { rootsDir, outsideDir, beta, gamma, plain, far, sneaky };
+}
+
+/**
+ * infinite scroll 用的長歷史（AGG_MAX_COMMITS=100 時要往回載入好幾批）。700 多個 commit 逐一 `git commit` 太慢，
+ * 改用 `git fast-import` 一次建好（每個 commit 都比上一個晚一小時：--date-order 的順序就是建立順序倒過來）。
+ *   main：d1 ← d2 ← … ← d700（d1 是 root：載到底時頁尾說「最初的 commit 在這裡」）
+ *   topic/old：從 d200 分出 t1 ← t2 ← t3，在 d210 合併；wip/deep：從 d650 分出 w1 ← w2（沒有合併）
+ *   tag v0.1 在 d30（最後一批才載得到）、v1.0 在 d690（第一批就有）
+ * 共 705 個 commit。
+ */
+function makeDeepRepo() {
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'agg-web-e2e-deep-')));
+  git(dir, 'init', '-q', '-b', 'main');
+  const marks = new Map();
+  let at = Math.floor(Date.UTC(2025, 0, 1) / 1000);
+  let out = '';
+  const add = (ref, id, msg, parents) => {
+    marks.set(id, marks.size + 1);
+    at += 3600;
+    const name = ['Amy', 'Ben', 'Cat'][marks.size % 3];
+    const who = `${name} <${name.toLowerCase()}@example.test> ${at} +0000`;
+    out += `commit refs/heads/${ref}\nmark :${marks.get(id)}\nauthor ${who}\ncommitter ${who}\n`;
+    out += `data ${Buffer.byteLength(msg)}\n${msg}\n`;
+    if (parents[0]) out += `from :${marks.get(parents[0])}\n`;
+    for (const p of parents.slice(1)) out += `merge :${marks.get(p)}\n`;
+    out += '\n';
+  };
+  const main = (i) => {
+    const prev = i > 1 ? [`d${i - 1}`] : [];
+    if (i === 1) return add('main', 'd1', 'chore: the very first commit', prev);
+    if (i === 210) return add('main', 'd210', "Merge branch 'topic/old'", [...prev, 't3']);
+    add('main', `d${i}`, `${TYPES[i % TYPES.length]}: deep step ${i}`, prev);
+  };
+  for (let i = 1; i <= 700; i++) {
+    main(i);
+    if (i === 200) add('topic/old', 't1', 'feat: old topic one', ['d200']);
+    if (i === 205) {
+      add('topic/old', 't2', 'fix: old topic two', ['t1']);
+      add('topic/old', 't3', 'test: old topic three', ['t2']);
+    }
+    if (i === 650) {
+      add('wip/deep', 'w1', 'wip: deep side one', ['d650']);
+      add('wip/deep', 'w2', 'wip: deep side two', ['w1']);
+    }
+  }
+  out += `reset refs/tags/v0.1\nfrom :${marks.get('d30')}\n\n`;
+  out += `reset refs/tags/v1.0\nfrom :${marks.get('d690')}\n\n`;
+  execFileSync('git', ['fast-import', '--quiet'], { cwd: dir, env: gitEnv, input: out });
+  // fast-import 不碰工作目錄：全部的 commit 都是空的 tree，HEAD（main）乾乾淨淨
+  return dir; // 705 commits, 3 branches, 2 tags, 1 merge
+}
+
+/**
+ * git 動作用的一組 repo（放在同一個暫時資料夾，新的 worktree 也會建在這裡：相對路徑以 repo 的上一層為基準）：
+ *   origin.git / backup.git   本機的 bare「remote」（檔案路徑，不需要網路）
+ *   work/                     dev server 的預設 repo（AGG_REPO_DIR）：clone 自 origin，main 追蹤 origin/main，另有 backup remote
+ *   mate/                     另一個 clone：模擬隊友在別處 push
+ *   roots/                    空的 AGG_REPO_ROOTS（repo 清單是確定的）
+ */
+function makeGitFixture() {
+  const top = realpathSync(mkdtempSync(resolve(tmpdir(), 'agg-web-e2e-git-')));
+  const fx = {
+    top,
+    origin: resolve(top, 'origin.git'),
+    backup: resolve(top, 'backup.git'),
+    work: resolve(top, 'work'),
+    mate: resolve(top, 'mate'),
+    roots: resolve(top, 'roots'),
+  };
+  mkdirSync(fx.roots);
+  git(top, 'init', '-q', '--bare', '-b', 'main', fx.origin);
+  git(top, 'init', '-q', '--bare', '-b', 'main', fx.backup);
+  git(top, 'init', '-q', '-b', 'main', fx.work);
+  git(fx.work, 'remote', 'add', 'origin', fx.origin);
+  git(fx.work, 'remote', 'add', 'backup', fx.backup);
+  writeFileSync(resolve(fx.work, 'notes.txt'), 'notes\n');
+  git(fx.work, 'add', 'notes.txt');
+  commit(fx.work, 'chore: start the shared repo');
+  for (let i = 1; i <= 7; i++) {
+    writeFileSync(resolve(fx.work, 'notes.txt'), `notes ${i}\n`);
+    git(fx.work, 'add', 'notes.txt');
+    commit(fx.work, `${TYPES[i % TYPES.length]}: shared step ${i}`, i % 3 ? 'Amy' : 'Ben');
+  }
+  git(fx.work, 'push', '-q', '-u', 'origin', 'main');
+  git(top, 'clone', '-q', fx.origin, fx.mate);
+  return fx;
 }
 
 // ───────────────────────── helpers ─────────────────────────
@@ -421,6 +527,12 @@ let dev;
 let preview;
 let browser;
 let page;
+// infinite scroll / git 動作的步驟各自有 repo 與 dev server（會改動 repo、提高快照深度，不能影響上面的步驟）
+let deepDir;
+let gfx;
+const sideServers = new Set();
+/** 失敗時要截圖的頁面（這些步驟用的是自己的頁面；沒有就截主畫面） */
+let shotPage;
 
 try {
   dev = startVite(['--port', String(port), '--strictPort'], env);
@@ -500,8 +612,8 @@ try {
       }),
     );
   const rowLoc = (sha, pg = page) => pg.locator(`.agg-commit[data-sha="${sha}"]`);
-  const selectedSha = () =>
-    page.evaluate(() => document.querySelector('.agg-commit[data-selected]')?.dataset.sha ?? null);
+  const selectedSha = (pg = page) =>
+    pg.evaluate(() => document.querySelector('.agg-commit[data-selected]')?.dataset.sha ?? null);
   const dimmedShas = async () => (await domRows()).filter((r) => r.dim).map((r) => r.sha);
   const litShas = async () => (await domRows()).filter((r) => !r.dim).map((r) => r.sha);
   const sameSet = (a, b) => a.length === b.length && new Set([...a, ...b]).size === a.length;
@@ -513,22 +625,23 @@ try {
       `${what}: expected ${want.length} lit rows, got ${got.length} (missing ${want.filter((s) => !got.includes(s)).length}, extra ${got.filter((s) => !want.includes(s)).length})`,
     );
   };
-  const waitSelected = async (sha, what = '') => {
-    await waitUntil(async () => (await selectedSha()) === sha, 10_000, `selected ${what}`).catch(
+  const waitSelected = async (sha, what = '', pg = page) => {
+    await waitUntil(async () => (await selectedSha(pg)) === sha, 10_000, `selected ${what}`).catch(
       () => {},
     );
-    assert.equal(await selectedSha(), sha, `selected row (${what})`);
+    assert.equal(await selectedSha(pg), sha, `selected row (${what})`);
   };
 
   // ── 捲動 ──
-  const scrollTopNow = () => page.evaluate(() => document.querySelector('.agg-scroll').scrollTop);
+  const scrollTopNow = (pg = page) =>
+    pg.evaluate(() => document.querySelector('.agg-scroll').scrollTop);
   /** 等平滑捲動結束（scrollTop 連續 3 次輪詢都沒變）。 */
-  const settleScroll = async () => {
+  const settleScroll = async (pg = page) => {
     let last = NaN;
     let same = 0;
     const t = Date.now();
     while (same < 3) {
-      const cur = await scrollTopNow();
+      const cur = await scrollTopNow(pg);
       same = cur === last ? same + 1 : 0;
       last = cur;
       if (Date.now() - t > 20_000) throw new Error('scroll never settled');
@@ -536,14 +649,14 @@ try {
     }
     return last;
   };
-  const scrollTo = async (top) => {
-    await page.evaluate((t) => {
+  const scrollTo = async (top, pg = page) => {
+    await pg.evaluate((t) => {
       document.querySelector('.agg-scroll').scrollTop = t;
     }, top);
-    return settleScroll();
+    return settleScroll(pg);
   };
-  const scrollMax = () =>
-    page.evaluate(() => {
+  const scrollMax = (pg = page) =>
+    pg.evaluate(() => {
       const s = document.querySelector('.agg-scroll');
       return s.scrollHeight - s.clientHeight;
     });
@@ -747,8 +860,8 @@ try {
     }, sel);
   const rootAttr = (name, pg = page) =>
     pg.evaluate((n) => document.querySelector('.agg-root')?.getAttribute(n) ?? null, name);
-  const noOverflow = () =>
-    page.evaluate(() => {
+  const noOverflow = (pg = page) =>
+    pg.evaluate(() => {
       const bad = [];
       const sc = document.querySelector('.agg-scroll');
       if (sc.scrollWidth > sc.clientWidth + 1)
@@ -801,20 +914,23 @@ try {
     page.locator('.agg-branch', {
       has: page.locator('.agg-branch-name', { hasText: new RegExp(`^${name}$`) }),
     });
-  const rowFullyVisible = (sha) =>
-    page.evaluate((s) => {
+  const rowFullyVisible = (sha, pg = page) =>
+    pg.evaluate((s) => {
       const r = document.querySelector(`.agg-commit[data-sha="${s}"]`)?.getBoundingClientRect();
       const sc = document.querySelector('.agg-scroll').getBoundingClientRect();
       return Boolean(r && r.top >= sc.top - 0.5 && r.bottom <= sc.bottom + 0.5);
     }, sha);
-  const waitRowVisible = async (sha, what = '') => {
+  const waitRowVisible = async (sha, what = '', pg = page) => {
     await waitUntil(
-      () => rowFullyVisible(sha),
+      () => rowFullyVisible(sha, pg),
       12_000,
       `row ${what || sha.slice(0, 7)} scrolled into view`,
     );
-    await settleScroll();
-    assert.ok(await rowFullyVisible(sha), `row ${what || sha.slice(0, 7)} must be fully visible`);
+    await settleScroll(pg);
+    assert.ok(
+      await rowFullyVisible(sha, pg),
+      `row ${what || sha.slice(0, 7)} must be fully visible`,
+    );
   };
 
   /** 詳情面板的內容（英文介面）。 */
@@ -860,7 +976,8 @@ try {
         hasCta: Boolean(d.querySelector('.agg-cta')),
       };
     });
-  const clickRow = (sha, how = {}) => rowLoc(sha).click({ position: { x: 150, y: 10 }, ...how });
+  const clickRow = (sha, how = {}, pg = page) =>
+    rowLoc(sha, pg).click({ position: { x: 150, y: 10 }, ...how });
 
   const readClipboard = async () => {
     await page.bringToFront();
@@ -4759,6 +4876,11 @@ try {
       await preview.ready;
       const p2 = await ctx.newPage();
       watchErrors(p2, 'preview page');
+      // 靜態建置沒有 dev server：不能有任何 /__agg/ 請求（git 狀態 / 動作、更早的歷史都不存在）
+      const aggRequests = [];
+      p2.on('request', (r) => {
+        if (new URL(r.url()).pathname.startsWith('/__agg/')) aggRequests.push(r.url());
+      });
       await p2.goto(`http://localhost:${pPort}/`);
       await p2.locator('.agg-title-text', { hasText: 'octo/cat' }).waitFor();
       await p2
@@ -4784,9 +4906,1914 @@ try {
         !(res.headers()['content-type'] ?? '').includes('json'),
         'dev endpoint must not exist in a build',
       );
+      // git 動作只屬於 dev server：沒有動作列、詳情面板裡沒有 Tag… / Worktree…；頁尾沒有「載入更早的歷史」
+      assert.equal(await p2.locator('.web-git').count(), 0, 'no git actions bar in a build');
+      await clickRow(rows[3].sha, {}, p2);
+      await p2.locator('.agg-detail').waitFor();
+      assert.equal(
+        await p2.locator('.web-detail-btn').count(),
+        0,
+        'no Tag… / Worktree… in a build',
+      );
+      assert.equal(await p2.locator('.agg-footer').getAttribute('data-state'), 'end');
+      assert.equal(await p2.locator('.agg-footer button').count(), 0, 'nothing to load in a build');
+      assert.deepEqual(aggRequests, [], 'a build never calls the dev endpoints');
       await p2.close();
     },
   );
+
+  // ═════════════════════════ infinite scroll / 詳情面板大小 ═════════════════════════
+  // 以下的步驟各自用自己的 dev server、暫時 repo 與 browser context（localStorage / sessionStorage 分開），
+  // 不改動上面步驟用的 repo、快照深度與設定。
+
+  const newContext = async () => {
+    const c = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'en-US' });
+    c.setDefaultTimeout(30_000 * SCALE);
+    c.setDefaultNavigationTimeout(30_000 * SCALE);
+    await c.route('https://github.com/**', (r) =>
+      r.fulfill({ status: 200, contentType: 'text/html', body: '<title>fake github</title>' }),
+    );
+    return c;
+  };
+  const xctx = await newContext();
+  /** 這一頁也是失敗時的截圖對象 */
+  const openPage = async (tag) => {
+    const pg = await xctx.newPage();
+    watchErrors(pg, tag);
+    shotPage = pg;
+    return pg;
+  };
+  // 前面步驟的主畫面用不到了：它的 WebGL 場景會一直跟下面的頁面搶 CPU（軟體 WebGL），先停在空白頁
+  await page.goto('about:blank');
+  // 側邊 dev server 的 repo 清單只掃描空資料夾（預設會掃描 repo 的上一層，也就是整個暫存目錄）
+  const emptyRoots = resolve(stateDir, 'empty-roots');
+  mkdirSync(emptyRoots);
+  /** 另起一個 dev server（`pnpm start` 同一份設定，只換環境變數）；結束時由 finally 收掉。 */
+  const startSide = async (name, extraEnv, args = []) => {
+    const p = await freePort();
+    const v = startVite([...args, '--port', String(p), '--strictPort'], {
+      ...env,
+      AGG_REPO_ROOTS: emptyRoots,
+      AGG_LOCAL_REPOS_FILE: stateFileOf(name),
+      ...extraEnv,
+    });
+    sideServers.add(v);
+    await v.ready;
+    return { v, port: p, origin: `http://localhost:${p}` };
+  };
+  const stopSide = async (v) => {
+    await stopVite(v);
+    sideServers.delete(v);
+  };
+
+  const rowShas = (pg) =>
+    pg.evaluate(() => [...document.querySelectorAll('.agg-commit')].map((r) => r.dataset.sha));
+  /** 列表最後一列（頁尾）：狀態、訊息（role=status 的 live region）、轉圈、按鈕。 */
+  const footerOf = (pg) =>
+    pg.evaluate(() => {
+      const f = document.querySelector('.agg-footer');
+      if (!f) return null;
+      const msg = f.querySelector('.agg-footer-msg');
+      return {
+        state: f.dataset.state ?? null,
+        text: msg?.textContent ?? '',
+        role: msg?.getAttribute('role') ?? null,
+        live: msg?.getAttribute('aria-live') ?? null,
+        spinner: Boolean(f.querySelector('.agg-spinner')),
+        button: f.querySelector('button')?.textContent ?? null,
+        height: f.getBoundingClientRect().height,
+      };
+    });
+  const waitFooter = async (pg, state, what) => {
+    await waitUntil(
+      async () => (await footerOf(pg))?.state === state,
+      30_000,
+      `${what}: footer data-state=${state}`,
+    );
+    return footerOf(pg);
+  };
+  /** 畫面最上面（完整看得到的第一列）是哪個 commit、離捲動區頂端多遠；用來證明「畫面沒有動」。 */
+  const viewAnchor = (pg) =>
+    pg.evaluate(() => {
+      const sc = document.querySelector('.agg-scroll');
+      const top = sc.getBoundingClientRect().top;
+      const row = [...document.querySelectorAll('.agg-commit')].find(
+        (r) => r.getBoundingClientRect().top >= top - 0.5,
+      );
+      return {
+        scrollTop: sc.scrollTop,
+        sha: row?.dataset.sha ?? null,
+        offset: row ? row.getBoundingClientRect().top - top : NaN,
+      };
+    });
+  /** 記下捲動容器的每一次 scrollTop（載入期間畫面若跳了一下又跳回來，只看前後兩點會漏掉） */
+  const recordScrolls = (pg) =>
+    pg.evaluate(() => {
+      const sc = document.querySelector('.agg-scroll');
+      window.__scrollStop?.();
+      window.__scrollLog = [];
+      const on = () => window.__scrollLog.push(sc.scrollTop);
+      sc.addEventListener('scroll', on);
+      window.__scrollStop = () => sc.removeEventListener('scroll', on);
+    });
+  const recordedScrolls = (pg) =>
+    pg.evaluate(() => {
+      window.__scrollStop?.();
+      window.__scrollStop = null;
+      return window.__scrollLog;
+    });
+  const commitChip = (pg) => pg.locator('.agg-chip--commits').first().innerText();
+  const tagScrollerOf = (pg) =>
+    pg.evaluate(() => {
+      document.querySelector('.agg-scroll').__tag = 'same-element';
+    });
+  const scrollerTagOf = (pg) =>
+    pg.evaluate(() => document.querySelector('.agg-scroll')?.__tag ?? null);
+  /** 欄位對齊（看得到的欄位）：標題列與第一列的同名欄位同 left / width。 */
+  const columnsAlignOn = async (pg, label) => {
+    const m = await pg.evaluate(() => {
+      const row = document.querySelector('.agg-commit');
+      const head = document.querySelector('.agg-colhead');
+      return ['agg-c-author', 'agg-c-date', 'agg-c-sha'].flatMap((c) => {
+        const a = row.querySelector(`.${c}`).getBoundingClientRect();
+        const b = head.querySelector(`.${c}`).getBoundingClientRect();
+        if (a.width === 0 && b.width === 0) return [];
+        return [{ c, dl: Math.abs(a.left - b.left), dw: Math.abs(a.width - b.width) }];
+      });
+    });
+    assert.ok(m.length >= 1, `${label}: no visible columns`);
+    for (const x of m)
+      assert.ok(
+        x.dl <= 1 && x.dw <= 1,
+        `${label}: column ${x.c} drifts from its header (Δleft ${x.dl}, Δwidth ${x.dw})`,
+      );
+  };
+
+  let deepOrigin;
+  let deepServer;
+  await step(
+    'INFINITE SCROLL (local; its own dev server on a 705-commit repo, AGG_MAX_COMMITS=100): nothing loads until you scroll; at the bottom the footer spins and the next 300 come from the dev server (?depth=400 → 700 → 1000), appended below without moving the view, losing the selection, recreating the scroller or replaying, the graph in sync — until "the first commit lives here"; a failed batch says so with Try again and never retries by itself; a live commit afterwards keeps the loaded history',
+    async () => {
+      deepDir = makeDeepRepo();
+      const all = gitLog(deepDir).map((c) => c.sha);
+      assert.equal(all.length, 705, 'sanity: the long repo');
+      const side = await startSide('deep', { AGG_REPO_DIR: deepDir, AGG_MAX_COMMITS: '100' });
+      deepOrigin = side.origin;
+      deepServer = side.v;
+      const pg = await openPage('deep page');
+      try {
+        // 這一頁向 dev server 要更深的快照（?depth=）的請求
+        const depths = [];
+        pg.on('request', (r) => {
+          const u = new URL(r.url());
+          if (u.pathname === '/__agg/git-snapshot' && u.searchParams.has('depth'))
+            depths.push(Number(u.searchParams.get('depth')));
+        });
+        // 攔住要更深快照的請求：在「這一批一定還沒回來」的狀態下量畫面（不靠時間差）；也可以讓下一批失敗（連線中斷）
+        let hold = false;
+        let failNext = false;
+        const held = [];
+        await pg.route(
+          (u) => u.pathname === '/__agg/git-snapshot' && u.searchParams.has('depth'),
+          async (route) => {
+            if (failNext) {
+              failNext = false;
+              return route.abort('failed');
+            }
+            if (hold) await new Promise((ok) => held.push(ok));
+            await route.continue().catch(() => {});
+          },
+        );
+        const release = () => {
+          hold = false;
+          for (const ok of held.splice(0)) ok();
+        };
+
+        await pg.goto(side.origin);
+        await titleIs(dirBase(deepDir), pg);
+        await waitUntil(async () => (await rowShas(pg)).length === 100, 25_000, 'the first 100');
+        assert.deepEqual(await rowShas(pg), all.slice(0, 100), 'the newest 100, newest first');
+        assert.match(await commitChip(pg), /^100 commits$/);
+        await replayDone(pg);
+        let f = await footerOf(pg);
+        assert.equal(f.state, 'idle', 'more history exists: the footer waits for the scroll');
+        assert.equal(f.button, 'Load older history', 'a keyboard / manual fallback');
+        assert.equal(f.role, 'status');
+        await sleep(1000);
+        assert.deepEqual(depths, [], 'nothing more is loaded before scrolling down');
+        const v01 = git(deepDir, 'rev-parse', 'v0.1');
+        assert.ok(!(await rowShas(pg)).includes(v01), 'sanity: the old tag is not loaded yet');
+
+        // 選一列（詳情面板打開）；之後每一批都不能把選取弄丟、不能重播、不能換掉捲動容器
+        const picked = all[5];
+        await clickRow(picked, {}, pg);
+        await waitSelected(picked, 'deep: select a row', pg);
+        await settleScroll(pg);
+        await watchReplay(pg);
+        await tagScrollerOf(pg);
+
+        /** 觸發下一批（預設：捲到底）→ 頁尾轉圈（請求被攔住）→ 量畫面 → 放行 → 列數變成 `want`，畫面沒有動 */
+        const batch = async (want, label, trigger) => {
+          hold = true;
+          if (trigger) await trigger();
+          else await scrollTo(await scrollMax(pg), pg);
+          await waitUntil(
+            () => held.length > 0,
+            20_000,
+            `${label}: the request for the next batch`,
+          );
+          f = await footerOf(pg);
+          assert.equal(f.state, 'loading', `${label}: the footer while loading`);
+          assert.equal(f.text, 'Loading older history…', `${label}: the loading text`);
+          assert.ok(f.spinner, `${label}: a spinner`);
+          assert.deepEqual([f.role, f.live], ['status', 'polite'], `${label}: announced politely`);
+          await settleScroll(pg);
+          const before = await viewAnchor(pg);
+          await recordScrolls(pg);
+          release();
+          await waitUntil(
+            async () => (await rowShas(pg)).length === want,
+            30_000,
+            `${label}: ${want} rows`,
+          );
+          await waitUntil(
+            async () => (await footerOf(pg)).state !== 'loading',
+            10_000,
+            `${label}: loaded`,
+          );
+          await sleep(300);
+          const after = await viewAnchor(pg);
+          const jumps = (await recordedScrolls(pg)).filter(
+            (t) => Math.abs(t - before.scrollTop) > 1,
+          );
+          assert.deepEqual(jumps, [], `${label}: scrollTop never moved while the batch came in`);
+          assert.equal(after.sha, before.sha, `${label}: the commit at the top of the view`);
+          assert.ok(
+            Math.abs(after.offset - before.offset) <= 1 &&
+              Math.abs(after.scrollTop - before.scrollTop) <= 1,
+            `${label}: the view must not move (offset ${before.offset} → ${after.offset}, scrollTop ${before.scrollTop} → ${after.scrollTop})`,
+          );
+          assert.deepEqual(
+            await rowShas(pg),
+            all.slice(0, want),
+            `${label}: older commits are appended below, in git order`,
+          );
+          assert.deepEqual(await replayLog(pg), ['done'], `${label}: the scene does not replay`);
+          assert.equal(await scrollerTagOf(pg), 'same-element', `${label}: same scroller`);
+          assert.equal(await selectedSha(pg), picked, `${label}: the selection survives`);
+          assert.equal(await pg.locator('.agg-detail').count(), 1, `${label}: detail still open`);
+          assert.match(await commitChip(pg), new RegExp(`^${want} commits$`));
+        };
+
+        // ── 第 1 批：捲到底 → 100 → 400 ──
+        await batch(400, 'batch 1');
+        f = await footerOf(pg);
+        assert.equal(f.state, 'idle');
+        assert.equal(f.text, 'Loaded 300 older commits', 'the footer says what came in');
+        // 接縫（第 100 列附近）與新的一批中間：線圖跟列表對齊
+        await graphSync('deep: around the seam of batch 1', { pg });
+        await pg.screenshot({ path: resolve(artifacts, '14-deep-batch1.png') });
+        const rowH = Number(await pg.locator('.agg-canvas').getAttribute('data-row-h'));
+        await scrollTo(Math.round(250 * rowH), pg);
+        await graphSync('deep: the middle of batch 1', { pg });
+
+        // ── 第 2 批：連線失敗 → 錯誤 + 再試一次（不會自己重試）→ 再試一次 → 700 ──
+        failNext = true;
+        await scrollTo(await scrollMax(pg), pg);
+        f = await waitFooter(pg, 'error', 'a failed batch');
+        assert.equal(
+          f.text,
+          'Could not load older history · Could not load older history (the dev server did not respond).',
+        );
+        assert.equal(f.button, 'Try again');
+        assert.equal(f.role, 'status', 'the failure is announced');
+        assert.equal(f.spinner, false);
+        const tries = depths.length;
+        assert.deepEqual(depths, [400, 700], 'the failed request asked for 700');
+        await sleep(1500);
+        await scrollTo((await scrollMax(pg)) - 3000, pg);
+        await scrollTo(await scrollMax(pg), pg);
+        await sleep(1500);
+        assert.equal(depths.length, tries, 'no automatic retry (not even when scrolling again)');
+        assert.equal((await rowShas(pg)).length, 400, 'a failed batch changes nothing');
+        assert.equal((await footerOf(pg)).state, 'error', 'the error stays until Try again');
+        // Try again 用鍵盤（Enter）：按鈕在載入中消失，焦點回到列表（不會掉到 body）
+        const retry = pg.locator('.agg-footer').getByRole('button', { name: 'Try again' });
+        await batch(700, 'batch 2 (Try again)', async () => {
+          await retry.focus();
+          await pg.keyboard.press('Enter');
+        });
+        await waitUntil(
+          () =>
+            pg.evaluate(() => document.activeElement?.classList.contains('agg-scroll') ?? false),
+          5000,
+          'keyboard focus back on the list after Try again',
+        );
+        await graphSync('deep: around the seam of batch 2', { pg });
+
+        // ── 第 3 批：剩下的 5 個 → 歷史的起點 ──
+        await batch(705, 'batch 3');
+        f = await footerOf(pg);
+        assert.equal(f.state, 'end');
+        assert.equal(f.text, 'the first commit lives here', 'the root commit is loaded');
+        assert.equal(f.button, null, 'nothing left to load');
+        assert.equal(f.spinner, false);
+        assert.deepEqual(await rowShas(pg), all, 'every commit, in git order');
+        const oldTag = (await domRows(pg)).find((r) => r.sha === v01);
+        assert.ok(
+          oldTag?.refs.some((r) => r.name === 'v0.1' && /agg-ref--tag/.test(r.cls)),
+          'the old tag shows up once its commit is loaded',
+        );
+        assert.deepEqual(depths, [400, 700, 700, 1000], 'one request per batch (+ the retry)');
+        await sleep(1500);
+        assert.equal(depths.length, 4, 'no more requests at the start of history');
+        await scrollTo(await scrollMax(pg), pg);
+        await graphSync('deep: the very first commit', { pg });
+        await pg.screenshot({ path: resolve(artifacts, '14-deep-end.png') });
+
+        // ── 載完之後來一個新 commit：即時更新帶著同樣的深度（不會縮回第一批的 100 個）──
+        commit(deepDir, 'feat: live after paging');
+        const fresh = git(deepDir, 'rev-parse', 'HEAD');
+        await waitUntil(
+          async () => (await rowShas(pg))[0] === fresh,
+          20_000,
+          'the live commit on top',
+        );
+        assert.equal((await rowShas(pg)).length, 706, 'the loaded history is kept');
+        assert.equal((await footerOf(pg)).state, 'end');
+        assert.equal(await selectedSha(pg), picked, 'the selection survives the live update');
+      } finally {
+        await pg.close();
+      }
+    },
+  );
+
+  await step(
+    'DETAIL SIZE: a toggle next to prev / next / close widens the docked panel to clamp(380px, 50%, 720px) and back (aria-pressed, label, title); the list and graph re-lay out (no horizontal overflow, aligned columns, selected row visible, no replay); Esc still closes the panel in one step; the choice is remembered across reloads; medium widens the drawer, the narrow bottom sheet has no toggle',
+    async () => {
+      const pg = await openPage('detail size page');
+      try {
+        await pg.goto(deepOrigin);
+        await titleIs(dirBase(deepDir), pg);
+        await pg.locator('.agg-commit').first().waitFor();
+        await replayDone(pg);
+        const shas = await rowShas(pg);
+        const panel = () =>
+          pg.evaluate(() => {
+            const root = document.querySelector('.agg-root');
+            const d = document.querySelector('.agg-detail');
+            const b = d?.querySelector('.agg-detail-size');
+            const r = d?.getBoundingClientRect();
+            const m = document.querySelector('.agg-main').getBoundingClientRect();
+            return {
+              size: root.dataset.size,
+              detailSize: root.dataset.detailSize,
+              cssW: root.style.getPropertyValue('--agg-detail-w'),
+              rootW: root.getBoundingClientRect().width,
+              open: Boolean(d),
+              position: d ? getComputedStyle(d).position : null,
+              left: r?.left ?? NaN,
+              right: r?.right ?? NaN,
+              width: r?.width ?? NaN,
+              mainRight: m.right,
+              nav: d
+                ? [...d.querySelectorAll('.agg-detail-nav button')].map((x) =>
+                    x.getAttribute('aria-label'),
+                  )
+                : [],
+              button: b
+                ? {
+                    pressed: b.getAttribute('aria-pressed'),
+                    label: b.getAttribute('aria-label'),
+                    title: b.title,
+                  }
+                : null,
+              stored: localStorage.getItem('agg.detail-size'),
+            };
+          });
+        const wideW = (rootW) => Math.round(Math.min(720, Math.max(380, rootW * 0.5)));
+        const toggle = () => pg.locator('.agg-detail .agg-detail-size');
+        const sizeTo = async (w, h, size) => {
+          await pg.setViewportSize({ width: w, height: h });
+          await pg.locator(`.agg-root[data-size="${size}"]`).waitFor();
+          await settleScroll(pg);
+        };
+        const select = async (sha) => {
+          await clickRow(sha, {}, pg);
+          await waitSelected(sha, 'detail size: select', pg);
+          await pg.locator('.agg-detail').waitFor();
+          await sleep(250);
+        };
+
+        // ── wide（1440）：預設 normal = 380px，按鈕在 上一個 / 下一個 與 關閉 之間 ──
+        await select(shas[4]);
+        let s = await panel();
+        assert.deepEqual(s.nav, [
+          'Previous (newer)',
+          'Next (older)',
+          'Widen the details panel',
+          'Close details',
+        ]);
+        assert.deepEqual(s.button, {
+          pressed: 'false',
+          label: 'Widen the details panel',
+          title: 'Widen the details panel',
+        });
+        assert.equal(s.size, 'wide');
+        assert.equal(s.detailSize, 'normal');
+        assert.equal(s.cssW, '380px');
+        assert.ok(Math.abs(s.width - 380) <= 1, `normal docked width ${s.width}`);
+        assert.ok(s.mainRight <= s.left + 0.5, 'list and panel side by side');
+        assert.equal(s.stored, null, 'nothing stored until the user picks a size');
+        assert.deepEqual(await noOverflow(pg), []);
+        const normalList = (await rectOf('.agg-main', pg)).width;
+
+        // ── 加寬：clamp(380, 50%, 720)；列表與線圖重新排版，不重播 ──
+        await watchReplay(pg);
+        await toggle().click();
+        await waitUntil(
+          async () => (await panel()).detailSize === 'wide',
+          5000,
+          'data-detail-size=wide',
+        );
+        await sleep(300);
+        s = await panel();
+        const want = wideW(s.rootW);
+        assert.ok(want > 380, `sanity: the wide width (${want}) is wider at 1440px`);
+        assert.deepEqual(s.button, {
+          pressed: 'true',
+          label: 'Restore the details panel width',
+          title: 'Restore the details panel width',
+        });
+        assert.equal(s.cssW, `${want}px`, '--agg-detail-w');
+        assert.ok(Math.abs(s.width - want) <= 1, `wide docked width ${s.width} ≠ ${want}`);
+        assert.ok(s.mainRight <= s.left + 0.5, 'still side by side, no overlap');
+        assert.ok(
+          (await rectOf('.agg-main', pg)).width < normalList - (want - 380) + 2,
+          'the list gave the room to the panel',
+        );
+        assert.equal(s.stored, 'wide', 'remembered in this browser');
+        assert.deepEqual(await noOverflow(pg), [], 'wide panel: no horizontal overflow');
+        await columnsAlignOn(pg, 'wide panel');
+        await waitRowVisible(shas[4], 'the selected row next to the wide panel', pg);
+        await graphSync('wide detail panel', { pg });
+        assert.deepEqual(await replayLog(pg), ['done'], 'resizing the panel does not replay');
+        await pg.screenshot({ path: resolve(artifacts, '15-detail-wide.png') });
+
+        // Esc 一次就關掉面板（焦點在剛按的按鈕上）
+        assert.equal(
+          await pg.evaluate(() => document.activeElement?.classList.contains('agg-detail-size')),
+          true,
+        );
+        await pg.keyboard.press('Escape');
+        await waitUntil(async () => (await selectedSha(pg)) === null, 5000, 'Esc closes the panel');
+        assert.equal(await pg.locator('.agg-detail').count(), 0);
+        assert.deepEqual(await noOverflow(pg), []);
+
+        // ── 重新載入：還是 wide ──
+        await pg.reload();
+        await titleIs(dirBase(deepDir), pg);
+        await pg.locator('.agg-commit').first().waitFor();
+        await select(shas[2]);
+        s = await panel();
+        assert.equal(s.detailSize, 'wide', 'the size survives a reload');
+        assert.equal(s.button.pressed, 'true');
+        assert.ok(Math.abs(s.width - wideW(s.rootW)) <= 1, `wide after reload (${s.width})`);
+        assert.deepEqual(await noOverflow(pg), []);
+
+        // ── medium（820）：浮動抽屜跟著變寬，列表版面不變 ──
+        await sizeTo(820, 900, 'medium');
+        s = await panel();
+        assert.equal(s.position, 'absolute', 'medium: a drawer');
+        assert.ok(s.button, 'medium: the toggle is there (it widens the drawer)');
+        assert.ok(s.width > 400.5, `medium + wide: a wider drawer (${s.width})`);
+        assert.ok(s.left >= 0 && s.right <= 820 + 0.5, `drawer on screen ${s.left}–${s.right}`);
+        assert.deepEqual(await noOverflow(pg), []);
+        const listMid = (await rectOf('.agg-main', pg)).width;
+        await toggle().click();
+        await waitUntil(async () => (await panel()).detailSize === 'normal', 5000, 'medium normal');
+        await sleep(200);
+        s = await panel();
+        assert.ok(s.width <= 400.5, `medium + normal: the usual drawer (${s.width})`);
+        assert.equal(s.button.pressed, 'false');
+        assert.equal(
+          (await rectOf('.agg-main', pg)).width,
+          listMid,
+          'the drawer floats: the list keeps its layout',
+        );
+        await toggle().click();
+        await waitUntil(async () => (await panel()).detailSize === 'wide', 5000, 'medium wide');
+        await graphSync('medium + wide drawer', { pg, minRows: 4 });
+
+        // ── narrow（390）：底部面板本來就是全寬，沒有切換按鈕 ──
+        await sizeTo(390, 844, 'narrow');
+        s = await panel();
+        assert.equal(s.button, null, 'narrow: no size toggle on the bottom sheet');
+        assert.deepEqual(s.nav, ['Previous (newer)', 'Next (older)', 'Close details']);
+        assert.ok(s.left >= 0 && s.right <= 390.5, `the sheet fits (${s.left}–${s.right})`);
+        assert.deepEqual(await noOverflow(pg), [], 'narrow + wide setting: no overflow');
+        await pg.screenshot({ path: resolve(artifacts, '15-detail-narrow.png') });
+
+        // ── 回到 wide：還原成 normal（也記住）──
+        await sizeTo(1440, 900, 'wide');
+        s = await panel();
+        assert.equal(s.detailSize, 'wide');
+        await toggle().click();
+        await waitUntil(
+          async () => (await panel()).detailSize === 'normal',
+          5000,
+          'back to normal',
+        );
+        await sleep(300);
+        s = await panel();
+        assert.ok(Math.abs(s.width - 380) <= 1, `normal again (${s.width})`);
+        assert.equal(s.cssW, '380px');
+        assert.equal(s.stored, 'normal');
+        assert.deepEqual(await noOverflow(pg), []);
+        await columnsAlignOn(pg, 'normal panel again');
+        await graphSync('normal detail panel again', { pg });
+      } finally {
+        await pg.close();
+      }
+      await stopSide(deepServer);
+    },
+  );
+
+  await step(
+    'INFINITE SCROLL (GitHub source, mock API): demo/long-history shows one page per branch; scrolling to the bottom fetches /commits?sha=<missing parent> and appends the older commits without moving the view or replaying, the graph in sync; a failed request says so with Try again (no automatic retry); it ends at the first commit with every commit newest first and the old tag on its commit',
+    async () => {
+      // 與 graph-core 相同的取法：每條 branch 從 tip 往回一頁（60 筆，時間倒序）；缺的 parent 再往回抓一頁
+      const byId = new Map(
+        LONG.specs.map(([id, parents, , , hours]) => [id, { id, parents, hours }]),
+      );
+      const back = (id) => {
+        const seenIds = new Set();
+        const stack = [id];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (seenIds.has(cur)) continue;
+          seenIds.add(cur);
+          stack.push(...byId.get(cur).parents);
+        }
+        return [...seenIds].sort((a, b) => byId.get(b).hours - byId.get(a).hours);
+      };
+      const first = new Set(Object.values(LONG.heads).flatMap((h) => back(h).slice(0, 60)));
+      const missing = (have) => [
+        ...new Set([...have].flatMap((id) => byId.get(id).parents).filter((p) => !have.has(p))),
+      ];
+      assert.deepEqual(missing(first), ['L88'], 'sanity: the first batch stops at L88');
+      const second = new Set([...first, ...back('L88').slice(0, 60)]);
+      assert.deepEqual(missing(second), ['L31'], 'sanity: the second batch stops at L31');
+      const shaToId = new Map(LONG.specs.map(([id]) => [mockSha(id), id]));
+      const moreCalls = () =>
+        seen.paths.filter((p) => /^\/repos\/demo\/long-history\/commits\?sha=[0-9a-f]{40}/.test(p));
+      const idsOnScreen = async (pg) => (await rowShas(pg)).map((s) => shaToId.get(s));
+      const newestFirst = async (pg) => {
+        const t = (await domRows(pg)).map((r) => Date.parse(r.datetime));
+        return t.every((x, i) => i === 0 || t[i - 1] >= x);
+      };
+
+      const pg = await openPage('GitHub paging page');
+      try {
+        await pg.goto(`${base}/?repo=demo/long-history`);
+        await titleIs('demo/long-history', pg);
+        await waitUntil(
+          async () => (await rowShas(pg)).length === first.size,
+          25_000,
+          `the first batch (${first.size})`,
+        );
+        assert.ok(sameSet(await idsOnScreen(pg), [...first]), 'one page per branch');
+        assert.ok(await newestFirst(pg), 'newest first');
+        await replayDone(pg);
+        let f = await footerOf(pg);
+        assert.equal(f.state, 'idle', 'GitHub: older history exists');
+        await sleep(800);
+        assert.deepEqual(moreCalls(), [], 'nothing more is fetched before scrolling');
+        await watchReplay(pg);
+        await tagScrollerOf(pg);
+
+        // ── 第 1 批：mock 先攔住 sha= 的請求（這一批一定還沒回來時量畫面）──
+        gate.hold = true;
+        await scrollTo(await scrollMax(pg), pg);
+        await waitUntil(() => gate.queue.length > 0, 20_000, 'the request from the missing parent');
+        f = await footerOf(pg);
+        assert.equal(f.state, 'loading');
+        assert.equal(f.text, 'Loading older history…');
+        await settleScroll(pg);
+        const before = await viewAnchor(pg);
+        await recordScrolls(pg);
+        releaseHeld();
+        await waitUntil(
+          async () => (await rowShas(pg)).length === second.size,
+          30_000,
+          `the second batch (${second.size})`,
+        );
+        await waitUntil(async () => (await footerOf(pg)).state === 'idle', 10_000, 'idle again');
+        await sleep(300);
+        const after = await viewAnchor(pg);
+        const jumps = (await recordedScrolls(pg)).filter((t) => Math.abs(t - before.scrollTop) > 1);
+        assert.deepEqual(jumps, [], 'GitHub: scrollTop never moved while the batch came in');
+        assert.equal(after.sha, before.sha, 'GitHub: the commit at the top of the view');
+        assert.ok(
+          Math.abs(after.offset - before.offset) <= 1 &&
+            Math.abs(after.scrollTop - before.scrollTop) <= 1,
+          `GitHub: the view must not move (${JSON.stringify({ before, after })})`,
+        );
+        assert.deepEqual(
+          moreCalls(),
+          [`/repos/demo/long-history/commits?sha=${mockSha('L88')}&per_page=60`],
+          'one page back from the only missing parent',
+        );
+        assert.ok(sameSet(await idsOnScreen(pg), [...second]));
+        assert.ok(await newestFirst(pg), 'still newest first');
+        assert.deepEqual(await replayLog(pg), ['done'], 'GitHub: no replay');
+        assert.equal(await scrollerTagOf(pg), 'same-element');
+        await graphSync('GitHub: around the seam', { pg });
+
+        // ── 第 2 批：502 → 錯誤 + 再試一次（不會自己重試）→ 再試一次 → 全部 ──
+        faults.more = 1;
+        await scrollTo(await scrollMax(pg), pg);
+        f = await waitFooter(pg, 'error', 'GitHub: a failed batch');
+        assert.equal(f.text, 'Could not load older history · Unknown error.');
+        assert.equal(f.button, 'Try again');
+        const calls = moreCalls().length;
+        await sleep(1500);
+        await scrollTo((await scrollMax(pg)) - 1500, pg);
+        await scrollTo(await scrollMax(pg), pg);
+        await sleep(1500);
+        assert.equal(moreCalls().length, calls, 'GitHub: no automatic retry');
+        assert.equal((await rowShas(pg)).length, second.size, 'a failed batch changes nothing');
+        await pg.locator('.agg-footer').getByRole('button', { name: 'Try again' }).click();
+        await waitFooter(pg, 'end', 'GitHub: the start of history');
+        f = await footerOf(pg);
+        assert.equal(f.text, 'the first commit lives here');
+        assert.equal(f.button, null);
+        assert.equal((await rowShas(pg)).length, LONG.total, 'every commit of demo/long-history');
+        assert.ok(
+          sameSet(
+            await idsOnScreen(pg),
+            LONG.specs.map(([id]) => id),
+          ),
+        );
+        assert.ok(await newestFirst(pg), 'newest first to the end');
+        assert.deepEqual(
+          moreCalls().slice(-2),
+          Array(2).fill(`/repos/demo/long-history/commits?sha=${mockSha('L31')}&per_page=60`),
+          'the failed request and Try again both start from L31',
+        );
+        const l40 = (await domRows(pg)).find((r) => r.sha === mockSha('L40'));
+        assert.ok(
+          l40?.refs.some((r) => r.name === 'v1.0' && /agg-ref--tag/.test(r.cls)),
+          'tag v1.0 appears on its (old) commit',
+        );
+        assert.deepEqual(await replayLog(pg), ['done'], 'GitHub: no replay after Try again');
+        const total = moreCalls().length;
+        await sleep(1500);
+        assert.equal(moreCalls().length, total, 'nothing more to fetch');
+        await scrollTo(await scrollMax(pg), pg);
+        await graphSync('GitHub: the first commit', { pg });
+      } finally {
+        gate.hold = false;
+        faults.more = 0;
+        releaseHeld();
+        await pg.close();
+      }
+    },
+  );
+
+  // ═════════════════════════ git 動作（本機 repo、dev server） ═════════════════════════
+  // 專用的 dev server 與一組暫時 repo（makeGitFixture）：work 是 origin.git 的 clone，mate 是另一個 clone（隊友）。
+  // 每個動作都從畫面上操作，結果以 git 本身為準（rev-parse / for-each-ref / stash list / worktree list）。
+
+  const BAR_NOTICE = '.web-git-notice--bar';
+  const DIALOG_NOTICE = '.web-git-dialog .web-git-notice';
+  const gitBtn = (pg, a) => pg.locator(`.web-git-btn[data-action="${a}"]`);
+  /** 動作列：branch、↑↓、變更數、給螢幕報讀器的完整說明，以及每個按鈕的狀態（不能用的原因 = aria-describedby 的文字）。 */
+  const barOf = (pg) =>
+    pg.evaluate(() => {
+      const bar = document.querySelector('.web-git');
+      if (!bar) return null;
+      const btns = {};
+      for (const b of bar.querySelectorAll('.web-git-btn')) {
+        const why = b.getAttribute('aria-describedby');
+        btns[b.dataset.action] = {
+          label: b.getAttribute('aria-label'),
+          disabled: b.getAttribute('aria-disabled') === 'true',
+          busy: b.getAttribute('aria-busy') === 'true',
+          title: b.title,
+          why: why ? (document.getElementById(why)?.textContent ?? null) : null,
+          badge: b.querySelector('.web-git-badge')?.textContent ?? null,
+        };
+      }
+      return {
+        order: [...bar.querySelectorAll('.web-git-btn')].map((b) => b.dataset.action),
+        branch: bar.querySelector('.web-git-branch')?.textContent ?? null,
+        sync: bar.querySelector('.web-git-sync')?.textContent ?? '',
+        dirty: bar.querySelector('.web-git-dirty')?.textContent ?? '',
+        op: bar.querySelector('.web-git-op')?.textContent ?? null,
+        sr: bar.querySelector('.web-git-status .web-sr')?.textContent ?? '',
+        btns,
+      };
+    });
+  const waitBar = async (pg, pred, what) => {
+    await waitUntil(
+      async () => {
+        const b = await barOf(pg);
+        return Boolean(b && pred(b));
+      },
+      20_000,
+      what,
+    ).catch(() => {});
+    const b = await barOf(pg);
+    assert.ok(b && pred(b), `${what}: ${JSON.stringify(b)}`);
+    return b;
+  };
+  /** 使用者回到瀏覽器視窗（focus）：畫面重新讀 git 狀態（在編輯器 / 終端機改了東西之後） */
+  const backToWindow = (pg) => pg.evaluate(() => window.dispatchEvent(new Event('focus')));
+  const noticeOf = (pg, sel) =>
+    pg.evaluate((s) => {
+      const n = document.querySelector(s);
+      if (!n) return null;
+      return {
+        tone: n.dataset.tone ?? null,
+        progress: n.hasAttribute('data-progress'),
+        status: n.querySelector('[role="status"]')?.textContent ?? '',
+        alert: n.querySelector('[role="alert"]')?.textContent ?? '',
+        output: n.querySelector('.web-git-output pre')?.textContent ?? '',
+      };
+    }, sel);
+  /**
+   * 等動作的結果（不是進度）：語氣與文字都要對；逾時就以實際的訊息判定失敗。
+   * 成功 / 沒事可做唸在 role=status（polite），失敗唸在 role=alert；另一個 live region 是空的。
+   */
+  const expectNotice = async (pg, sel, tone, text, what) => {
+    const said = (n) => (tone === 'error' ? n.alert : n.status);
+    const matches = (n) => Boolean(n && !n.progress && n.tone === tone && said(n) === text);
+    await waitUntil(async () => matches(await noticeOf(pg, sel)), 30_000, what).catch(() => {});
+    const n = await noticeOf(pg, sel);
+    assert.ok(matches(n), `${what}: expected ${tone} “${text}”, got ${JSON.stringify(n)}`);
+    assert.equal(tone === 'error' ? n.status : n.alert, '', `${what}: only one live region speaks`);
+    return n;
+  };
+  /** 這一頁送出的 git 動作（POST /__agg/git 的 body） */
+  const recordActions = (pg) => {
+    const list = [];
+    pg.on('request', (r) => {
+      if (r.method() !== 'POST' || new URL(r.url()).pathname !== '/__agg/git') return;
+      try {
+        list.push(JSON.parse(r.postData() ?? 'null'));
+      } catch {
+        list.push({ unparsable: r.postData() }); // 安全性步驟故意送的壞 body
+      }
+    });
+    return list;
+  };
+  const dialogNamed = (pg, name) => pg.getByRole('dialog', { name, exact: true });
+  const headOf = (dir) => git(dir, 'rev-parse', 'HEAD');
+  const writeIn = (dir, file, text) => writeFileSync(resolve(dir, file), text);
+  const commitFile = (dir, file, text, msg, author = 'Amy') => {
+    writeIn(dir, file, text);
+    git(dir, 'add', file);
+    commit(dir, msg, author);
+    return headOf(dir);
+  };
+  const activeText = (pg) => pg.evaluate(() => document.activeElement?.textContent ?? null);
+  const stashCount = () => gitWork('stash', 'list').split('\n').filter(Boolean).length;
+  // dev server 執行的 git（stash、tag -a、push）不能受開發者自己的 ~/.gitconfig 影響（簽章、hooksPath、alias…）
+  const hermeticGit = {
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    ...identity('Amy'),
+  };
+
+  let gitSide;
+  let gpg;
+  let gitActions;
+  const gitWork = (...args) => git(gfx.work, ...args);
+
+  await step(
+    'GIT ACTIONS (its own dev server on a clone of a local bare remote, plus a teammate’s clone): a bar in the source row shows the branch, ↑ahead ↓behind its upstream and the change count (the status endpoint = git); Fetch / Pull / Push / Stash / Tag / Worktree are labelled buttons and the unavailable ones say why; on phones they become icons without overflowing',
+    async () => {
+      gfx = makeGitFixture();
+      gitSide = await startSide('git', {
+        AGG_REPO_DIR: gfx.work,
+        AGG_REPO_ROOTS: gfx.roots,
+        ...hermeticGit,
+      });
+      gpg = await openPage('git page');
+      gitActions = recordActions(gpg);
+      await gpg.goto(gitSide.origin);
+      await titleIs('work', gpg);
+      await waitShowsRepo(gfx.work, 'the work clone', gpg);
+      await gpg.locator('.web-bar .web-git').waitFor();
+
+      const head = headOf(gfx.work);
+      const status = await gpg.evaluate(async () => {
+        const res = await fetch('/__agg/status?repo=default', { cache: 'no-store' });
+        return { code: res.status, body: await res.json() };
+      });
+      assert.equal(status.code, 200);
+      assert.deepEqual(status.body, {
+        branch: 'main',
+        head,
+        upstream: 'origin/main',
+        ahead: 0,
+        behind: 0,
+        changes: { staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
+        remotes: ['backup', 'origin'],
+        stashes: [],
+        worktrees: [
+          {
+            id: 'default',
+            label: repoLabelOf(gfx.work),
+            branch: 'main',
+            head,
+            current: true,
+            main: true,
+            locked: false,
+            prunable: false,
+          },
+        ],
+        operation: null,
+        bare: false,
+      });
+
+      let b = await waitBar(gpg, (x) => x.branch === 'main', 'the bar shows main');
+      assert.deepEqual(b.order, ['fetch', 'pull', 'push', 'stash', 'tag', 'worktree']);
+      assert.deepEqual(
+        Object.values(b.btns).map((x) => x.label),
+        ['Fetch', 'Pull', 'Push', 'Stash', 'Tag', 'Worktree'],
+      );
+      for (const a of ['fetch', 'pull', 'stash', 'tag', 'worktree'])
+        assert.equal(b.btns[a].disabled, false, `${a} is available`);
+      assert.deepEqual(
+        [b.btns.push.disabled, b.btns.push.title, b.btns.push.why],
+        [true, 'Nothing to push', 'Nothing to push'],
+        'in sync with the upstream: Push says why it is unavailable',
+      );
+      assert.deepEqual([b.sync, b.dirty, b.op], ['', '', null]);
+      assert.equal(b.sr, '0 ahead of and 0 behind origin/main; No uncommitted changes');
+      await gitBtn(gpg, 'push').click({ force: true }); // aria-disabled：Playwright 預設不點
+      await sleep(400);
+      assert.equal(
+        await gpg.locator('.web-git-dialog').count(),
+        0,
+        'a disabled button does nothing',
+      );
+
+      // 在編輯器改檔案（staged / unstaged / untracked 各一）→ 回到瀏覽器時重新讀狀態
+      writeIn(gfx.work, 'notes.txt', 'edited in an editor\n');
+      writeIn(gfx.work, 'staged.txt', 'staged\n');
+      gitWork('add', 'staged.txt');
+      writeIn(gfx.work, 'scratch.txt', 'untracked\n');
+      await backToWindow(gpg);
+      b = await waitBar(gpg, (x) => x.dirty === '●3', 'three changed files');
+      assert.equal(
+        b.sr,
+        '0 ahead of and 0 behind origin/main; 3 changed files (1 staged, 1 unstaged, 1 untracked)',
+      );
+      gitWork('reset', '-q', '--hard');
+      rmSync(resolve(gfx.work, 'scratch.txt'));
+      await backToWindow(gpg);
+      await waitBar(gpg, (x) => x.dirty === '', 'clean again');
+      await gpg.screenshot({ path: resolve(artifacts, '16-git-bar-1440.png') });
+
+      // 手機寬度：按鈕只留圖示（名稱在 aria-label / title），不會橫向溢位
+      for (const [w, h] of [
+        [390, 844],
+        [320, 640],
+      ]) {
+        await gpg.setViewportSize({ width: w, height: h });
+        await gpg.locator('.agg-root[data-size="narrow"]').waitFor();
+        await sleep(300);
+        const lay = await gpg.evaluate(() =>
+          [...document.querySelectorAll('.web-git-btn, .web-git-status')].map((el) => {
+            const r = el.getBoundingClientRect();
+            const label = el.querySelector('.web-git-label');
+            return {
+              what: el.dataset.action ?? 'status',
+              left: r.left,
+              right: r.right,
+              w: r.width,
+              h: r.height,
+              label: label ? getComputedStyle(label).display !== 'none' : null,
+            };
+          }),
+        );
+        for (const x of lay) {
+          assert.ok(
+            x.left >= -0.5 && x.right <= w + 0.5,
+            `${w}px: ${x.what} spans ${x.left}–${x.right}`,
+          );
+          if (x.what === 'status') continue;
+          assert.equal(x.label, false, `${w}px: ${x.what} is icon-only`);
+          assert.ok(x.w >= 24 && x.h >= 24, `${w}px: ${x.what} is still a target (${x.w}×${x.h})`);
+        }
+        assert.deepEqual(await noOverflow(gpg), [], `${w}px with the git bar`);
+        await gpg.screenshot({ path: resolve(artifacts, `16-git-bar-${w}.png`) });
+      }
+      await gpg.setViewportSize({ width: 1440, height: 900 });
+      await gpg.locator('.agg-root[data-size="wide"]').waitFor();
+      assert.ok(await gitBtn(gpg, 'fetch').locator('.web-git-label').isVisible(), 'wide: labels');
+      assert.deepEqual(gitActions, [], 'looking around sends no git action');
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: Fetch brings in what the teammate pushed (the button spins and the others wait meanwhile; ↓2 on the bar, origin/main on the graph, the branch untouched); Pull fast-forwards to it without a merge commit; doing either again says there is nothing new',
+    async () => {
+      const mine = headOf(gfx.work);
+      commitFile(gfx.mate, 'mate.txt', 'one\n', 'feat: teammate one', 'Ben');
+      const theirs = commitFile(gfx.mate, 'mate.txt', 'two\n', 'fix: teammate two', 'Ben');
+      git(gfx.mate, 'push', '-q', 'origin', 'main');
+      assert.ok(!(await rowShas(gpg)).includes(theirs), 'nothing is known before fetching');
+
+      // 先攔住請求：看得到執行中的樣子（按鈕轉圈、其他按鈕說「另一個動作正在執行」、狀態列「正在 fetch…」）
+      let letGo;
+      const gateOpen = new Promise((ok) => (letGo = ok));
+      const held = [];
+      const isGitPost = (u) => u.pathname === '/__agg/git';
+      const holdGit = async (route) => {
+        held.push(route);
+        await gateOpen;
+        await route.continue().catch(() => {});
+      };
+      await gpg.route(isGitPost, holdGit);
+      await gitBtn(gpg, 'fetch').click();
+      await waitUntil(() => held.length > 0, 10_000, 'the fetch request');
+      const busy = await waitBar(gpg, (x) => x.btns.fetch.busy, 'Fetch is running');
+      assert.equal(busy.btns.fetch.title, 'Fetching…');
+      for (const a of ['pull', 'stash', 'tag', 'worktree'])
+        assert.deepEqual(
+          [busy.btns[a].disabled, busy.btns[a].why],
+          [true, 'Another git action is running'],
+          `${a} waits for the fetch`,
+        );
+      const progress = await noticeOf(gpg, BAR_NOTICE);
+      assert.deepEqual(
+        [progress.tone, progress.progress, progress.status],
+        ['info', true, 'Fetching…'],
+        'the bar status line says what is running',
+      );
+      letGo();
+      await gpg.unroute(isGitPost, holdGit);
+      await expectNotice(gpg, BAR_NOTICE, 'ok', 'Fetched new commits from every remote.', 'fetch');
+      assert.equal(gitWork('rev-parse', 'origin/main'), theirs, 'origin/main moved');
+      assert.equal(headOf(gfx.work), mine, 'fetch leaves the branch alone');
+      let b = await waitBar(
+        gpg,
+        (x) => x.sync === '↓2' && x.btns.pull.badge === '↓2' && !x.btns.fetch.busy,
+        'behind 2 after the fetch',
+      );
+      assert.equal(b.sr, '0 ahead of and 2 behind origin/main; No uncommitted changes');
+      await waitUntil(
+        async () => (await rowShas(gpg))[0] === theirs,
+        20_000,
+        'the fetched commits on top of the graph',
+      );
+      const top = (await domRows(gpg))[0];
+      assert.ok(
+        top.refs.some((r) => r.name === 'origin/main' && /agg-ref--remote/.test(r.cls)),
+        `origin/main on the newest row: ${JSON.stringify(top.refs)}`,
+      );
+
+      await gitBtn(gpg, 'fetch').click();
+      await expectNotice(gpg, BAR_NOTICE, 'info', 'No new commits.', 'fetch again');
+
+      await gitBtn(gpg, 'pull').click();
+      await expectNotice(
+        gpg,
+        BAR_NOTICE,
+        'ok',
+        'Fast-forwarded to the latest commit of the upstream.',
+        'pull',
+      );
+      assert.equal(headOf(gfx.work), theirs, 'main is at the teammate’s commit');
+      assert.equal(gitWork('rev-list', '--merges', '--count', 'HEAD'), '0', 'no merge commit');
+      await waitBar(gpg, (x) => x.sync === '' && x.btns.pull.badge === null, 'in sync again');
+      await waitUntil(
+        async () => {
+          const r = (await domRows(gpg))[0];
+          return r.sha === theirs && r.refs.some((x) => /agg-ref--current/.test(x.cls));
+        },
+        20_000,
+        'HEAD ➜ main moved to the newest row',
+      );
+      await gitBtn(gpg, 'pull').click();
+      await expectNotice(gpg, BAR_NOTICE, 'info', 'Already up to date.', 'pull again');
+      assert.deepEqual(
+        gitActions.map((a) => a.action.type),
+        ['fetch', 'fetch', 'pull', 'pull'],
+      );
+      assert.ok(gitActions.every((a) => a.repo === 'default'));
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: Push asks first (N commits of the branch → its upstream; Esc cancels, focus returns) and pushes only the current branch; a push the remote rejects (non-fast-forward) is never forced; a diverged Pull refuses to merge; after a rebase in the terminal the push goes through',
+    async () => {
+      const remoteBefore = git(gfx.origin, 'rev-parse', 'main');
+      const one = commitFile(gfx.work, 'local.txt', 'one\n', 'feat: local one');
+      let b = await waitBar(
+        gpg,
+        (x) => x.sync === '↑1' && !x.btns.push.disabled && x.btns.push.badge === '↑1',
+        'ahead 1 after a local commit',
+      );
+      assert.equal(b.sr, '1 ahead of and 0 behind origin/main; No uncommitted changes');
+      const dlg = dialogNamed(gpg, 'Push main');
+      await gitBtn(gpg, 'push').click();
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-git-lead').innerText(),
+        '1 commit of main will be pushed to origin/main.',
+      );
+      assert.match(await dlg.innerText(), /Never uses --force/);
+      assert.equal(await activeText(gpg), 'Push', 'focus starts on the Push button');
+      const sent = gitActions.length;
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+      assert.equal(gitActions.length, sent, 'Esc sends nothing');
+      assert.equal(
+        await gpg.evaluate(() => document.activeElement?.dataset.action ?? null),
+        'push',
+        'focus is back on the bar’s Push button',
+      );
+      assert.equal(git(gfx.origin, 'rev-parse', 'main'), remoteBefore, 'the remote is untouched');
+
+      await gitBtn(gpg, 'push').click();
+      await dlg.waitFor();
+      await dlg.getByRole('button', { name: 'Push', exact: true }).click();
+      await dlg.waitFor({ state: 'detached' });
+      await expectNotice(gpg, BAR_NOTICE, 'ok', 'Pushed main to origin/main.', 'push');
+      assert.equal(git(gfx.origin, 'rev-parse', 'main'), one, 'the remote has the commit');
+      b = await waitBar(gpg, (x) => x.sync === '' && x.btns.push.disabled, 'nothing left to push');
+      assert.equal(b.btns.push.why, 'Nothing to push');
+
+      // 隊友先 push 了（這邊還沒 fetch），這邊又 commit 一個 → push 被拒絕，絕不 force
+      git(gfx.mate, 'pull', '-q', '--ff-only');
+      const teammate = commitFile(gfx.mate, 'mate.txt', 'three\n', 'fix: teammate three', 'Ben');
+      git(gfx.mate, 'push', '-q', 'origin', 'main');
+      const two = commitFile(gfx.work, 'local.txt', 'two\n', 'feat: local two');
+      await waitBar(gpg, (x) => x.sync === '↑1' && !x.btns.push.disabled, 'ahead 1 (not fetched)');
+      await gitBtn(gpg, 'push').click();
+      await dlg.waitFor();
+      await dlg.getByRole('button', { name: 'Push', exact: true }).click();
+      const rejected = await expectNotice(
+        gpg,
+        BAR_NOTICE,
+        'error',
+        'The remote rejected the push because it has commits you do not have. Pull first.',
+        'a non-fast-forward push',
+      );
+      assert.match(rejected.output, /rejected/, 'git’s own output can be expanded');
+      assert.equal(git(gfx.origin, 'rev-parse', 'main'), teammate, 'never forced');
+      assert.equal(headOf(gfx.work), two);
+
+      await gitBtn(gpg, 'fetch').click();
+      await expectNotice(gpg, BAR_NOTICE, 'ok', 'Fetched new commits from every remote.', 'fetch');
+      b = await waitBar(gpg, (x) => x.sync === '↑1↓1', 'diverged: ahead 1 and behind 1');
+      assert.equal(b.sr, '1 ahead of and 1 behind origin/main; No uncommitted changes');
+      await gitBtn(gpg, 'push').click();
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-warn').first().innerText(),
+        'origin/main has 1 commit you do not have: this push will be rejected. Pull first.',
+      );
+      await dlg.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dlg.waitFor({ state: 'detached' });
+
+      // pull 只會 fast-forward：分岔時拒絕，不建立 merge commit、不留下衝突
+      await gitBtn(gpg, 'pull').click();
+      await expectNotice(
+        gpg,
+        BAR_NOTICE,
+        'error',
+        'Cannot fast-forward: this branch and its upstream have diverged. Merge or rebase in a terminal.',
+        'a diverged pull',
+      );
+      assert.equal(headOf(gfx.work), two, 'the branch stays where it was');
+      assert.equal(gitWork('rev-list', '--merges', '--count', 'HEAD'), '0', 'no merge commit');
+      assert.equal(gitWork('status', '--porcelain'), '', 'nothing half-merged');
+
+      // 在終端機 rebase 之後再 push
+      execFileSync('git', ['rebase', '-q', 'origin/main'], { cwd: gfx.work, env: stamped('Amy') });
+      const rebased = headOf(gfx.work);
+      await waitBar(gpg, (x) => x.sync === '↑1', 'ahead 1 after the rebase');
+      await gitBtn(gpg, 'push').click();
+      await dlg.waitFor();
+      await dlg.getByRole('button', { name: 'Push', exact: true }).click();
+      await expectNotice(gpg, BAR_NOTICE, 'ok', 'Pushed main to origin/main.', 'push after rebase');
+      assert.equal(git(gfx.origin, 'rev-parse', 'main'), rebased);
+      assert.equal(
+        git(gfx.origin, 'rev-parse', 'main~1'),
+        teammate,
+        'linear history on the remote',
+      );
+      assert.equal(git(gfx.backup, 'for-each-ref'), '', 'only the upstream remote was pushed to');
+      const pushes = gitActions.filter((a) => a.action.type === 'push');
+      assert.equal(pushes.length, 3);
+      for (const p of pushes) assert.deepEqual(p.action, { type: 'push', confirm: true });
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: a branch without an upstream — Pull says why it is unavailable; Push offers a remote picker (origin preselected), pushes to the chosen one and sets it as the upstream',
+    async () => {
+      gitWork('checkout', '-q', '-b', 'topic/e2e');
+      const tip = commitFile(gfx.work, 'topic.txt', 'topic\n', 'feat: topic work');
+      let b = await waitBar(gpg, (x) => x.branch === 'topic/e2e', 'the bar follows the checkout');
+      assert.deepEqual(
+        [b.btns.pull.disabled, b.btns.pull.why],
+        [true, 'This branch has no upstream'],
+      );
+      assert.equal(b.btns.push.disabled, false, 'Push is offered (it sets the upstream)');
+      assert.equal(b.sr, 'no upstream set; No uncommitted changes');
+      await gitBtn(gpg, 'push').click();
+      const dlg = dialogNamed(gpg, 'Push topic/e2e');
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-git-lead').innerText(),
+        'topic/e2e has no upstream yet. Pick a remote; after the push it becomes the upstream:',
+      );
+      const remote = dlg.getByLabel('Remote', { exact: true });
+      assert.equal(await remote.inputValue(), 'origin', 'origin is preselected');
+      assert.deepEqual(await remote.locator('option').allInnerTexts(), ['backup', 'origin']);
+      await dlg.getByText('Pushed as origin/topic/e2e', { exact: true }).waitFor();
+      await remote.selectOption('backup');
+      await dlg.getByText('Pushed as backup/topic/e2e', { exact: true }).waitFor();
+      await dlg.getByRole('button', { name: 'Push and set upstream', exact: true }).click();
+      await expectNotice(
+        gpg,
+        BAR_NOTICE,
+        'ok',
+        'Pushed topic/e2e to backup/topic/e2e and set it as the upstream.',
+        'a set-upstream push',
+      );
+      assert.equal(git(gfx.backup, 'rev-parse', 'refs/heads/topic/e2e'), tip);
+      assert.equal(
+        gitWork('rev-parse', '--abbrev-ref', 'topic/e2e@{upstream}'),
+        'backup/topic/e2e',
+      );
+      assert.equal(git(gfx.origin, 'for-each-ref', 'refs/heads/topic'), '', 'origin got nothing');
+      b = await waitBar(
+        gpg,
+        (x) =>
+          x.sr === '0 ahead of and 0 behind backup/topic/e2e; No uncommitted changes' &&
+          !x.btns.pull.disabled &&
+          x.btns.push.disabled,
+        'the new upstream',
+      );
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'push',
+        confirm: true,
+        setUpstream: { remote: 'backup' },
+      });
+      gitWork('checkout', '-q', 'main');
+      await waitBar(gpg, (x) => x.branch === 'main', 'back on main');
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: a detached HEAD and a merge stopped by a conflict (both made in the terminal) — the bar says so ("(detached HEAD) <sha>", "⚠ Merge in progress", the conflicted file) and Pull / Push / Stash changes say why they are unavailable',
+    async () => {
+      const main = headOf(gfx.work);
+      gitWork('checkout', '-q', '--detach', 'HEAD~1');
+      const detachedAt = headOf(gfx.work);
+      await backToWindow(gpg);
+      let b = await waitBar(gpg, (x) => x.branch !== 'main', 'the bar notices the detached HEAD');
+      assert.equal(b.branch, `(detached HEAD) ${detachedAt.slice(0, 7)}`);
+      for (const a of ['pull', 'push'])
+        assert.deepEqual(
+          [b.btns[a].disabled, b.btns[a].why],
+          [true, 'HEAD is detached: check out a branch first'],
+          `${a} on a detached HEAD`,
+        );
+      assert.equal(b.btns.fetch.disabled, false, 'fetch still works');
+
+      // 兩條 branch 改同一行 → merge 停在衝突
+      gitWork('checkout', '-q', '-b', 'conflict-a', main);
+      commitFile(gfx.work, 'notes.txt', 'version a\n', 'docs: notes a');
+      gitWork('checkout', '-q', '-b', 'conflict-b', main);
+      commitFile(gfx.work, 'notes.txt', 'version b\n', 'docs: notes b');
+      assert.throws(() =>
+        execFileSync('git', ['merge', '-q', 'conflict-a'], {
+          cwd: gfx.work,
+          env: stamped('Amy'),
+          stdio: 'pipe',
+        }),
+      );
+      await backToWindow(gpg);
+      b = await waitBar(gpg, (x) => x.op !== null, 'the in-progress merge');
+      assert.equal(b.op, '⚠ Merge in progress');
+      assert.equal(b.branch, 'conflict-b');
+      assert.equal(b.dirty, '●1');
+      assert.equal(
+        b.sr,
+        'no upstream set; 1 changed file (0 staged, 0 unstaged, 0 untracked, 1 conflicted)',
+      );
+      assert.deepEqual(
+        [b.btns.pull.disabled, b.btns.pull.why],
+        [true, 'This branch has no upstream'],
+      );
+      await gitBtn(gpg, 'stash').click();
+      const dlg = dialogNamed(gpg, 'Stash');
+      await dlg.waitFor();
+      const save = dlg.getByRole('button', { name: 'Stash changes', exact: true });
+      assert.equal(await save.getAttribute('aria-disabled'), 'true', 'no stash during a merge');
+      assert.equal(
+        await save.getAttribute('title'),
+        'A merge / rebase is in progress: finish it in a terminal first',
+      );
+      await gpg.screenshot({ path: resolve(artifacts, '16-git-merge-in-progress.png') });
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+
+      // 在終端機放棄 merge、回到 main
+      gitWork('merge', '--abort');
+      gitWork('checkout', '-q', 'main');
+      gitWork('branch', '-q', '-D', 'conflict-a', 'conflict-b');
+      await backToWindow(gpg);
+      b = await waitBar(
+        gpg,
+        (x) => x.branch === 'main' && x.op === null && x.dirty === '',
+        'back on a clean main',
+      );
+      assert.equal(b.btns.pull.disabled, false);
+      assert.equal(headOf(gfx.work), main);
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: Stash — save with a message (untracked files on request) leaves a clean tree; Apply keeps the stash; Pop drops it; Drop asks a second time (focus on Keep; Esc and Keep keep it)',
+    async () => {
+      writeIn(gfx.work, 'notes.txt', 'half-done edit\n');
+      writeIn(gfx.work, 'idea.txt', 'untracked idea\n');
+      await backToWindow(gpg);
+      await waitBar(gpg, (x) => x.dirty === '●2', 'two changed files');
+      await gitBtn(gpg, 'stash').click();
+      const dlg = dialogNamed(gpg, 'Stash');
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-git-lead').innerText(),
+        '2 changed files (0 staged, 1 unstaged, 1 untracked)',
+      );
+      assert.equal(await dlg.locator('.web-git-empty').innerText(), 'No stashes.');
+      const message = dlg.getByLabel('Stash message (optional)');
+      assert.equal(
+        await gpg.evaluate(() => document.activeElement?.id ?? null),
+        await message.getAttribute('id'),
+        'focus starts in the message box',
+      );
+      await message.fill('wip: e2e stash');
+      const untracked = dlg.getByLabel('Include untracked files');
+      assert.equal(await untracked.isChecked(), false, 'untracked files are opt-in');
+      await untracked.check();
+      const save = dlg.getByRole('button', { name: 'Stash changes', exact: true });
+      await save.click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Stashed your changes.', 'stash save');
+      assert.equal(gitWork('status', '--porcelain'), '', 'a clean working tree');
+      assert.equal(gitWork('stash', 'list', '--format=%gs'), 'On main: wip: e2e stash');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'stash-save',
+        message: 'wip: e2e stash',
+        includeUntracked: true,
+      });
+      const items = dlg.locator('.web-git-li');
+      await waitUntil(async () => (await items.count()) === 1, 10_000, 'one stash listed');
+      assert.match(await items.first().innerText(), /stash@\{0\}[\s\S]*wip: e2e stash/);
+      assert.equal(await message.inputValue(), '', 'the message box is cleared');
+      await waitBar(gpg, (x) => x.dirty === '' && x.btns.stash.badge === '1', 'clean, 1 stash');
+      // 沒有變更時「Stash changes」不能用，原因寫在按鈕上
+      assert.equal(await save.getAttribute('aria-disabled'), 'true');
+      assert.equal(await save.getAttribute('title'), 'There are no changes to stash');
+
+      // Apply：變更回來，stash 還在
+      await items.first().getByRole('button', { name: 'Apply', exact: true }).click();
+      await expectNotice(
+        gpg,
+        DIALOG_NOTICE,
+        'ok',
+        'Applied stash@{0} (the stash is kept).',
+        'stash apply',
+      );
+      assert.equal(readFileSync(resolve(gfx.work, 'notes.txt'), 'utf8'), 'half-done edit\n');
+      assert.equal(readFileSync(resolve(gfx.work, 'idea.txt'), 'utf8'), 'untracked idea\n');
+      assert.equal(stashCount(), 1, 'apply keeps the stash');
+
+      // 再存一個（沒有訊息）；Pop 比較舊的那個（stash@{1}）
+      await save.click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Stashed your changes.', 'a second stash');
+      await waitUntil(async () => (await items.count()) === 2, 10_000, 'two stashes listed');
+      assert.equal(gitWork('status', '--porcelain'), '');
+      await items.nth(1).getByRole('button', { name: 'Pop', exact: true }).click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Applied and dropped stash@{1}.', 'stash pop');
+      assert.equal(readFileSync(resolve(gfx.work, 'notes.txt'), 'utf8'), 'half-done edit\n');
+      const left = gitWork('stash', 'list', '--format=%gs').split('\n');
+      assert.equal(left.length, 1, 'pop drops the stash');
+      assert.notEqual(left[0], 'On main: wip: e2e stash', 'the popped one is gone');
+      await waitUntil(async () => (await items.count()) === 1, 10_000, 'one stash left');
+
+      // Drop：列內第二次確認，焦點在 Keep；Esc / Keep 都保留
+      const confirmRow = dlg.locator('.web-git-confirm');
+      const sent = gitActions.length;
+      await items.first().getByRole('button', { name: 'Drop', exact: true }).click();
+      await confirmRow.waitFor();
+      assert.equal(
+        await confirmRow.locator('.web-git-confirm-text').innerText(),
+        'Drop stash@{0}? It cannot be recovered afterwards.',
+      );
+      assert.equal(await activeText(gpg), 'Keep', 'focus starts on Keep');
+      await gpg.keyboard.press('Escape');
+      await confirmRow.waitFor({ state: 'detached' });
+      assert.equal(await dlg.count(), 1, 'Esc closes only the confirmation');
+      await items.first().getByRole('button', { name: 'Drop', exact: true }).click();
+      await confirmRow.getByRole('button', { name: 'Keep', exact: true }).click();
+      await confirmRow.waitFor({ state: 'detached' });
+      assert.equal(gitActions.length, sent, 'Esc and Keep send nothing');
+      assert.equal(stashCount(), 1, 'still there');
+      await items.first().getByRole('button', { name: 'Drop', exact: true }).click();
+      await confirmRow.getByRole('button', { name: 'Drop', exact: true }).click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Dropped stash@{0}.', 'stash drop');
+      assert.equal(gitWork('stash', 'list'), '', 'no stashes left');
+      assert.deepEqual(gitActions.at(-1).action, { type: 'stash-drop', index: 0, confirm: true });
+      await dlg.locator('.web-git-empty').waitFor();
+      await gpg.screenshot({ path: resolve(artifacts, '16-git-stash.png') });
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+      assert.equal(
+        await gpg.evaluate(() => document.activeElement?.dataset.action ?? null),
+        'stash',
+        'focus is back on the bar’s Stash button',
+      );
+
+      gitWork('checkout', '--', 'notes.txt');
+      rmSync(resolve(gfx.work, 'idea.txt'));
+      await backToWindow(gpg);
+      await waitBar(gpg, (x) => x.dirty === '' && x.btns.stash.badge === null, 'clean again');
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: Tag… in the detail panel tags the selected commit — names are checked like git check-ref-format before anything is sent; the annotated tag appears on its row; Push sends it to the upstream remote; Delete (confirmed) removes only the local tag; Tag on the bar tags HEAD and can push it at once; Esc in a dialog leaves the detail panel open',
+    async () => {
+      const row = (await domRows(gpg))[3];
+      // 對話框顯示完整的第一行（列表把 conventional 的類型拆成標籤）
+      const target = { sha: row.sha, subject: gitWork('log', '-1', '--format=%s', row.sha) };
+      await clickRow(target.sha, {}, gpg);
+      await waitSelected(target.sha, 'tag: select a commit', gpg);
+      await gpg.locator('.agg-detail .web-detail-btn', { hasText: 'Tag…' }).click();
+      const dlg = dialogNamed(gpg, 'Create a tag');
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-git-where').innerText(),
+        `${target.sha.slice(0, 7)} · ${target.subject}`,
+      );
+      assert.equal(await dlg.locator('.web-git-empty').innerText(), 'This commit has no tags yet.');
+      const name = dlg.getByLabel('Tag name');
+      const create = dlg.getByRole('button', { name: 'Create tag', exact: true });
+      const err = dlg.locator('.web-error[role="alert"]');
+      const sent = gitActions.length;
+      for (const [bad, why] of [
+        ['bad name', 'Spaces and the characters ~ ^ : ? * [ \\ are not allowed.'],
+        ['-x', 'It cannot start with -.'],
+        [
+          'a..b',
+          'Invalid format (no .., @{ or //; it cannot start or end with / or ., or end with .lock).',
+        ],
+      ]) {
+        await name.fill(bad);
+        await create.click();
+        await waitUntil(
+          async () => (await err.count()) === 1 && (await err.innerText()) === why,
+          5000,
+          `“${bad}” is refused with “${why}”`,
+        );
+        assert.equal(await name.getAttribute('aria-invalid'), 'true');
+      }
+      assert.equal(gitActions.length, sent, 'invalid names never reach the dev server');
+      assert.equal(gitWork('tag', '-l'), '', 'no tag yet');
+
+      await name.fill('v0.9.0');
+      await waitUntil(async () => (await err.count()) === 0, 5000, 'a valid name clears the error');
+      await dlg.getByLabel('Message (optional; makes an annotated tag)').fill('e2e release');
+      await create.click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Created tag v0.9.0.', 'tag create');
+      assert.equal(gitWork('cat-file', '-t', 'v0.9.0'), 'tag', 'an annotated tag');
+      assert.equal(gitWork('rev-parse', 'v0.9.0^{commit}'), target.sha, 'on the selected commit');
+      assert.equal(gitWork('tag', '-l', '--format=%(contents:subject)', 'v0.9.0'), 'e2e release');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'tag-create',
+        name: 'v0.9.0',
+        target: target.sha,
+        message: 'e2e release',
+      });
+      const rowTags = async () =>
+        ((await domRows(gpg)).find((r) => r.sha === target.sha)?.refs ?? [])
+          .filter((r) => /agg-ref--tag/.test(r.cls))
+          .map((r) => r.name);
+      await waitUntil(
+        async () => (await rowTags()).includes('v0.9.0'),
+        20_000,
+        'the tag badge on its row',
+      );
+      const item = dlg.locator('.web-git-li', { hasText: 'v0.9.0' });
+      await item.waitFor();
+
+      await item.getByRole('button', { name: 'Push', exact: true }).click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Pushed tag v0.9.0.', 'tag push');
+      assert.equal(git(gfx.origin, 'rev-parse', 'v0.9.0^{commit}'), target.sha, 'origin has it');
+      assert.deepEqual(gitActions.at(-1).action, { type: 'tag-push', name: 'v0.9.0' });
+
+      await item.getByRole('button', { name: 'Delete', exact: true }).click();
+      const confirmRow = dlg.locator('.web-git-confirm');
+      await confirmRow.waitFor();
+      assert.equal(
+        await confirmRow.locator('.web-git-confirm-text').innerText(),
+        'Delete the local tag v0.9.0? The remote tag is not touched.',
+      );
+      assert.equal(await activeText(gpg), 'Keep', 'focus starts on Keep');
+      await confirmRow.getByRole('button', { name: 'Delete', exact: true }).click();
+      await expectNotice(
+        gpg,
+        DIALOG_NOTICE,
+        'ok',
+        'Deleted the local tag v0.9.0 (the remote is untouched).',
+        'tag delete',
+      );
+      assert.equal(gitWork('tag', '-l', 'v0.9.0'), '', 'the local tag is gone');
+      assert.equal(git(gfx.origin, 'rev-parse', 'v0.9.0^{commit}'), target.sha, 'remote kept');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'tag-delete',
+        name: 'v0.9.0',
+        confirm: true,
+      });
+      await waitUntil(async () => !(await rowTags()).includes('v0.9.0'), 20_000, 'badge gone');
+      await dlg.locator('.web-git-empty').waitFor();
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+      assert.equal(
+        await selectedSha(gpg),
+        target.sha,
+        'Esc in the dialog does not reach the viewer',
+      );
+      assert.equal(await gpg.locator('.agg-detail').count(), 1, 'the detail panel stays open');
+
+      // 動作列的 Tag：在 HEAD 上，建立後馬上 push 到 origin
+      const head = headOf(gfx.work);
+      await gitBtn(gpg, 'tag').click();
+      await dlg.waitFor();
+      assert.equal(
+        await dlg.locator('.web-git-where').innerText(),
+        `HEAD · main · ${head.slice(0, 7)}`,
+      );
+      await dlg.getByLabel('Tag name').fill('v1.0.0');
+      await dlg.getByLabel('Push it to origin afterwards').check();
+      await dlg.getByRole('button', { name: 'Create tag', exact: true }).click();
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', 'Created and pushed tag v1.0.0.', 'tag + push');
+      assert.equal(gitWork('cat-file', '-t', 'v1.0.0'), 'commit', 'a lightweight tag');
+      assert.equal(gitWork('rev-parse', 'v1.0.0'), head, 'on HEAD');
+      assert.equal(git(gfx.origin, 'rev-parse', 'v1.0.0'), head, 'pushed to origin');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'tag-create',
+        name: 'v1.0.0',
+        target: head,
+        push: true,
+      });
+      await gpg.screenshot({ path: resolve(artifacts, '16-git-tag.png') });
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+      await gpg.evaluate(() => document.querySelector('.agg-root').focus({ preventScroll: true }));
+      await gpg.keyboard.press('Escape');
+      await waitUntil(async () => (await selectedSha(gpg)) === null, 5000, 'detail closed');
+    },
+  );
+
+  await step(
+    'GIT ACTIONS: Worktree — the list marks the main / viewed worktree (not removable, and says why); Add checks out a new branch in a folder next to the repo; "Open the new worktree" shows it (?local=<id>, its own bar); a worktree with untracked files is not removed (never --force), a clean one is (its branch stays)',
+    async () => {
+      await gitBtn(gpg, 'worktree').click();
+      const dlg = dialogNamed(gpg, 'Worktrees');
+      await dlg.waitFor();
+      const items = dlg.locator('.web-git-li');
+      assert.equal(await items.count(), 1);
+      assert.match(
+        await items.first().innerText(),
+        /work[\s\S]*main[\s\S]*viewing[\s\S]*main worktree/,
+      );
+      const removeMain = items.first().getByRole('button', { name: 'Remove', exact: true });
+      assert.equal(await removeMain.getAttribute('aria-disabled'), 'true');
+      assert.equal(await removeMain.getAttribute('title'), 'The main worktree cannot be removed');
+
+      assert.equal(await dlg.getByLabel('A new branch').isChecked(), true, 'new branch by default');
+      await dlg.getByLabel('New branch name').fill('wt-feature');
+      const folder = dlg.getByLabel('Folder', { exact: true });
+      assert.equal(await folder.inputValue(), 'work-wt-feature', 'a folder name from the branch');
+      await dlg.getByText('Starting at HEAD (main)', { exact: true }).waitFor();
+      await dlg.getByRole('button', { name: 'Add worktree', exact: true }).click();
+      const wtDir = resolve(gfx.top, 'work-wt-feature');
+      await waitUntil(
+        async () => {
+          const n = await noticeOf(gpg, DIALOG_NOTICE);
+          return Boolean(n?.tone && !n.progress);
+        },
+        30_000,
+        'the result of adding the worktree',
+      );
+      const wtLabel = repoLabelOf(wtDir);
+      await expectNotice(gpg, DIALOG_NOTICE, 'ok', `Added worktree ${wtLabel}`, 'worktree add');
+      assert.ok(statSync(wtDir).isDirectory(), 'a folder next to the repo');
+      assert.equal(git(wtDir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'wt-feature');
+      assert.equal(headOf(wtDir), headOf(gfx.work), 'starting at HEAD');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'worktree-add',
+        path: 'work-wt-feature',
+        newBranch: 'wt-feature',
+      });
+      await waitUntil(async () => (await items.count()) === 2, 10_000, 'two worktrees listed');
+
+      const wtId = repoIdOf(wtDir);
+      await dlg.getByRole('button', { name: 'Open the new worktree', exact: true }).click();
+      await waitSearch(`?local=${wtId}`, gpg);
+      await titleIs('work-wt-feature', gpg);
+      await dlg.waitFor({ state: 'detached' });
+      await waitShowsRepo(wtDir, 'the new worktree', gpg);
+      await waitBar(gpg, (x) => x.branch === 'wt-feature', 'the bar of the new worktree');
+
+      await gitBtn(gpg, 'worktree').click();
+      await dlg.waitFor();
+      const viewed = items.filter({ hasText: 'wt-feature' });
+      assert.match(await viewed.innerText(), /viewing/);
+      assert.equal(
+        await viewed.getByRole('button', { name: 'Remove', exact: true }).getAttribute('title'),
+        'You are viewing this worktree: open another one first',
+      );
+      writeIn(wtDir, 'leftover.txt', 'not committed\n');
+      await items
+        .filter({ hasText: 'main worktree' })
+        .getByRole('button', { name: 'Open', exact: true })
+        .click();
+      await waitSearch('', gpg);
+      await titleIs('work', gpg);
+      await waitBar(gpg, (x) => x.branch === 'main', 'back in the main worktree');
+
+      // Remove：先確認；有未追蹤的檔案 → 拒絕（不會 --force），資料夾還在
+      await gitBtn(gpg, 'worktree').click();
+      await dlg.waitFor();
+      const wt = items.filter({ hasText: 'wt-feature' });
+      const confirmRow = dlg.locator('.web-git-confirm');
+      await wt.getByRole('button', { name: 'Remove', exact: true }).click();
+      await confirmRow.waitFor();
+      assert.equal(
+        await confirmRow.locator('.web-git-confirm-text').innerText(),
+        `Remove the worktree ${wtLabel}? Its folder is deleted (git refuses if it has modified or untracked files).`,
+      );
+      await confirmRow.getByRole('button', { name: 'Remove', exact: true }).click();
+      await expectNotice(
+        gpg,
+        DIALOG_NOTICE,
+        'error',
+        'This worktree has modified or untracked files. Clean them up first (it is never removed with --force here).',
+        'removing a dirty worktree',
+      );
+      assert.equal(readFileSync(resolve(wtDir, 'leftover.txt'), 'utf8'), 'not committed\n');
+      const worktrees = () =>
+        gitWork('worktree', 'list', '--porcelain').match(/^worktree /gm).length;
+      assert.equal(worktrees(), 2, 'still two worktrees');
+      assert.deepEqual(gitActions.at(-1).action, {
+        type: 'worktree-remove',
+        id: wtId,
+        confirm: true,
+      });
+
+      rmSync(resolve(wtDir, 'leftover.txt'));
+      await wt.getByRole('button', { name: 'Remove', exact: true }).click();
+      await confirmRow.getByRole('button', { name: 'Remove', exact: true }).click();
+      await expectNotice(
+        gpg,
+        DIALOG_NOTICE,
+        'ok',
+        `Removed worktree ${wtLabel}`,
+        'worktree remove',
+      );
+      assert.throws(() => statSync(wtDir), /ENOENT/, 'the folder is gone');
+      assert.equal(worktrees(), 1);
+      assert.equal(gitWork('rev-parse', 'wt-feature'), headOf(gfx.work), 'the branch stays');
+      await waitUntil(async () => (await items.count()) === 1, 10_000, 'one worktree left');
+      await gpg.screenshot({ path: resolve(artifacts, '16-git-worktree.png') });
+      await gpg.keyboard.press('Escape');
+      await dlg.waitFor({ state: 'detached' });
+    },
+  );
+
+  await step(
+    'SECURITY (git actions): pages on other origins (another localhost port, 127.0.0.1) can neither read /__agg/status nor run /__agg/git (cors, no-cors, form POST — the server itself answers 403); same-origin requests are validated too (405, 415, 413, unknown repo / action, destructive actions without confirm, a name starting with -); a forged Host is blocked by Vite; nothing in the repo changed',
+    async () => {
+      const snapshotOfRepo = () => ({
+        refs: gitWork('for-each-ref'),
+        origin: git(gfx.origin, 'for-each-ref'),
+        backup: git(gfx.backup, 'for-each-ref'),
+        status: gitWork('status', '--porcelain'),
+        stash: gitWork('stash', 'list'),
+        worktrees: gitWork('worktree', 'list', '--porcelain'),
+      });
+      const before = snapshotOfRepo();
+      const gbase = gitSide.origin;
+      const evil = JSON.stringify({
+        repo: 'default',
+        action: { type: 'tag-create', name: 'evil', target: headOf(gfx.work) },
+      });
+      const blankPage = async (host) => {
+        const srv = createHttpServer((_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>other origin</title><body></body>');
+        });
+        await new Promise((ok) => srv.listen(0, host, ok));
+        return srv;
+      };
+      const blanks = [await blankPage('localhost'), await blankPage('127.0.0.1')];
+      try {
+        for (const url of [
+          `http://localhost:${blanks[0].address().port}/`,
+          `http://127.0.0.1:${blanks[1].address().port}/`,
+        ]) {
+          const other = await xctx.newPage();
+          const responses = [];
+          other.on('response', (r) => {
+            if (r.url().startsWith(`${gbase}/__agg/`))
+              responses.push(`${r.request().method()} ${new URL(r.url()).pathname} ${r.status()}`);
+          });
+          try {
+            await other.goto(url);
+            const out = await other.evaluate(
+              async ({ gbase, body }) => {
+                const read = async (u, init) => {
+                  try {
+                    const res = await fetch(u, init);
+                    return `readable:${res.status}`;
+                  } catch {
+                    return 'blocked';
+                  }
+                };
+                const opaque = (u, init) =>
+                  fetch(u, { ...init, mode: 'no-cors' }).then(
+                    (r) => r.type,
+                    () => 'failed',
+                  );
+                return {
+                  status: await read(`${gbase}/__agg/status?repo=default`),
+                  post: await read(`${gbase}/__agg/git`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body,
+                  }),
+                  statusNoCors: await opaque(`${gbase}/__agg/status?repo=default`),
+                  postNoCors: await opaque(`${gbase}/__agg/git`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'text/plain' },
+                    body,
+                  }),
+                };
+              },
+              { gbase, body: evil },
+            );
+            assert.deepEqual(
+              out,
+              { status: 'blocked', post: 'blocked', statusNoCors: 'opaque', postNoCors: 'opaque' },
+              `${url}: nothing readable, the JSON POST does not go through`,
+            );
+            const want = ['GET /__agg/status 403', 'POST /__agg/git 403'];
+            await waitUntil(
+              () => want.every((w) => responses.includes(w)),
+              5000,
+              `${url}: the server's answers (${responses})`,
+            );
+            assert.ok(
+              responses.every((r) => / 403$/.test(r)),
+              `${url}: all refused (${responses})`,
+            );
+            // 傳統的跨站表單（text/plain 拼出 JSON 的樣子）
+            await Promise.all([
+              other.waitForURL(`${gbase}/__agg/git`),
+              other.evaluate(
+                ({ gbase }) => {
+                  const f = document.createElement('form');
+                  f.method = 'POST';
+                  f.action = `${gbase}/__agg/git`;
+                  f.enctype = 'text/plain';
+                  const i = document.createElement('input');
+                  i.name = '{"repo":"default","action":{"type":"stash-save"},"x":"';
+                  i.value = '"}';
+                  f.append(i);
+                  document.body.append(f);
+                  f.submit();
+                },
+                { gbase },
+              ),
+            ]);
+            assert.match(await other.locator('body').innerText(), /forbidden/);
+          } finally {
+            await other.close();
+          }
+        }
+      } finally {
+        for (const srv of blanks) await new Promise((ok) => srv.close(ok));
+      }
+
+      // 同源，但請求本身不對：一律拒絕（破壞性的動作沒有 confirm: true 也不行）
+      const same = await gpg.evaluate(async (head) => {
+        const go = async (url, init) => {
+          const res = await fetch(url, init);
+          const j = await res.json().catch(() => ({}));
+          return `${res.status} ${j.code ?? j.error ?? ''}`.trim();
+        };
+        const json = { 'content-type': 'application/json' };
+        const post = (body) =>
+          go('/__agg/git', { method: 'POST', headers: json, body: JSON.stringify(body) });
+        return {
+          get: await go('/__agg/git', { method: 'GET' }),
+          statusPost: await go('/__agg/status?repo=default', { method: 'POST' }),
+          textPlain: await go('/__agg/git', {
+            method: 'POST',
+            headers: { 'content-type': 'text/plain' },
+            body: JSON.stringify({ repo: 'default', action: { type: 'fetch' } }),
+          }),
+          tooLarge: await post({
+            repo: 'default',
+            action: { type: 'stash-save', message: 'x'.repeat(9000) },
+          }),
+          notJson: await go('/__agg/git', { method: 'POST', headers: json, body: '{nope' }),
+          badRepo: await post({ repo: '../etc', action: { type: 'fetch' } }),
+          unknownRepo: await post({ repo: '0123456789ab', action: { type: 'fetch' } }),
+          unknownAction: await post({ repo: 'default', action: { type: 'reset-hard' } }),
+          pushNoConfirm: await post({ repo: 'default', action: { type: 'push' } }),
+          dropNoConfirm: await post({ repo: 'default', action: { type: 'stash-drop', index: 0 } }),
+          tagDeleteNoConfirm: await post({
+            repo: 'default',
+            action: { type: 'tag-delete', name: 'v1.0.0' },
+          }),
+          worktreeRemoveNoConfirm: await post({
+            repo: 'default',
+            action: { type: 'worktree-remove', id: 'default' },
+          }),
+          dashName: await post({
+            repo: 'default',
+            action: { type: 'tag-create', name: '-x', target: head },
+          }),
+        };
+      }, headOf(gfx.work));
+      assert.deepEqual(same, {
+        get: '405 method_not_allowed',
+        statusPost: '405 method_not_allowed',
+        textPlain: '415 unsupported_media_type',
+        tooLarge: '413 too_large',
+        notJson: '400 invalid',
+        badRepo: '400 invalid',
+        unknownRepo: '404 not_found',
+        unknownAction: '400 invalid',
+        pushNoConfirm: '400 invalid',
+        dropNoConfirm: '400 invalid',
+        tagDeleteNoConfirm: '400 invalid',
+        worktreeRemoveNoConfirm: '400 invalid',
+        dashName: '400 invalid',
+      });
+
+      // 瀏覽器以外（node http）：偽造的 Host 被 Vite 擋下；Host 對了但說是別的站 / 別的 Origin 也不行
+      const raw = (path, opts) => rawHttp('localhost', gitSide.port, path, opts);
+      const jsonHeaders = { 'content-type': 'application/json' };
+      for (const [path, opts] of [
+        ['/__agg/status?repo=default', {}],
+        ['/__agg/git', { method: 'POST', headers: jsonHeaders, body: evil }],
+      ]) {
+        const r = await raw(path, { ...opts, headers: { ...opts.headers, Host: 'evil.example' } });
+        assert.equal(r.status, 403, `forged Host → ${path}`);
+        assert.match(r.body, /Blocked request/, 'rejected by Vite’s host check');
+        assert.ok(!r.body.includes(gfx.top), 'no paths leak');
+      }
+      for (const [what, path, opts] of [
+        [
+          'status, Sec-Fetch-Site: cross-site',
+          '/__agg/status?repo=default',
+          { headers: { 'Sec-Fetch-Site': 'cross-site' } },
+        ],
+        [
+          'status, Origin of another port',
+          '/__agg/status?repo=default',
+          { headers: { Origin: 'http://localhost:1' } },
+        ],
+        [
+          'POST without Origin / fetch metadata',
+          '/__agg/git',
+          { method: 'POST', headers: jsonHeaders, body: evil },
+        ],
+        [
+          'POST with a foreign Origin',
+          '/__agg/git',
+          {
+            method: 'POST',
+            headers: { ...jsonHeaders, Origin: 'http://evil.example' },
+            body: evil,
+          },
+        ],
+        [
+          'POST, Sec-Fetch-Site: same-site',
+          '/__agg/git',
+          {
+            method: 'POST',
+            headers: { ...jsonHeaders, 'Sec-Fetch-Site': 'same-site' },
+            body: evil,
+          },
+        ],
+      ]) {
+        const r = await raw(path, opts);
+        assert.equal(r.status, 403, what);
+        assert.equal(r.json?.error, 'forbidden', what);
+      }
+      // 對照組：這台電腦上直接讀狀態（網址列 / curl）可以
+      const direct = await raw('/__agg/status?repo=default');
+      assert.equal(direct.status, 200, 'a direct GET from this machine');
+      assert.equal(direct.json.branch, 'main');
+
+      assert.deepEqual(snapshotOfRepo(), before, 'none of these requests changed anything');
+      assert.equal(gitWork('tag', '-l', 'evil'), '', 'no tag from another origin');
+    },
+  );
+
+  const GIT_LAN_STEP =
+    'SECURITY (git actions, vite --host): a client on a non-loopback address gets 403 local_only from /__agg/status and /__agg/git (the same server answers loopback); its page shows the graph but no git actions bar and no Tag… / Worktree… in the detail panel';
+  if (!lanIp)
+    console.log(`↷ skipped (this machine has no non-loopback IPv4 interface): ${GIT_LAN_STEP}`);
+  else
+    await step(GIT_LAN_STEP, async () => {
+      const p = await freePort();
+      const lanOrigin = `http://${lanIp}:${p}`;
+      const lan = startVite(['--host', '0.0.0.0', '--port', String(p), '--strictPort'], {
+        ...env,
+        AGG_REPO_DIR: gfx.work,
+        AGG_REPO_ROOTS: gfx.roots,
+        AGG_LOCAL_REPOS_FILE: stateFileOf('git-lan'),
+        ...hermeticGit,
+      });
+      sideServers.add(lan);
+      const lanCtx = await browser.newContext({
+        viewport: { width: 1440, height: 900 },
+        locale: 'en-US',
+        proxy: { server: 'http://127.0.0.1:9', bypass: lanIp },
+      });
+      lanCtx.setDefaultTimeout(30_000 * SCALE);
+      lanCtx.setDefaultNavigationTimeout(30_000 * SCALE);
+      try {
+        await lan.ready;
+        const fromLan = (path, opts = {}) =>
+          rawHttp(lanIp, p, path, { ...opts, headers: { Host: `${lanIp}:${p}`, ...opts.headers } });
+        const st = await fromLan('/__agg/status?repo=default');
+        assert.equal(st.status, 403, 'LAN status');
+        assert.deepEqual(st.json, { error: 'local_only' });
+        const act = await fromLan('/__agg/git', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            Origin: lanOrigin,
+            'Sec-Fetch-Site': 'same-origin',
+          },
+          body: JSON.stringify({ repo: 'default', action: { type: 'stash-save' } }),
+        });
+        assert.equal(act.status, 403, 'LAN git action');
+        assert.equal(act.json?.error, 'local_only');
+        for (const r of [st, act])
+          for (const leak of [gfx.top, 'main', 'origin'])
+            assert.ok(!r.body.includes(leak), `LAN answer must not leak "${leak}"`);
+        const here = await rawHttp('127.0.0.1', p, '/__agg/status?repo=default', {
+          headers: { Host: `localhost:${p}` },
+        });
+        assert.equal(here.status, 200, 'loopback: the same server answers');
+
+        const lp = await lanCtx.newPage();
+        watchErrors(lp, 'git LAN page');
+        const answers = [];
+        lp.on('response', (r) => {
+          if (new URL(r.url()).pathname === '/__agg/status') answers.push(r.status());
+        });
+        await lp.goto(`${lanOrigin}/`);
+        await titleIs('work', lp);
+        await lp.locator('.agg-commit').first().waitFor();
+        await waitUntil(() => answers.length > 0, 15_000, 'the LAN page asked for the status');
+        await sleep(500);
+        assert.deepEqual([...new Set(answers)], [403]);
+        assert.equal(await lp.locator('.web-git').count(), 0, 'no git actions bar from the LAN');
+        await clickRow((await rowShas(lp))[1], {}, lp);
+        await lp.locator('.agg-detail').waitFor();
+        assert.equal(await lp.locator('.web-detail-btn').count(), 0, 'no Tag… / Worktree…');
+        await lp.screenshot({ path: resolve(artifacts, '16-git-lan.png') });
+        await lp.close();
+      } finally {
+        await lanCtx.close();
+        await stopSide(lan);
+      }
+    });
+
+  await gpg?.close();
+  if (gitSide) await stopSide(gitSide.v);
+  await xctx.close();
 
   assert.deepEqual(errors, [], `unexpected browser errors:\n${errors.join('\n')}`);
   console.log(`\nAll ${results.length} web e2e steps passed. Screenshots → ${artifacts}`);
@@ -4794,7 +6821,8 @@ try {
   console.error('\n✘ web e2e failed:', err);
   if (errors.length) console.error('browser errors:\n' + errors.join('\n'));
   try {
-    await page?.screenshot({ path: resolve(artifacts, 'failure.png') });
+    const shot = shotPage && !shotPage.isClosed() ? shotPage : page;
+    await shot?.screenshot({ path: resolve(artifacts, 'failure.png') });
     console.error(`failure screenshot → ${resolve(artifacts, 'failure.png')}`);
   } catch {
     /* ignore */
@@ -4805,7 +6833,10 @@ try {
   await browser?.close();
   dev?.proc.kill();
   preview?.proc.kill();
+  for (const v of sideServers) v.proc.kill();
   mock.close();
+  if (deepDir) rmSync(deepDir, { recursive: true, force: true });
+  if (gfx) rmSync(gfx.top, { recursive: true, force: true });
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(fx.rootsDir, { recursive: true, force: true });
   rmSync(fx.outsideDir, { recursive: true, force: true });

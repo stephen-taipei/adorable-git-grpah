@@ -17,7 +17,7 @@ const T = {
     tokenWarn:
       '請使用 fine-grained token，Repository access 只勾要看的 repo，權限只開 Contents: Read-only 與 Metadata: Read-only。Token 只存在這個瀏覽器的本機 extension 儲存空間，且只會送往 api.github.com。請勿使用有寫入權限的 token。',
     maxBranches: '最多顯示幾條分支',
-    maxCommits: '每條分支抓幾筆 commit',
+    maxCommits: '每條分支抓幾筆 commit（捲到底時每批也抓這麼多）',
     cache: '快取（分鐘，0 = 不快取）',
     save: '儲存',
     saved: '已儲存 ✓',
@@ -36,7 +36,7 @@ const T = {
     tokenWarn:
       'Use a fine-grained token limited to the repositories you want to view, with only Contents: Read-only and Metadata: Read-only. It is stored only in the local extension storage of this browser and sent solely to api.github.com. Never use a token with write access.',
     maxBranches: 'Max branches to show',
-    maxCommits: 'Commits fetched per branch',
+    maxCommits: 'Commits fetched per branch (also per batch when scrolling back)',
     cache: 'Cache (minutes, 0 = off)',
     save: 'Save',
     saved: 'Saved ✓',

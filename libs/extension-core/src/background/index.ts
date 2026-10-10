@@ -1,10 +1,13 @@
-import { GitHubError, fetchGitHubGraph } from '@adorable/graph-core';
+import { GitHubError, fetchGitHubCommitsFrom, fetchGitHubGraph } from '@adorable/graph-core';
 import type { GraphData } from '@adorable/graph-core';
+import { parseFetchMore } from '../shared/history';
+import { FETCH_MORE_MAX_STARTS } from '../shared/messages';
 import type {
   BgError,
   BgRequest,
   BgResponse,
   FetchGraphResponse,
+  FetchMoreResponse,
   RateLimitResponse,
   TabCommand,
 } from '../shared/messages';
@@ -26,6 +29,7 @@ interface CacheEntry {
 }
 
 const inflight = new Map<string, Promise<FetchGraphResponse>>();
+const inflightMore = new Map<string, Promise<FetchMoreResponse>>();
 
 function toError(err: unknown): BgError {
   if (err instanceof GitHubError)
@@ -84,6 +88,28 @@ async function fetchGraph(
   }
 }
 
+/**
+ * infinite scroll：從 content script 給的 missing parent 各往回抓一頁（每頁筆數 = 設定的「每條分支抓幾筆」）。
+ * 不寫快取：快取只存第一批，重新整理 / 換 repo 都從第一批重新開始。
+ */
+async function fetchMore(
+  req: Extract<BgRequest, { type: 'fetch-more' }>,
+): Promise<FetchMoreResponse> {
+  const settings = await loadSettings();
+  try {
+    const commits = await fetchGitHubCommitsFrom(req.owner, req.repo, req.shas, {
+      token: settings.token || undefined,
+      apiBase: __AGG_API_BASE__,
+      perPage: settings.maxCommitsPerBranch,
+      maxStarts: FETCH_MORE_MAX_STARTS,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    return { ok: true, data: { commits } };
+  } catch (err) {
+    return { ok: false, error: toError(err) };
+  }
+}
+
 async function rateLimit(): Promise<RateLimitResponse> {
   const settings = await loadSettings();
   try {
@@ -123,6 +149,22 @@ chrome.runtime.onMessage.addListener(
         if (!p) {
           p = fetchGraph(req).finally(() => inflight.delete(key));
           inflight.set(key, p);
+        }
+        void p.then(sendResponse);
+        return true;
+      }
+      case 'fetch-more': {
+        // content script 送來的內容一律重新驗證（repo 名稱、40 位 hex 的 sha、起點數量），不合法就不碰網路
+        const more = parseFetchMore(req);
+        if (!more) {
+          sendResponse({ ok: false, error: { code: 'invalid', message: 'Invalid request' } });
+          return false;
+        }
+        const key = `${more.owner}/${more.repo}#${more.shas.join(',')}`.toLowerCase();
+        let p = inflightMore.get(key);
+        if (!p) {
+          p = fetchMore(more).finally(() => inflightMore.delete(key));
+          inflightMore.set(key, p);
         }
         void p.then(sendResponse);
         return true;

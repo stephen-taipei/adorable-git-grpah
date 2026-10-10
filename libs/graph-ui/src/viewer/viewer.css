@@ -531,6 +531,9 @@
   transition:
     background 0.12s,
     opacity 0.2s;
+  /* 幾千列（infinite scroll）時畫面外的列跳過繪製；列高是固定的，所以版面 / 捲動位置 / canvas 的列座標都不受影響 */
+  content-visibility: auto;
+  contain-intrinsic-height: auto var(--agg-row-h);
 }
 
 .agg-commit:hover {
@@ -715,13 +718,57 @@
   color: var(--agg-ink);
 }
 
+/* 列表尾端：高度固定一列（場景的 track 高度也算這一列），載入中 / 失敗 / 可以再載入時都不會讓列表跳動 */
 .agg-footer {
   display: flex;
   align-items: center;
+  gap: 8px;
   height: var(--agg-row-h);
   padding-left: calc(var(--agg-graph-w) + 10px);
+  padding-right: 12px;
   font-size: 12px;
   color: var(--agg-card-muted);
+}
+
+.agg-footer-msg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-footer-msg:empty {
+  display: none;
+}
+
+.agg-footer[data-state='error'] .agg-footer-msg {
+  color: var(--agg-card-ink);
+}
+
+.agg-footer[data-state='error'] .agg-footer-msg::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  background: var(--agg-danger);
+  border: 2px solid var(--agg-ink);
+  border-radius: 50%;
+  vertical-align: 0;
+}
+
+.agg-footer-btn {
+  flex: none;
+}
+
+.agg-spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: agg-spin 0.8s linear infinite;
 }
 
 /* ── ref 標籤（branch / remote / tag） ───────────────────────── */
@@ -1041,6 +1088,8 @@
 .agg-detail-foot {
   flex: none;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   padding: 10px 14px 12px;
   border-top: 2px solid var(--agg-line);
@@ -1048,6 +1097,21 @@
 
 .agg-detail-foot:empty {
   display: none;
+}
+
+/* 使用端的額外內容（renderDetailExtra），例如 web app 的 tag 動作 */
+.agg-detail-extra {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 面板大小切換按鈕：加寬中 */
+.agg-detail-size[aria-pressed='true']:not(:hover) {
+  background: #e7defc;
 }
 
 .agg-cta--sm {
@@ -1107,6 +1171,11 @@
   box-shadow:
     0 4px 0 var(--agg-ink),
     -12px 0 28px rgba(43, 33, 64, 0.25);
+}
+
+/* 中等寬度 + 加寬：抽屜蓋住列表的大部分（列表本身的版面不變） */
+.agg-root[data-size='medium'][data-detail-size='wide'] .agg-detail {
+  width: min(720px, max(400px, 72%), calc(100% - 28px));
 }
 
 /* 窄螢幕：兩行式的列、詳情變成底部面板、工具列可橫向捲動 */
@@ -1500,6 +1569,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .agg-spinner,
   .agg-btn--busy svg,
   .agg-bounce,
   .agg-shadow,

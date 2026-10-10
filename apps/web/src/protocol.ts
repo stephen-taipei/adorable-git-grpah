@@ -53,3 +53,94 @@ export interface SnapshotEvent {
 /** 比較用：忽略每次讀取都會變的時間戳，只看內容有沒有變。 */
 export const snapshotKey = (s: GitSnapshot): string =>
   JSON.stringify({ ...s, generatedAt: 0, graph: s.graph && { ...s.graph, fetchedAt: 0 } });
+
+// ───────────────────────── 本機 repo 的狀態與 git 動作（只有 dev server、只回應本機） ─────────────────────────
+
+/** `GET ?repo=<id>`：某個本機 repo 的狀態（branch、ahead / behind、變更、stash、worktree…）。只回應本機的同源請求。 */
+export const STATUS_ENDPOINT = '/__agg/status';
+/** `POST { repo, action }`（JSON）：執行一個 git 動作。只接受本機同源頁面送來的 JSON。 */
+export const GIT_ENDPOINT = '/__agg/git';
+/** 一次最多讀幾筆 commit（infinite scroll 的上限）。 */
+export const MAX_DEPTH = 5000;
+
+export interface WorktreeInfo {
+  /** 與 LocalRepo.id 同一個 id 空間：可以用 `?local=<id>` 開啟（啟動時的預設 repo 是 `default`） */
+  id: string;
+  /** 顯示用的位置（家目錄縮寫成 ~）；只會送給本機 */
+  label: string;
+  /** null = detached HEAD（bare repo 的主 worktree 也是 null） */
+  branch: string | null;
+  /** HEAD 的 sha（bare / 還沒有 commit 時是空字串） */
+  head: string;
+  /** 就是正在看的這個 repo */
+  current: boolean;
+  /** 主 worktree（不能移除） */
+  main: boolean;
+  locked: boolean;
+  /** 資料夾已經不在了（`git worktree prune` 會清掉） */
+  prunable: boolean;
+}
+
+export interface RepoStatus {
+  /** null = detached HEAD */
+  branch: string | null;
+  /** null = 還沒有任何 commit */
+  head: string | null;
+  /** 例如 'origin/main'；沒有設定 upstream 時是 null */
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  changes: { staged: number; unstaged: number; untracked: number; conflicted: number };
+  remotes: string[];
+  /** index 就是 `stash@{index}`；date 是 ISO 8601 */
+  stashes: { index: number; message: string; date: string }[];
+  worktrees: WorktreeInfo[];
+  /** 進行中的操作（`git am` 也算 'rebase'） */
+  operation: 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'bisect' | null;
+  bare: boolean;
+}
+
+/**
+ * 畫面能要求的 git 動作。server 端會重新驗證每個欄位，而且只組固定的參數（不會 force、pull 只做 fast-forward）。
+ * 會丟掉資料或改到遠端的動作（push、stash-drop、tag-delete、worktree-remove）必須帶 `confirm: true`。
+ */
+export type GitAction =
+  | { type: 'fetch' }
+  | { type: 'pull' }
+  | { type: 'push'; confirm: true; setUpstream?: { remote: string } }
+  | { type: 'stash-save'; message?: string; includeUntracked?: boolean }
+  | { type: 'stash-apply'; index: number }
+  | { type: 'stash-pop'; index: number }
+  | { type: 'stash-drop'; index: number; confirm: true }
+  | { type: 'tag-create'; name: string; target: string; message?: string; push?: boolean }
+  | { type: 'tag-delete'; name: string; confirm: true }
+  | { type: 'tag-push'; name: string }
+  | { type: 'worktree-add'; path: string; branch?: string; newBranch?: string; base?: string }
+  | { type: 'worktree-remove'; id: string; confirm: true };
+
+export type GitActionErrorCode =
+  | 'invalid'
+  | 'busy'
+  | 'not_ff'
+  | 'no_upstream'
+  | 'no_branch'
+  | 'conflict'
+  | 'rejected'
+  | 'auth'
+  | 'dirty'
+  | 'exists'
+  | 'not_found'
+  | 'timeout'
+  | 'operation_in_progress'
+  | 'nothing'
+  | 'failed';
+
+export interface GitActionResult {
+  ok: boolean;
+  /** 整理過的 git 輸出（去掉 ANSI、遮掉網址裡的帳密、只留最後 4 KB）；可能是空字串 */
+  output: string;
+  /** !ok 時一定有；ok 但什麼都沒做（例如沒有東西可以 stash）時是 'nothing' */
+  code?: GitActionErrorCode;
+  /** worktree-add：新的 worktree（可以用 `?local=<id>` 開啟） */
+  repo?: LocalRepo;
+}
