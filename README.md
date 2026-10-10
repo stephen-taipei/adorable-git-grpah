@@ -4,11 +4,11 @@
 branch 是流動著箭頭的管線，merge / fork 會自己長出來。版面是 **`git log --graph` 式的上下捲動列表**（最新在最上面），
 每一列帶著 SHA、作者、日期、branch / tag / HEAD 等常用 git 資訊；手機到桌機都能用（RWD）。純前端，無後端。
 
-| 階段   | 內容                                                                                               | 狀態 |
-| ------ | -------------------------------------------------------------------------------------------------- | ---- |
-| **1**  | `apps/extension` — Chrome extension，在 github.com repo 頁面顯示該 repo 的 git graph               | ✅   |
-| **1b** | `apps/extension-firefox` — Firefox（MV3）版，與 Chrome 版共用同一份原始碼                          | ✅   |
-| **2**  | `apps/web` — `pnpm start` 於 localhost 查看**本專案**的 git graph（與 extension 共用同一套 UI/UX） | ✅   |
+| 階段   | 內容                                                                                                               | 狀態 |
+| ------ | ------------------------------------------------------------------------------------------------------------------ | ---- |
+| **1**  | `apps/extension` — Chrome extension，在 github.com repo 頁面顯示該 repo 的 git graph                               | ✅   |
+| **1b** | `apps/extension-firefox` — Firefox（MV3）版，與 Chrome 版共用同一份原始碼                                          | ✅   |
+| **2**  | `apps/web` — `pnpm start` 於 localhost 查看本專案或**任何本機 repo** 的 git graph（與 extension 共用同一套 UI/UX） | ✅   |
 
 ## 快速開始
 
@@ -16,7 +16,7 @@ branch 是流動著箭頭的管線，merge / fork 會自己長出來。版面是
 
 ```bash
 pnpm install
-pnpm start            # 階段 2：http://localhost:4200 ，顯示「本專案」的 git graph
+pnpm start            # 階段 2：http://localhost:4200 ，預設顯示「本專案」，可從選單換成其他本機 repo
 pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Firefox → apps/extension-firefox/dist、web → apps/web/dist
 ```
 
@@ -27,6 +27,11 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
   只有**新增**的 commit 會彈出來；你正在看的位置與選取的 commit 不會被重設（如果你本來就在最上面，新的 commit 直接出現在眼前）。
   偵測方式：逐層監看 `.git` 的 `HEAD` / `packed-refs` / `refs/**` 目錄（不用遞迴 `fs.watch`，它在 Linux 上第二次 commit 起就會漏事件），
   另有每 2 秒比對 ref 清單的安全網；git 暫時出錯時保留上一張好的圖，不會讓 dev server 掛掉。
+- **選擇本機 repo**（只有 dev server）：`📍 本機` 旁的選單列出預設 repo（★）與它**同層資料夾**裡的 git repo
+  （往下找 3 層；一般 repo、worktree、`*.git` bare repo 都算；略過 `node_modules`、`.` 開頭、`dist` / `build` 等資料夾，不跟隨 symlink、不往 repo 裡面找）。
+  選了之後網址變成 `/?local=<id>`（可加書籤、上一頁 / 下一頁可用），那個 repo 一樣即時更新（最多同時監看 4 個非預設 repo，最久沒看的會先停，再選到時重新開始）。
+  清單外的 repo：選「＋ 開啟其他路徑…」輸入**絕對路徑**（可用 `~`，repo 裡的子資料夾也可以）；輸入過的路徑記在這個瀏覽器，dev server 重開後會自動重新登記。
+  回到這個分頁時清單會重新掃描（剛 `git clone` 的 repo 會出現）。
 - 標題列下方的 `📍 本機 | 🐙 GitHub`：切到 GitHub 後輸入 `owner/repo` 或 GitHub 網址（也可直接開 `/?repo=owner/repo`），
   從瀏覽器直接呼叫 GitHub REST API（與 extension 同一套 `fetchGitHubGraph`），結果快取 10 分鐘。
   未登入每小時 60 次，點 ⚙ 可貼入 fine-grained PAT（只存 localStorage、只送往 `api.github.com`；更換 / 清除 token 會一併清掉快取）。
@@ -34,12 +39,17 @@ pnpm build            # 建置所有專案：Chrome → apps/extension/dist、Fi
 - 環境變數：`AGG_REPO_DIR`（要看哪個 repo，預設就是本專案；一般 repo、bare repo、shallow clone 都可以）、
   `AGG_MAX_COMMITS`（預設 300，不再被 layout 偷偷截成 400）、`AGG_MAX_BRANCHES`（預設 8）、
   `AGG_DEFAULT_BRANCH`（預設依序：`origin/HEAD` → `main` → `master` → 目前 branch；`main` 或 `origin/main` 兩種寫法都可以）。
-  例如看另一個專案：`AGG_REPO_DIR=~/code/other pnpm start`。
+  例如預設改看另一個專案：`AGG_REPO_DIR=~/code/other pnpm start`。
+  選單的掃描範圍：`AGG_REPO_ROOTS`（以 `:` 分隔，Windows 為 `;`，可用 `~`；預設是預設 repo 的上一層）、`AGG_REPO_SCAN_DEPTH`（預設 3）。
+  例如：`AGG_REPO_ROOTS=~/code:~/work pnpm start`。掃描上限 5000 個資料夾 / 300 個 repo / 3 秒，超過時選單會提示清單不完整。
 - `pnpm --filter @adorable/web build && pnpm --filter @adorable/web preview`：靜態版，**把建置當下的 git 快照烤進 bundle**。
 
 > ⚠️ 靜態版的 bundle 只含 **commit 的第一行（subject）與作者名稱**，不含 email 與 commit 本文（`Signed-off-by` / `Co-authored-by` 等 trailer 不會被讀進來）。
 > 但 subject、作者名與 branch / tag 名稱仍是公開資訊：**不要把私有 repo 的建置結果公開部署**。
-> dev server 預設只綁 `localhost`；`/__agg/git-snapshot` 只存在於 dev、只回應同源請求（其他 localhost 埠上的頁面讀不到，e2e 有驗證），不會出現在 build 中。
+> dev server 預設只綁 `localhost`；`/__agg/git-snapshot`、`/__agg/repos` 只存在於 dev、只回應同源請求（其他 localhost 埠上的頁面讀不到，e2e 有驗證），不會出現在 build 中。
+> 偽造的 `Host`（DNS rebinding）會先被 Vite 自己的 host 檢查擋掉。瀏覽器選 repo 時只送出 server 算出的 id（realpath 的雜湊），不會送路徑；
+> 唯一的例外是「開啟其他路徑」：那是使用者自己輸入的路徑，server 只接受同源頁面送來的 `application/json` POST（跨站表單 / no-cors 請求送不出，fetch 會被 CORS preflight 擋下）。
+> 掃描只檢查資料夾裡有沒有 `.git`，不會在清單上的每個 repo 執行 git；只有你選了某個 repo，dev server 才會在那裡執行唯讀的 git 指令（等同你自己在那裡打 `git log`）。
 > 靜態版沒有後端可重讀 git，因此不顯示重新整理按鈕。
 > `pnpm build` 不使用 Nx 快取 web（快照是建置當下的 git 狀態，不是檔案內容的函數）。
 
@@ -141,7 +151,7 @@ pnpm e2e              # 真實瀏覽器：web app + Chrome extension + Firefox e
 **Chrome extension**（`apps/extension/e2e`）：build 一份指向 mock GitHub API 的 extension → 用 Chromium（`--headless=new`）載入 →
 在假的 `github.com` 頁面上驗證 FAB、overlay、繪圖、頁面不被捲動、按鍵不洩漏到頁面、Esc 分層、404 / rate-limit 錯誤畫面、快取命中與強制重抓、設定頁與 token 傳遞，截圖輸出到 `apps/extension/e2e/.artifacts/`。
 **web**（`apps/web/e2e`）：啟動真正的 dev server，對一個臨時建立的 git repo 驗證本機快照、**commit / 建 branch 後畫面即時更新且不重新整理**（含捲動錨定）、
-連續多次 commit / 切 branch、cross-origin 讀不到 dev endpoint、GitHub 來源切換（輸入驗證、404、rate limit、deep link 與快取、token 不外洩且移除後不留帶 token 的快取）、
+連續多次 commit / 切 branch、cross-origin 讀不到 dev endpoint、本機 repo 選單（掃描範圍、切換 / 上一頁 / deep link、選到的 repo 即時更新、手動輸入路徑與錯誤訊息、跨站無法新增路徑、窄螢幕不溢出）、GitHub 來源切換（輸入驗證、404、rate limit、deep link 與快取、token 不外洩且移除後不留帶 token 的快取）、
 主題記憶、本機 build + preview（快照烤進 bundle、無 Refresh、dev endpoint 不存在）。
 
 **Firefox extension**（`apps/extension-firefox/e2e`）：用 puppeteer-core 經 WebDriver BiDi 驅動**真正的 Firefox**，載入打包後的 add-on（等同「載入暫時性附加元件」），
@@ -160,8 +170,8 @@ pnpm e2e              # 真實瀏覽器：web app + Chrome extension + Firefox e
 ```
 apps/
   web/                  Vite + React：pnpm start 的 localhost 版
-    plugins/            git-snapshot：執行 git log、監看 .git refs，經 HMR 推送新快照（virtual:git-snapshot）
-    src/                SourceBar（本機 / GitHub 切換）、TokenDialog、useGraphSource
+    plugins/            git-snapshot：執行 git log、監看 .git refs，經 HMR 推送新快照（virtual:git-snapshot）；掃描本機 repo、依 id 提供快照
+    src/                SourceBar（本機 / GitHub 切換、本機 repo 選單）、TokenDialog、useGraphSource、localRepos
   extension/            Chrome（MV3）：只有建置入口、圖示產生器與 e2e，原始碼都在 libs/extension-core
   extension-firefox/    Firefox（MV3）：建置入口、web-ext 的 lint / package / run、e2e（puppeteer + 真實 Firefox）
 libs/
@@ -209,6 +219,8 @@ tools/e2e/              e2e 共用：Chrome 偵測、mock GitHub API（含 CORS�
 - 未登入時額度很小，連續開多個 repo 會遇到 rate limit（畫面會提示，並可跳到設定頁）。
 - GitHub 來源目前只支援 github.com（不含 GitHub Enterprise、GitLab）；本機來源則任何 git repo 都可以。
 - web app 的本機快照預設讀最近 300 筆 commit、最多 8 條 branch（可用環境變數調整）。
+- 本機 repo 選單只在 `pnpm start`（dev server）時有；靜態建置只有建置當下的預設 repo。Chrome / Firefox extension 讀的是 GitHub，不能選本機 repo。
+- 瀏覽器無法取得資料夾的實際路徑，所以「開啟其他路徑」要自己輸入路徑，沒有原生的資料夾選擇視窗。
 - 動畫在無 GPU 的環境（軟體 WebGL）會明顯掉幀，屬預期。
 - lane 非常多（例如一次顯示十幾條長期並行的 branch）時，手機上線圖欄會被壓縮到最小間距、仍可能佔掉不少寬度。
 - 沒有橫向模式 / 自由縮放：這是刻意的，換來的是一致的捲動、搜尋與 RWD。
